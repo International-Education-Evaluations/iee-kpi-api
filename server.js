@@ -933,11 +933,31 @@ app.get('/users', async (req, res) => {
     const STAFF_ROLE_ID = '67acba952a78ccf7588a3ee1';
 
     // Filter: type='staff' only.
-    // 'active' field is an account-activation flag in V2, NOT employment status.
-    // Many current staff have active:false or active unset — filtering on it drops them.
-    // system_admin = system accounts (super admin, armadalogics bots), not processing staff.
-    // partner_user / customer / system_bot = external, excluded.
+    // 'active' field is an account-activation flag in V2, NOT employment status —
+    // many current staff have active:false. Do NOT filter on it.
     const STAFF_TYPES = ['staff'];
+
+    // Internal email domains — only these are IEE employees or known internal accounts.
+    // Contractors (gmail, yahoo, etc.) and legacy @foreigntranscripts.com are excluded.
+    const INTERNAL_DOMAINS = ['myiee.org'];
+
+    // Known junk/test/bot email prefixes and addresses to exclude server-side.
+    const EXCLUDE_EMAILS = new Set([
+      'devauth@myiee.org',          // IEE Dev bot
+      'testadmin@myiee.org',        // Test Admin
+      'worker@myiee.org',           // Evaluator McEvaluator test account
+      'documentmanagement@myiee.org', // Shared CLT inbox, not a person
+      'devscanner@myiee.org',       // Dev Scanner bot
+      'testuser2@myiee.org',        // Test User 2
+      'teststaaff@myiee.org',       // Test Staff
+    ]);
+
+    // Known junk name patterns (lowercase match)
+    const JUNK_NAME_PATTERNS = [
+      /^test/i, /^aaa/i, /omit omit/i, /evaluator mcevaluator/i,
+      /^john doe$/i, /top lingual/i, /document management - clt/i,
+      /^dev /i, /jagamohan/i, /^[?\s]+$/  // blank/corrupt names like "? ?"
+    ];
 
     const cursor = col.find(
       { type: { $in: STAFF_TYPES } },
@@ -961,35 +981,62 @@ app.get('/users', async (req, res) => {
 
     const docs = await cursor.toArray();
 
-    const users = docs.map(u => {
+    const allMapped = docs.map(u => {
       // Name: firstName + lastName only (middleName excluded — unreliable)
-      const fullName = [u.firstName, u.lastName].filter(Boolean).join(' ');
+      const fullName = [u.firstName, u.lastName].filter(Boolean).join(' ').trim();
+      const email    = (u.email || '').toLowerCase().trim();
+      const dept     = (u.department && u.department.name) || '';
 
       // Tags: extract names as comma-separated string
       const tagNames = (u.tags || []).map(t => t.name).filter(Boolean).join(', ');
 
-      // isStaff: has Staff roleId OR is system_admin type
-      const isStaff = u.roleId === STAFF_ROLE_ID || u.type === 'system_admin';
+      // isStaff: has Staff roleId
+      const isStaff = u.roleId === STAFF_ROLE_ID;
+
+      // ── Exclusion logic ──────────────────────────────────────
+      // 1. Excluded email list (known bots/test/shared inboxes)
+      const isExcludedEmail = EXCLUDE_EMAILS.has(email);
+
+      // 2. Domain filter — only @myiee.org internal staff
+      const emailDomain = email.split('@')[1] || '';
+      const isInternalDomain = INTERNAL_DOMAINS.includes(emailDomain);
+
+      // 3. Junk name patterns
+      const isJunkName = !fullName || JUNK_NAME_PATTERNS.some(p => p.test(fullName));
+
+      // 4. N/A last name (external applicant accounts)
+      const isNAAccount = (u.lastName || '').trim() === 'N/A';
+
+      const excluded = isExcludedEmail || !isInternalDomain || isJunkName || isNAAccount;
 
       return {
         userId:       u._id.toString(),
         v1Id:         u.v1Id || null,
         legacyId:     u.legacyId || null,
         fullName:     fullName,
-        email:        u.email || '',
-        department:   (u.department && u.department.name) || '',
+        email:        email,
+        department:   dept,
         departmentId: (u.department && u.department.legacyId) || '',
         tags:         tagNames,
         type:         u.type || '',
         roleId:       u.roleId || '',
         isStaff:      isStaff,
-        active:       u.active === true
+        active:       u.active === true,
+        _excluded:    excluded
       };
+    });
+
+    // Only return non-excluded users
+    const users = allMapped.filter(u => !u._excluded).map(u => {
+      const { _excluded, ...clean } = u;
+      return clean;
     });
 
     res.json({
       count:      users.length,
       staffCount: users.filter(u => u.isStaff).length,
+      totalRaw:   allMapped.length,
+      excluded:   allMapped.filter(u => u._excluded).length,
       users
     });
   } catch (err) {
