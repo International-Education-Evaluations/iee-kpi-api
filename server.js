@@ -903,14 +903,43 @@ app.get('/users', async (req, res) => {
     const userDb = await getDb('user');
     const col    = userDb.collection('user');
 
+    // ── Type discovery mode ──────────────────────────────────
+    // GET /users?discover=true returns all distinct type values in the collection.
+    // Use this once to confirm which type values represent internal staff.
+    if (req.query.discover === 'true') {
+      const types = await col.distinct('type', { active: true });
+      const roleIds = await col.distinct('roleId', { active: true });
+      const sample = await col.find(
+        { active: true },
+        { projection: { type: 1, roleId: 1, department: 1, firstName: 1, lastName: 1 } }
+      ).limit(50).toArray();
+      const byType = {};
+      for (const doc of sample) {
+        const t = doc.type || '(none)';
+        if (!byType[t]) byType[t] = { count: 0, examples: [] };
+        byType[t].count++;
+        if (byType[t].examples.length < 3) {
+          byType[t].examples.push({
+            name: [doc.firstName, doc.lastName].filter(Boolean).join(' ') || '(blank)',
+            dept: (doc.department && doc.department.name) || '',
+            roleId: doc.roleId || ''
+          });
+        }
+      }
+      return res.json({ distinctTypes: types, distinctRoleIds: roleIds, sampleByType: byType });
+    }
+
     // Staff role ObjectId (confirmed from user.role collection)
     const STAFF_ROLE_ID = '67acba952a78ccf7588a3ee1';
 
-    // Pull all active users — filter to non-system accounts
-    // Strategy: active:true AND (roleId matches Staff OR type != 'system_admin')
-    // We return all active users and include type/roleId so GAS can filter if needed
+    // Filter server-side: only internal staff types.
+    // Excludes 'customer' and any other non-staff types.
+    // type='staff' and type='system_admin' are internal IEE users.
+    // If other internal types are discovered via ?discover=true, add them here.
+    const STAFF_TYPES = ['staff', 'system_admin'];
+
     const cursor = col.find(
-      { active: true },
+      { active: true, type: { $in: STAFF_TYPES } },
       {
         projection: {
           _id: 1,
@@ -932,20 +961,18 @@ app.get('/users', async (req, res) => {
     const docs = await cursor.toArray();
 
     const users = docs.map(u => {
-      // Name: firstName + lastName only (middleName is unreliable — sometimes
-      // populated with last name due to data entry quirk)
+      // Name: firstName + lastName only (middleName excluded — unreliable)
       const fullName = [u.firstName, u.lastName].filter(Boolean).join(' ');
 
       // Tags: extract names as comma-separated string
       const tagNames = (u.tags || []).map(t => t.name).filter(Boolean).join(', ');
 
-      // Is staff: roleId matches Staff role OR type is not system_admin/admin
-      const isStaff = u.roleId === STAFF_ROLE_ID ||
-        (!['system_admin', 'admin'].includes(u.type));
+      // isStaff: has Staff roleId OR is system_admin type
+      const isStaff = u.roleId === STAFF_ROLE_ID || u.type === 'system_admin';
 
       return {
-        userId:       u._id.toString(),       // ObjectId string — join key for QC events
-        v1Id:         u.v1Id || null,          // MySQL user ID — join key for KPI segments
+        userId:       u._id.toString(),
+        v1Id:         u.v1Id || null,
         legacyId:     u.legacyId || null,
         fullName:     fullName,
         email:        u.email || '',
