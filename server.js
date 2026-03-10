@@ -900,7 +900,7 @@ app.get('/qc-discovery', async (req, res) => {
 // ── /users — Active staff list from user.user collection ──
 app.get('/users', async (req, res) => {
   try {
-    const userDb = client.db('user');
+    const userDb = await getDb('user');
     const col    = userDb.collection('user');
 
     // Staff role ObjectId (confirmed from user.role collection)
