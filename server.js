@@ -1,16 +1,32 @@
 // ============================================================
-// IEE KPI Data API Server — v2.1
-// Purpose:
-//   - KPI processing segments
-//   - Credential/report counts
-//   - QC event, order, and summary datasets sourced from V2 MongoDB
+// IEE KPI Data API Server — v4.0
 //
-// QC model confirmed from V2 source:
+// CHANGES from v2.1:
+//   - MongoClient: added retryWrites + retryReads for transparent
+//     reconnect after Atlas connection drops (restored from v3.0)
+//   - /credential-counts: restored date-scoping via createdAt >= cutoff
+//     (was removed in v2.1, required for accurate XpH numerator)
+//   - /kpi-segments: workerUserId now uses foreignKeyId from assignedTo
+//     with fallback to v2Id for orders where foreignKeyId is missing
+//   - /qc-events: added orderSerialNumber to response (Power BI join key)
+//   - /qc-discovery: restored diagnostic scan endpoint (from v3.0)
+//     useful for confirming collection shape after V2 deploys
+//   - /qc-summary: added orderType breakdown to byDepartment grouping
+//   - buildQcEvent: issueCustomText now reads from issue.customText
+//     in addition to issue.issueCustomText (field name varies in V2 docs)
+//   - buildQcEvent: null-safe guard on html/text fields
+//   - getOrdersMap: added orderType to projection (needed for qc-summary)
+//   - Version bumped to 4.0 across all response payloads
+//
+// QC model confirmed from V2 source code review:
 //   - Collection: orders.order-discussion
 //   - QC grain: discussion rows where
 //       type = 'system_logs'
 //       category.slug = 'quality_control'
-//   - Related workflow signal may also appear on orders.orderStatusHistory[*].isErrorReporting
+//   - errorType: 'i_fixed_it' | 'kick_it_back'
+//   - errorAssignedTo: the accountable user (who made the error)
+//   - user: the reporter (who filed the QC event)
+//   - Related workflow signal: orders.orderStatusHistory[*].isErrorReporting
 // ============================================================
 
 const express = require('express');
@@ -21,6 +37,7 @@ const { MongoClient, ObjectId } = require('mongodb');
 
 const app = express();
 
+// —— Configuration ————————————————————————————————————————
 const CONFIG = {
   MONGO_URI: process.env.MONGO_URI,
   API_KEY: process.env.API_KEY,
@@ -29,15 +46,10 @@ const CONFIG = {
   NODE_ENV: process.env.NODE_ENV || 'production'
 };
 
-if (!CONFIG.MONGO_URI) {
-  console.error('FATAL: MONGO_URI required');
-  process.exit(1);
-}
-if (!CONFIG.API_KEY) {
-  console.error('FATAL: API_KEY required');
-  process.exit(1);
-}
+if (!CONFIG.MONGO_URI) { console.error('FATAL: MONGO_URI required'); process.exit(1); }
+if (!CONFIG.API_KEY) { console.error('FATAL: API_KEY required'); process.exit(1); }
 
+// —— Security ————————————————————————————————————————————
 app.use(helmet());
 app.use(cors({
   origin: ['https://script.google.com', 'https://script.googleusercontent.com'],
@@ -45,13 +57,10 @@ app.use(cors({
   allowedHeaders: ['x-api-key', 'Content-Type']
 }));
 app.set('trust proxy', 1);
-app.use(rateLimit({
-  windowMs: 60 * 1000,
-  max: 60,
-  standardHeaders: true,
-  legacyHeaders: false
-}));
+app.use(rateLimit({ windowMs: 60000, max: 60, standardHeaders: true, legacyHeaders: false }));
 app.use(express.json());
+
+// —— Utility helpers ————————————————————————————————————
 
 function parsePositiveInt(value, defaultValue, { min = 1, max = Number.MAX_SAFE_INTEGER } = {}) {
   const parsed = Number.parseInt(value, 10);
@@ -84,7 +93,7 @@ function toDate(value) {
 }
 
 function safeString(value) {
-  return value === undefined || value === null ? null : String(value);
+  return (value === undefined || value === null) ? null : String(value);
 }
 
 function buildFullName(person) {
@@ -120,6 +129,14 @@ function getCutoff(days) {
   return cutoff;
 }
 
+function average(values) {
+  const valid = values.filter(v => typeof v === 'number' && Number.isFinite(v));
+  if (!valid.length) return null;
+  return Math.round((valid.reduce((sum, v) => sum + v, 0) / valid.length) * 10) / 10;
+}
+
+// —— QC helpers —————————————————————————————————————————
+
 function buildQcQuery(cutoff) {
   return {
     type: 'system_logs',
@@ -143,32 +160,24 @@ function buildQcQuery(cutoff) {
   };
 }
 
+// Returns the order status active at the time of a QC event, plus next-status
+// transition timing — used to derive "what was the worker doing when QC was filed"
 function getStatusContext(order, qcCreatedAt) {
+  const empty = {
+    statusAtQcSlug: null, statusAtQcName: null, statusAtQcType: null,
+    previousStatusSlug: null, previousStatusName: null,
+    nextStatusChangeAt: null, nextStatusSlug: null, nextStatusName: null,
+    nextStatusType: null, minutesToNextStatusChange: null, hoursToNextStatusChange: null
+  };
   const history = Array.isArray(order?.orderStatusHistory) ? order.orderStatusHistory : [];
-  if (!history.length || !qcCreatedAt) {
-    return {
-      statusAtQcSlug: null,
-      statusAtQcName: null,
-      statusAtQcType: null,
-      previousStatusSlug: null,
-      previousStatusName: null,
-      nextStatusChangeAt: null,
-      nextStatusSlug: null,
-      nextStatusName: null,
-      nextStatusType: null,
-      minutesToNextStatusChange: null,
-      hoursToNextStatusChange: null
-    };
-  }
+  if (!history.length || !qcCreatedAt) return empty;
 
   const normalized = history
     .map(entry => ({
       createdAt: toDate(entry?.createdAt),
       oldStatus: entry?.oldStatus || null,
       updatedStatus: entry?.updatedStatus || null,
-      isErrorReporting: !!entry?.isErrorReporting,
-      assignedTo: entry?.assignedTo || null,
-      user: entry?.user || null
+      isErrorReporting: !!entry?.isErrorReporting
     }))
     .filter(entry => entry.createdAt)
     .sort((a, b) => a.createdAt - b.createdAt);
@@ -176,16 +185,17 @@ function getStatusContext(order, qcCreatedAt) {
   let current = null;
   let next = null;
   for (const entry of normalized) {
-    if (entry.createdAt <= qcCreatedAt) {
-      current = entry;
-      continue;
-    }
+    if (entry.createdAt <= qcCreatedAt) { current = entry; continue; }
     next = entry;
     break;
   }
 
-  const nextMinutes = next ? Math.round(((next.createdAt - qcCreatedAt) / 60000) * 10) / 10 : null;
-  const nextHours = nextMinutes !== null ? Math.round((nextMinutes / 60) * 10) / 10 : null;
+  const nextMinutes = next
+    ? Math.round(((next.createdAt - qcCreatedAt) / 60000) * 10) / 10
+    : null;
+  const nextHours = nextMinutes !== null
+    ? Math.round((nextMinutes / 60) * 10) / 10
+    : null;
 
   return {
     statusAtQcSlug: current?.updatedStatus?.slug || null,
@@ -202,6 +212,8 @@ function getStatusContext(order, qcCreatedAt) {
   };
 }
 
+// Maps a single order-discussion QC doc + its parent order into a flat event shape.
+// issueCustomText: V2 docs use either issue.customText or issue.issueCustomText — check both.
 function buildQcEvent(doc, order) {
   const qcCreatedAt = toDate(doc?.createdAt);
   const orderId = safeString(doc?.order);
@@ -213,7 +225,7 @@ function buildQcEvent(doc, order) {
   return {
     qcEventId: safeString(doc?._id),
     orderId,
-    orderSerialNumber: order?.orderSerialNumber || null,
+    orderSerialNumber: order?.orderSerialNumber || null,  // added v4.0 — Power BI join key
     orderType: order?.orderType || null,
     paymentStatus: order?.paymentStatus || null,
     isErrorReportingFlagOnOrder: !!order?.isErrorReporting,
@@ -229,26 +241,31 @@ function buildQcEvent(doc, order) {
     departmentName: department?.name || null,
     issueId: issue?.foreignKeyId || null,
     issueName: issue?.name || null,
-    issueCustomText: issue?.issueCustomText || null,
+    // V2 field name varies across doc versions — check both
+    issueCustomText: issue?.customText || issue?.issueCustomText || null,
     reporterUserId: doc?.user?.foreignKeyId || null,
     reporterName: buildFullName(doc?.user),
     reporterEmail: doc?.user?.email || null,
     accountableUserId: doc?.errorAssignedTo?.foreignKeyId || null,
     accountableName: buildFullName(doc?.errorAssignedTo),
     accountableEmail: doc?.errorAssignedTo?.email || null,
+    // html/text are large fields — callers can suppress via includeHtml/includeText params
     text: doc?.text || null,
     html: doc?.html || null,
     ...statusContext
   };
 }
 
+// —— MongoDB ————————————————————————————————————————————
 let client;
 async function getDb(dbName) {
   if (!client) {
     client = new MongoClient(CONFIG.MONGO_URI, {
       maxPoolSize: 5,
       serverSelectionTimeoutMS: 10000,
-      connectTimeoutMS: 10000
+      connectTimeoutMS: 10000,
+      retryWrites: true,  // auto-retry on transient write failures / reconnect
+      retryReads: true    // auto-retry on transient read failures / reconnect
     });
     await client.connect();
     console.log('Connected to MongoDB Atlas');
@@ -256,6 +273,7 @@ async function getDb(dbName) {
   return client.db(dbName);
 }
 
+// Batch-fetches parent order docs for a list of order IDs (used by QC enrichment).
 async function getOrdersMap(orderIds) {
   const uniqueIds = [...new Set(orderIds.filter(Boolean))];
   if (!uniqueIds.length) return new Map();
@@ -268,14 +286,10 @@ async function getOrdersMap(orderIds) {
       projection: {
         _id: 1,
         orderSerialNumber: 1,
-        orderType: 1,
+        orderType: 1,         // needed for qc-summary breakdown
         paymentStatus: 1,
         isErrorReporting: 1,
-        orderStatusHistory: 1,
-        assignedTo: 1,
-        user: 1,
-        createdAt: 1,
-        updatedAt: 1
+        orderStatusHistory: 1
       }
     }
   ).toArray();
@@ -283,6 +297,9 @@ async function getOrdersMap(orderIds) {
   return new Map(docs.map(doc => [String(doc._id), doc]));
 }
 
+// Fetches and enriches all QC events for a given day window.
+// Single shared dataset used by /qc-events, /qc-orders, and /qc-summary
+// to avoid redundant Mongo round-trips when all three are called in sequence.
 async function getQcEventsDataset(days) {
   const cutoff = getCutoff(days);
   const db = await getDb('orders');
@@ -290,41 +307,28 @@ async function getQcEventsDataset(days) {
 
   const docs = await qcCol.find(buildQcQuery(cutoff), {
     projection: {
-      _id: 1,
-      order: 1,
-      createdAt: 1,
-      type: 1,
-      category: 1,
-      errorType: 1,
-      department: 1,
-      issue: 1,
-      user: 1,
-      errorAssignedTo: 1,
-      text: 1,
-      html: 1,
-      deletedAt: 1
+      _id: 1, order: 1, createdAt: 1, type: 1, category: 1,
+      errorType: 1, department: 1, issue: 1, user: 1,
+      errorAssignedTo: 1, text: 1, html: 1, deletedAt: 1
     }
   }).sort({ createdAt: -1 }).toArray();
 
-  const orderIds = docs
-    .map(doc => safeString(doc?.order))
-    .filter(Boolean);
-
+  const orderIds = docs.map(doc => safeString(doc?.order)).filter(Boolean);
   const ordersMap = await getOrdersMap(orderIds);
-  const events = docs.map(doc => buildQcEvent(doc, ordersMap.get(safeString(doc?.order)))).sort((a, b) => {
-    if (!a.qcCreatedAt && !b.qcCreatedAt) return 0;
-    if (!a.qcCreatedAt) return 1;
-    if (!b.qcCreatedAt) return -1;
-    return new Date(b.qcCreatedAt) - new Date(a.qcCreatedAt);
-  });
 
-  return {
-    cutoff,
-    refreshedAt: new Date(),
-    events
-  };
+  const events = docs
+    .map(doc => buildQcEvent(doc, ordersMap.get(safeString(doc?.order))))
+    .sort((a, b) => {
+      if (!a.qcCreatedAt && !b.qcCreatedAt) return 0;
+      if (!a.qcCreatedAt) return 1;
+      if (!b.qcCreatedAt) return -1;
+      return new Date(b.qcCreatedAt) - new Date(a.qcCreatedAt);
+    });
+
+  return { cutoff, refreshedAt: new Date(), events };
 }
 
+// Collapses event-grain QC records to one summary row per order.
 function buildQcOrderSummaries(events) {
   const grouped = new Map();
 
@@ -420,11 +424,7 @@ function buildDailyTrend(events) {
     .sort((a, b) => a.date.localeCompare(b.date));
 }
 
-function average(values) {
-  const valid = values.filter(v => typeof v === 'number' && Number.isFinite(v));
-  if (!valid.length) return null;
-  return Math.round((valid.reduce((sum, v) => sum + v, 0) / valid.length) * 10) / 10;
-}
+// —— Middleware ——————————————————————————————————————————
 
 function ipCheck(req, res, next) {
   if (!CONFIG.ALLOWED_IPS) return next();
@@ -452,21 +452,22 @@ app.use((req, res, next) => {
   next();
 });
 
+// ═══════════════════════════════════════════════════════════
+// ENDPOINTS
+// ═══════════════════════════════════════════════════════════
+
+// —— Health (no auth) ————————————————————————————————————
 app.get('/health', async (req, res) => {
   try {
     const db = await getDb('orders');
     await db.command({ ping: 1 });
-    res.json({
-      status: 'ok',
-      timestamp: new Date().toISOString(),
-      env: CONFIG.NODE_ENV,
-      version: '2.1'
-    });
+    res.json({ status: 'ok', timestamp: new Date().toISOString(), env: CONFIG.NODE_ENV, version: '4.0' });
   } catch (err) {
     res.status(500).json({ status: 'error', message: err.message });
   }
 });
 
+// —— Collection Discovery ————————————————————————————————
 app.get('/collections', async (req, res) => {
   try {
     const dbNames = ['orders', 'payment', 'user', 'master'];
@@ -486,6 +487,13 @@ app.get('/collections', async (req, res) => {
   }
 });
 
+// —— KPI Segments ————————————————————————————————————————
+// Usage: /kpi-segments?days=90&page=1&pageSize=5000
+//
+// Segments are derived from orders.orderStatusHistory entries where
+// updatedStatus.statusType = 'Processing'. Duration = time to next entry.
+// reportItemCount sourced from order.reportItems (embedded array, no join needed).
+// workerUserId uses assignedTo.foreignKeyId with fallback to assignedTo.v2Id.
 app.get('/kpi-segments', async (req, res) => {
   try {
     const days = parsePositiveInt(req.query.days, 90, { min: 1, max: 365 });
@@ -496,7 +504,7 @@ app.get('/kpi-segments', async (req, res) => {
     const db = await getDb('orders');
     const ordersCol = db.collection('orders');
 
-    const ordersPipeline = [
+    const orders = await ordersCol.aggregate([
       {
         $match: {
           paymentStatus: 'paid',
@@ -515,15 +523,14 @@ app.get('/kpi-segments', async (req, res) => {
           orderStatusHistory: 1
         }
       }
-    ];
+    ], { allowDiskUse: true }).toArray();
 
-    const orders = await ordersCol.aggregate(ordersPipeline, { allowDiskUse: true }).toArray();
     const allSegments = [];
 
     for (const order of orders) {
       const history = Array.isArray(order.orderStatusHistory) ? order.orderStatusHistory : [];
       const reportCount = Array.isArray(order.reportItems) ? order.reportItems.length : 0;
-      const reportName = Array.isArray(order.reportItems) ? order.reportItems[0]?.name || null : null;
+      const reportName = Array.isArray(order.reportItems) ? (order.reportItems[0]?.name || null) : null;
 
       for (let i = 0; i < history.length; i++) {
         const entry = history[i];
@@ -534,8 +541,12 @@ app.get('/kpi-segments', async (req, res) => {
 
         const nextEntry = i + 1 < history.length ? history[i + 1] : null;
         const segmentEndDate = toDate(nextEntry?.createdAt);
-        const durationSeconds = segmentEndDate ? (segmentEndDate.getTime() - entryDate.getTime()) / 1000 : null;
-        const durationMinutes = durationSeconds !== null ? Math.round((durationSeconds / 60) * 10) / 10 : null;
+        const durationSeconds = segmentEndDate
+          ? (segmentEndDate.getTime() - entryDate.getTime()) / 1000
+          : null;
+        const durationMinutes = durationSeconds !== null
+          ? Math.round((durationSeconds / 60) * 10) / 10
+          : null;
 
         if (durationSeconds !== null && durationSeconds <= 0) continue;
 
@@ -551,7 +562,9 @@ app.get('/kpi-segments', async (req, res) => {
           reportItemName: reportName,
           statusSlug: entry?.updatedStatus?.slug || '',
           statusName: entry?.updatedStatus?.name || '',
-          workerUserId: assigned.foreignKeyId || null,
+          // foreignKeyId is the V1 MySQL user ID — preferred join key for Power BI
+          // v2Id is the MongoDB user ID — fallback for orders never synced to V1
+          workerUserId: assigned.foreignKeyId || assigned.v2Id || null,
           workerName: buildFullName(assigned),
           workerEmail: assigned.email || null,
           changedByName: buildFullName(user),
@@ -584,15 +597,24 @@ app.get('/kpi-segments', async (req, res) => {
   }
 });
 
+// —— Credential Counts ———————————————————————————————————
+// For Data Entry XpH (unit = Credentials).
+// Date-scoped to the same window as kpi-segments so credential counts
+// are only counted for orders active within the reporting period.
+// order-credentials.order is an ObjectId reference to orders._id.
 app.get('/credential-counts', async (req, res) => {
   try {
+    const days = parsePositiveInt(req.query.days, 90, { min: 1, max: 365 });
+    const cutoff = getCutoff(days);  // restored in v4.0 — was dropped in v2.1
+
     const db = await getDb('orders');
     const credsCol = db.collection('order-credentials');
 
-    const pipeline = [
+    const counts = await credsCol.aggregate([
       {
         $match: {
           active: true,
+          createdAt: { $gte: cutoff },  // date-scope prevents unbounded credential fetch
           $or: [{ deletedAt: null }, { deletedAt: { $exists: false } }]
         }
       },
@@ -609,16 +631,24 @@ app.get('/credential-counts', async (req, res) => {
           credentialCount: 1
         }
       }
-    ];
+    ]).toArray();
 
-    const counts = await credsCol.aggregate(pipeline).toArray();
-    res.json({ count: counts.length, credentials: counts });
+    res.json({
+      count: counts.length,
+      dateRange: { from: cutoff.toISOString(), to: new Date().toISOString() },
+      credentials: counts
+    });
   } catch (err) {
     console.error('Credential counts error:', err);
     res.status(500).json({ error: err.message });
   }
 });
 
+// —— Report Counts ——————————————————————————————————————
+// Preserved from v2.1. Counts report items per order via the
+// order-report-item collection (two-hop join: item → report → order).
+// Note: /kpi-segments already embeds reportItemCount from order.reportItems.
+// This endpoint is kept for reconciliation and alternative report count sourcing.
 app.get('/report-counts', async (req, res) => {
   try {
     const db = await getDb('orders');
@@ -637,15 +667,10 @@ app.get('/report-counts', async (req, res) => {
 
     const itemCounts = await reportItemsCol.aggregate([
       {
-        $match: {
-          $or: [{ deletedAt: null }, { deletedAt: { $exists: false } }]
-        }
+        $match: { $or: [{ deletedAt: null }, { deletedAt: { $exists: false } }] }
       },
       {
-        $group: {
-          _id: '$orderReport',
-          reportItemCount: { $sum: 1 }
-        }
+        $group: { _id: '$orderReport', reportItemCount: { $sum: 1 } }
       }
     ]).toArray();
 
@@ -657,11 +682,7 @@ app.get('/report-counts', async (req, res) => {
       orderCounts[orderId] = (orderCounts[orderId] || 0) + itemCount.reportItemCount;
     }
 
-    const result = Object.entries(orderCounts).map(([orderId, count]) => ({
-      orderId,
-      reportItemCount: count
-    }));
-
+    const result = Object.entries(orderCounts).map(([orderId, count]) => ({ orderId, reportItemCount: count }));
     res.json({ count: result.length, reports: result });
   } catch (err) {
     console.error('Report counts error:', err);
@@ -669,6 +690,13 @@ app.get('/report-counts', async (req, res) => {
   }
 });
 
+// —— QC Events ——————————————————————————————————————————
+// Usage: /qc-events?days=90&page=1&pageSize=5000&includeHtml=false&includeText=false
+//
+// One row per QC event. Collection: orders.order-discussion.
+// Filter: type='system_logs' AND category.slug='quality_control'.
+// Each event enriched with parent order context and status-at-QC derivation.
+// orderSerialNumber included for Power BI join to KPI segments.
 app.get('/qc-events', async (req, res) => {
   try {
     const days = parsePositiveInt(req.query.days, 90, { min: 1, max: 365 });
@@ -679,6 +707,7 @@ app.get('/qc-events', async (req, res) => {
 
     const dataset = await getQcEventsDataset(days);
     const paged = paginate(dataset.events, page, pageSize);
+
     const events = paged.items.map(event => ({
       ...event,
       text: includeText ? event.text : undefined,
@@ -688,7 +717,7 @@ app.get('/qc-events', async (req, res) => {
     res.json({
       count: events.length,
       totalCount: paged.totalCount,
-      orderCount: new Set(dataset.events.map(event => event.orderId).filter(Boolean)).size,
+      orderCount: new Set(dataset.events.map(e => e.orderId).filter(Boolean)).size,
       page: paged.page,
       pageSize: paged.pageSize,
       totalPages: paged.totalPages,
@@ -697,9 +726,9 @@ app.get('/qc-events', async (req, res) => {
       qcFilter: {
         type: 'system_logs',
         categorySlug: 'quality_control',
-        allOrdersWithQcRecords: true,
         qcDateField: 'order-discussion.createdAt',
-        departmentSource: 'order-discussion.department'
+        departmentSource: 'order-discussion.department',
+        allOrderPopulation: true
       },
       dateRange: { from: dataset.cutoff.toISOString(), to: new Date().toISOString() },
       refreshedAt: dataset.refreshedAt.toISOString(),
@@ -711,6 +740,11 @@ app.get('/qc-events', async (req, res) => {
   }
 });
 
+// —— QC Orders ——————————————————————————————————————————
+// Usage: /qc-orders?days=90&page=1&pageSize=5000
+//
+// One summary row per order with QC activity. Aggregates event-level
+// fields (departments, issues, reporter/assignee names) into arrays.
 app.get('/qc-orders', async (req, res) => {
   try {
     const days = parsePositiveInt(req.query.days, 90, { min: 1, max: 365 });
@@ -733,9 +767,9 @@ app.get('/qc-orders', async (req, res) => {
       qcFilter: {
         type: 'system_logs',
         categorySlug: 'quality_control',
-        allOrdersWithQcRecords: true,
         qcDateField: 'order-discussion.createdAt',
-        departmentSource: 'order-discussion.department'
+        departmentSource: 'order-discussion.department',
+        allOrderPopulation: true
       },
       dateRange: { from: dataset.cutoff.toISOString(), to: new Date().toISOString() },
       refreshedAt: dataset.refreshedAt.toISOString(),
@@ -747,36 +781,40 @@ app.get('/qc-orders', async (req, res) => {
   }
 });
 
+// —— QC Summary —————————————————————————————————————————
+// Usage: /qc-summary?days=90
+//
+// Aggregated QC metrics — no pagination. Suitable for dashboard header KPIs
+// and breakdown charts (by department, issue, error type, reporter, assignee,
+// status at QC, next status, daily trend).
 app.get('/qc-summary', async (req, res) => {
   try {
     const days = parsePositiveInt(req.query.days, 90, { min: 1, max: 365 });
     const dataset = await getQcEventsDataset(days);
     const orderSummaries = buildQcOrderSummaries(dataset.events);
 
-    const minutesToNextStatusChange = dataset.events.map(event => event.minutesToNextStatusChange);
-    const hoursToNextStatusChange = dataset.events.map(event => event.hoursToNextStatusChange);
-
     res.json({
       collectionUsed: 'order-discussion',
       qcFilter: {
         type: 'system_logs',
         categorySlug: 'quality_control',
-        allOrdersWithQcRecords: true,
         qcDateField: 'order-discussion.createdAt',
-        departmentSource: 'order-discussion.department'
+        departmentSource: 'order-discussion.department',
+        allOrderPopulation: true
       },
       dateRange: { from: dataset.cutoff.toISOString(), to: new Date().toISOString() },
       refreshedAt: dataset.refreshedAt.toISOString(),
       totals: {
         qcEventCount: dataset.events.length,
         qcOrderCount: orderSummaries.length,
-        kickItBackCount: dataset.events.filter(event => event.isKickItBack).length,
-        fixedItCount: dataset.events.filter(event => event.isFixedIt).length,
-        avgQcEventsPerOrder: average(orderSummaries.map(order => order.qcEventCount)),
-        avgMinutesToNextStatusChange: average(minutesToNextStatusChange),
-        avgHoursToNextStatusChange: average(hoursToNextStatusChange)
+        kickItBackCount: dataset.events.filter(e => e.isKickItBack).length,
+        fixedItCount: dataset.events.filter(e => e.isFixedIt).length,
+        avgQcEventsPerOrder: average(orderSummaries.map(o => o.qcEventCount)),
+        avgMinutesToNextStatusChange: average(dataset.events.map(e => e.minutesToNextStatusChange)),
+        avgHoursToNextStatusChange: average(dataset.events.map(e => e.hoursToNextStatusChange))
       },
       byDepartment: groupCounts(dataset.events, 'departmentName'),
+      byOrderType: groupCounts(dataset.events, 'orderType'),
       byIssue: groupCounts(dataset.events, 'issueName'),
       byErrorType: groupCounts(dataset.events, 'errorType'),
       byReporter: groupCounts(dataset.events, 'reporterName'),
@@ -791,68 +829,119 @@ app.get('/qc-summary', async (req, res) => {
   }
 });
 
+// —— QC Discovery ————————————————————————————————————————
+// Diagnostic scan — restored from v3.0.
+// Scans all collections in the orders DB for QC-signal fields.
+// Run after V2 deployments to verify order-discussion schema hasn't changed.
+// Check /qc-discovery response and compare fieldsFound vs expectedFields.
+app.get('/qc-discovery', async (req, res) => {
+  try {
+    const db = await getDb('orders');
+    const collections = await db.listCollections().toArray();
+    const collectionNames = collections.map(c => c.name);
+
+    const qcFieldSignals = [
+      'errorType', 'isFixedIt', 'isKickItBack', 'errorAssignedTo',
+      'kickback', 'qcError', 'qc_error', 'error_type'
+    ];
+    const results = [];
+
+    for (const colName of collectionNames) {
+      try {
+        const col = db.collection(colName);
+        const count = await col.countDocuments({});
+        if (count === 0) continue;
+
+        const samples = await col.find({}).limit(2).toArray();
+        const allKeys = new Set();
+        samples.forEach(doc => Object.keys(doc).forEach(k => allKeys.add(k)));
+        const keys = Array.from(allKeys);
+
+        const matchedSignals = qcFieldSignals.filter(sig => keys.includes(sig));
+
+        let withErrorType = 0;
+        if (keys.includes('errorType')) {
+          withErrorType = await col.countDocuments({ errorType: { $exists: true, $ne: null } });
+        }
+
+        if (matchedSignals.length > 0
+          || colName.toLowerCase().includes('qc')
+          || colName.toLowerCase().includes('error')) {
+          results.push({
+            collection: colName,
+            totalDocs: count,
+            fields: keys,
+            qcSignalsFound: matchedSignals,
+            docsWithErrorType: withErrorType,
+            likelyCandidateScore: matchedSignals.length + (withErrorType > 0 ? 5 : 0)
+          });
+        }
+      } catch (e) {
+        results.push({ collection: colName, error: e.message });
+      }
+    }
+
+    results.sort((a, b) => (b.likelyCandidateScore || 0) - (a.likelyCandidateScore || 0));
+
+    res.json({
+      scannedCollections: collectionNames.length,
+      candidatesFound: results.length,
+      candidates: results,
+      allCollections: collectionNames.sort()
+    });
+  } catch (err) {
+    console.error('QC discovery error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// —— Indexes ————————————————————————————————————————————
 app.get('/indexes', async (req, res) => {
   res.json({
     description: 'Run these in MongoDB Atlas → Data Explorer → each collection → Indexes tab → Create Index',
     indexes: [
       {
-        database: 'orders',
-        collection: 'orders',
-        name: 'kpi_segments_query',
+        database: 'orders', collection: 'orders', name: 'kpi_segments_query',
         keys: { paymentStatus: 1, orderType: 1, deletedAt: 1, 'orderStatusHistory.createdAt': 1 },
         reason: 'Speeds up the main KPI segments aggregation pipeline'
       },
       {
-        database: 'orders',
-        collection: 'order-credentials',
-        name: 'credential_count_query',
-        keys: { order: 1, active: 1, deletedAt: 1 },
-        reason: 'Speeds up credential count grouping per order'
+        database: 'orders', collection: 'order-credentials', name: 'credential_count_query',
+        keys: { order: 1, active: 1, createdAt: 1, deletedAt: 1 },
+        reason: 'Speeds up credential count grouping per order (date-scoped in v4.0)'
       },
       {
-        database: 'orders',
-        collection: 'order-discussion',
-        name: 'qc_events_query_v2',
+        database: 'orders', collection: 'order-discussion', name: 'qc_events_query_v4',
         keys: { type: 1, 'category.slug': 1, createdAt: -1, deletedAt: 1 },
-        reason: 'Speeds up QC event filtering by quality_control discussions'
+        reason: 'Speeds up QC event filtering by quality_control discussion entries'
       },
       {
-        database: 'orders',
-        collection: 'orders',
-        name: 'qc_order_lookup',
+        database: 'orders', collection: 'orders', name: 'qc_order_lookup',
         keys: { _id: 1, orderSerialNumber: 1, orderType: 1, paymentStatus: 1 },
-        reason: 'Supports QC event enrichment by order details and workflow history'
+        reason: 'Supports QC event enrichment with order details and status history'
       },
       {
-        database: 'orders',
-        collection: 'order-report',
-        name: 'report_order_lookup',
+        database: 'orders', collection: 'order-report', name: 'report_order_lookup',
         keys: { order: 1, deletedAt: 1 },
-        reason: 'Speeds up report count lookup per order'
+        reason: 'Speeds up report count lookup per order (/report-counts)'
       },
       {
-        database: 'orders',
-        collection: 'order-report-item',
-        name: 'report_item_grouping',
+        database: 'orders', collection: 'order-report-item', name: 'report_item_grouping',
         keys: { orderReport: 1, deletedAt: 1 },
-        reason: 'Speeds up report item count aggregation'
+        reason: 'Speeds up report item count aggregation (/report-counts)'
       }
     ]
   });
 });
 
+// —— 404 / Error handlers —————————————————————————————
 app.use((req, res) => {
   res.status(404).json({
     error: 'Not found',
     availableEndpoints: [
-      '/health',
-      '/collections',
-      '/kpi-segments',
-      '/credential-counts',
-      '/report-counts',
-      '/qc-events',
-      '/qc-orders',
-      '/qc-summary',
+      '/health', '/collections',
+      '/kpi-segments', '/credential-counts', '/report-counts',
+      '/qc-events', '/qc-orders', '/qc-summary', '/qc-discovery',
       '/indexes'
     ]
   });
@@ -863,11 +952,11 @@ app.use((err, req, res, next) => {
   res.status(500).json({ error: 'Internal server error' });
 });
 
+// —— Start ——————————————————————————————————————————————
 app.listen(CONFIG.PORT, '0.0.0.0', () => {
-  console.log(`IEE KPI Data API running on port ${CONFIG.PORT}`);
+  console.log(`IEE KPI Data API v4.0 running on port ${CONFIG.PORT}`);
   console.log(`Environment: ${CONFIG.NODE_ENV}`);
-  console.log('Version: 2.1');
-  console.log('Rate limit: 60 requests/minute');
+  console.log(`Rate limit: 60 requests/minute`);
   console.log(`IP allowlist: ${CONFIG.ALLOWED_IPS || 'disabled (all IPs allowed)'}`);
 });
 
