@@ -1,7 +1,7 @@
 {
   "name": "iee-kpi-api",
-  "version": "1.0.0",
-  "description": "IEE KPI/QC Data API — MongoDB to Google Sheets pipeline",
+  "version": "2.1.0",
+  "description": "IEE KPI/QC Data API \u2014 MongoDB to Google Sheets pipeline",
   "main": "server.js",
   "engines": {
     "node": ">=20.0.0"
