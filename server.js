@@ -896,6 +896,80 @@ app.get('/qc-discovery', async (req, res) => {
 });
 
 // —— Indexes ————————————————————————————————————————————
+
+// ── /users — Active staff list from user.user collection ──
+app.get('/users', async (req, res) => {
+  try {
+    const userDb = mongoClient.db('user');
+    const col    = userDb.collection('user');
+
+    // Staff role ObjectId (confirmed from user.role collection)
+    const STAFF_ROLE_ID = '67acba952a78ccf7588a3ee1';
+
+    // Pull all active users — filter to non-system accounts
+    // Strategy: active:true AND (roleId matches Staff OR type != 'system_admin')
+    // We return all active users and include type/roleId so GAS can filter if needed
+    const cursor = col.find(
+      { active: true },
+      {
+        projection: {
+          _id: 1,
+          v1Id: 1,
+          legacyId: 1,
+          firstName: 1,
+          middleName: 1,
+          lastName: 1,
+          email: 1,
+          department: 1,
+          tags: 1,
+          type: 1,
+          roleId: 1,
+          active: 1
+        }
+      }
+    ).sort({ lastName: 1, firstName: 1 });
+
+    const docs = await cursor.toArray();
+
+    const users = docs.map(u => {
+      // Name: firstName + lastName only (middleName is unreliable — sometimes
+      // populated with last name due to data entry quirk)
+      const fullName = [u.firstName, u.lastName].filter(Boolean).join(' ');
+
+      // Tags: extract names as comma-separated string
+      const tagNames = (u.tags || []).map(t => t.name).filter(Boolean).join(', ');
+
+      // Is staff: roleId matches Staff role OR type is not system_admin/admin
+      const isStaff = u.roleId === STAFF_ROLE_ID ||
+        (!['system_admin', 'admin'].includes(u.type));
+
+      return {
+        userId:       u._id.toString(),       // ObjectId string — join key for QC events
+        v1Id:         u.v1Id || null,          // MySQL user ID — join key for KPI segments
+        legacyId:     u.legacyId || null,
+        fullName:     fullName,
+        email:        u.email || '',
+        department:   (u.department && u.department.name) || '',
+        departmentId: (u.department && u.department.legacyId) || '',
+        tags:         tagNames,
+        type:         u.type || '',
+        roleId:       u.roleId || '',
+        isStaff:      isStaff,
+        active:       u.active === true
+      };
+    });
+
+    res.json({
+      count:      users.length,
+      staffCount: users.filter(u => u.isStaff).length,
+      users
+    });
+  } catch (err) {
+    console.error('/users error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.get('/indexes', async (req, res) => {
   res.json({
     description: 'Run these in MongoDB Atlas → Data Explorer → each collection → Indexes tab → Create Index',
@@ -942,7 +1016,7 @@ app.use((req, res) => {
       '/health', '/collections',
       '/kpi-segments', '/credential-counts', '/report-counts',
       '/qc-events', '/qc-orders', '/qc-summary', '/qc-discovery',
-      '/indexes'
+      '/users', '/indexes'
     ]
   });
 });
@@ -954,7 +1028,7 @@ app.use((err, req, res, next) => {
 
 // —— Start ——————————————————————————————————————————————
 app.listen(CONFIG.PORT, '0.0.0.0', () => {
-  console.log(`IEE KPI Data API v4.0 running on port ${CONFIG.PORT}`);
+  console.log(`IEE KPI Data API v4.1 running on port ${CONFIG.PORT}`);
   console.log(`Environment: ${CONFIG.NODE_ENV}`);
   console.log(`Rate limit: 60 requests/minute`);
   console.log(`IP allowlist: ${CONFIG.ALLOWED_IPS || 'disabled (all IPs allowed)'}`);
