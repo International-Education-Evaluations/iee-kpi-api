@@ -1,18 +1,24 @@
 // ============================================================
-// IEE KPI Data API Server — v2.0
-// CHANGES from v1:
-//   - Confirmed collection names from /collections output
-//   - Added /report-counts endpoint (Evaluation XpH unit)
-//   - Added pagination to /kpi-segments (?page=1&pageSize=5000)
-//   - Fixed QC collection name to 'order-discussion' (confirmed)
-//   - Added /indexes endpoint with recommended indexes
+// IEE KPI Data API Server — v3.0
+// CHANGES from v2:
+//   - /kpi-segments: reportItemCount now uses reportItems.length
+//     (embedded on order doc — no separate collection needed)
+//   - /credential-counts: added date filter (createdAt >= cutoff)
+//   - /report-counts: REMOVED — data already in /kpi-segments
+//   - /qc-events: patched to return diagnostic when no QC docs
+//     found — order-discussion has no errorType field; real QC
+//     collection TBD via /collections discovery
+//   - MongoDB client: added retryWrites + retryReads for
+//     transparent reconnect after connection drops
+//   - Removed unused ObjectId import (no longer needed)
+//   - Added /qc-discovery endpoint to identify real QC collection
 // ============================================================
 
 const express = require('express');
 const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
 const cors = require('cors');
-const { MongoClient, ObjectId } = require('mongodb');
+const { MongoClient } = require('mongodb');
 
 const app = express();
 
@@ -66,7 +72,9 @@ async function getDb(dbName) {
     client = new MongoClient(CONFIG.MONGO_URI, {
       maxPoolSize: 5,
       serverSelectionTimeoutMS: 10000,
-      connectTimeoutMS: 10000
+      connectTimeoutMS: 10000,
+      retryWrites: true,   // auto-retry on transient write failures
+      retryReads: true     // auto-retry on transient read failures / reconnect
     });
     await client.connect();
     console.log('Connected to MongoDB Atlas');
@@ -92,7 +100,7 @@ app.get('/health', async (req, res) => {
   try {
     const db = await getDb('orders');
     await db.command({ ping: 1 });
-    res.json({ status: 'ok', timestamp: new Date().toISOString(), env: CONFIG.NODE_ENV, version: '2.0' });
+    res.json({ status: 'ok', timestamp: new Date().toISOString(), env: CONFIG.NODE_ENV, version: '3.0' });
   } catch (err) {
     res.status(500).json({ status: 'error', message: err.message });
   }
@@ -101,7 +109,7 @@ app.get('/health', async (req, res) => {
 // —— Collection Discovery —————————————————————————————————
 app.get('/collections', async (req, res) => {
   try {
-    const dbNames = ['orders', 'payment', 'user', 'master'];
+    const dbNames = ['orders', 'payment', 'user', 'master', 'evaluation'];
     const result = {};
     for (const dbName of dbNames) {
       try {
@@ -120,6 +128,11 @@ app.get('/collections', async (req, res) => {
 
 // —— KPI Segments (with pagination) ———————————————————————
 // Usage: /kpi-segments?days=90&page=1&pageSize=5000
+//
+// Report count source: orders.reportItems (embedded array on the order doc).
+// This is the authoritative source — no separate collection join needed.
+// reportItems[].name  = product name (e.g. "Education Course Report")
+// reportItems.length  = report count used as XpH numerator for Evaluation
 app.get('/kpi-segments', async (req, res) => {
   try {
     const days = Math.min(parseInt(req.query.days) || 90, 365);
@@ -129,7 +142,6 @@ app.get('/kpi-segments', async (req, res) => {
     cutoff.setDate(cutoff.getDate() - days);
 
     const db = await getDb('orders');
-    // Confirmed collection name: 'orders'
     const ordersCol = db.collection('orders');
 
     const ordersPipeline = [
@@ -147,7 +159,7 @@ app.get('/kpi-segments', async (req, res) => {
           orderSerialNumber: 1,
           orderType: 1,
           parentOrderId: 1,
-          reportItems: 1,
+          reportItems: 1,          // embedded product array — used for report count + name
           orderStatusHistory: 1
         }
       }
@@ -155,13 +167,17 @@ app.get('/kpi-segments', async (req, res) => {
 
     const orders = await ordersCol.aggregate(ordersPipeline, { allowDiskUse: true }).toArray();
 
-    // Extract all Processing segments
     const allSegments = [];
 
     for (const order of orders) {
       const history = order.orderStatusHistory || [];
-      const reportCount = (order.reportItems || []).length;
-      const reportName = (order.reportItems || [])[0]?.name || null;
+
+      // reportItems is embedded on the order — no separate collection needed.
+      // Each element has: foreignKeyId, name (product name), slug
+      const reportItems = order.reportItems || [];
+      const reportItemCount = reportItems.length;
+      // Use first report item name as the representative product name
+      const reportItemName = reportItems[0]?.name || null;
 
       for (let i = 0; i < history.length; i++) {
         const entry = history[i];
@@ -190,8 +206,8 @@ app.get('/kpi-segments', async (req, res) => {
           orderId: order._id.toString(),
           orderType: order.orderType,
           parentOrderId: order.parentOrderId || null,
-          reportItemCount: reportCount,
-          reportItemName: reportName,
+          reportItemCount,
+          reportItemName,
           statusSlug: entry.updatedStatus?.slug || '',
           statusName: entry.updatedStatus?.name || '',
           workerUserId: assigned.foreignKeyId || null,
@@ -208,7 +224,7 @@ app.get('/kpi-segments', async (req, res) => {
       }
     }
 
-    // Pagination
+    // Pagination (in-memory — all segments built before slicing)
     const totalCount = allSegments.length;
     const totalPages = Math.ceil(totalCount / pageSize);
     const startIdx = (page - 1) * pageSize;
@@ -235,6 +251,8 @@ app.get('/kpi-segments', async (req, res) => {
 
 // —— Credential Counts ————————————————————————————————————
 // For Data Entry XpH (unit = Credentials)
+// Scoped to orders within the requested date window using credential createdAt.
+// order-credentials.order is an ObjectId reference to orders._id.
 app.get('/credential-counts', async (req, res) => {
   try {
     const days = Math.min(parseInt(req.query.days) || 90, 365);
@@ -242,33 +260,37 @@ app.get('/credential-counts', async (req, res) => {
     cutoff.setDate(cutoff.getDate() - days);
 
     const db = await getDb('orders');
-    // Confirmed collection name: 'order-credentials'
     const credsCol = db.collection('order-credentials');
 
     const pipeline = [
       {
         $match: {
           active: true,
+          createdAt: { $gte: cutoff },           // date-scoped — was missing in v2
           $or: [{ deletedAt: null }, { deletedAt: { $exists: false } }]
         }
       },
       {
         $group: {
-          _id: '$order',
+          _id: '$order',                          // ObjectId ref to orders._id
           credentialCount: { $sum: 1 }
         }
       },
       {
         $project: {
           _id: 0,
-          orderId: { $toString: '$_id' },
+          orderId: { $toString: '$_id' },         // convert ObjectId to string for JSON
           credentialCount: 1
         }
       }
     ];
 
     const counts = await credsCol.aggregate(pipeline).toArray();
-    res.json({ count: counts.length, credentials: counts });
+    res.json({
+      count: counts.length,
+      dateRange: { from: cutoff.toISOString(), to: new Date().toISOString() },
+      credentials: counts
+    });
 
   } catch (err) {
     console.error('Credential counts error:', err);
@@ -276,69 +298,12 @@ app.get('/credential-counts', async (req, res) => {
   }
 });
 
-// —— Report Counts (NEW) —————————————————————————————————
-// For Evaluation XpH (unit = Reports)
-// order-report-item has orderReport (ref to order-report), which has order (ref to orders)
-// We need: for each order, count of report items
-app.get('/report-counts', async (req, res) => {
-  try {
-    const db = await getDb('orders');
-    // Confirmed collection name: 'order-report-item'
-    const reportItemsCol = db.collection('order-report-item');
-    // Confirmed collection name: 'order-report'
-    const orderReportsCol = db.collection('order-report');
-
-    // Step 1: Get all order-report documents to build orderReport -> orderId map
-    const reports = await orderReportsCol.find(
-      { $or: [{ deletedAt: null }, { deletedAt: { $exists: false } }] },
-      { projection: { _id: 1, order: 1 } }
-    ).toArray();
-
-    const reportToOrderMap = {};
-    for (const r of reports) {
-      reportToOrderMap[r._id.toString()] = r.order;
-    }
-
-    // Step 2: Count report items per orderReport
-    const pipeline = [
-      {
-        $match: {
-          $or: [{ deletedAt: null }, { deletedAt: { $exists: false } }]
-        }
-      },
-      {
-        $group: {
-          _id: '$orderReport',
-          reportItemCount: { $sum: 1 }
-        }
-      }
-    ];
-
-    const itemCounts = await reportItemsCol.aggregate(pipeline).toArray();
-
-    // Step 3: Map back to orderId
-    const orderCounts = {};
-    for (const ic of itemCounts) {
-      const orderRef = reportToOrderMap[ic._id?.toString()];
-      if (!orderRef) continue;
-      const orderId = orderRef.toString();
-      orderCounts[orderId] = (orderCounts[orderId] || 0) + ic.reportItemCount;
-    }
-
-    const result = Object.entries(orderCounts).map(([orderId, count]) => ({
-      orderId,
-      reportItemCount: count
-    }));
-
-    res.json({ count: result.length, reports: result });
-
-  } catch (err) {
-    console.error('Report counts error:', err);
-    res.status(500).json({ error: err.message });
-  }
-});
-
 // —— QC Events ————————————————————————————————————————————
+// NOTE: order-discussion does NOT contain QC/error data.
+// Confirmed schema of order-discussion: { order, user, category, html, text, type }
+// type values: 'discussion', 'system_logs' — no errorType, no isFixedIt fields.
+// The real QC collection is unknown. Use /qc-discovery to identify it.
+// This endpoint returns a diagnostic until the correct collection is confirmed.
 app.get('/qc-events', async (req, res) => {
   try {
     const days = Math.min(parseInt(req.query.days) || 90, 365);
@@ -346,64 +311,97 @@ app.get('/qc-events', async (req, res) => {
     cutoff.setDate(cutoff.getDate() - days);
 
     const db = await getDb('orders');
-    // Confirmed collection name: 'order-discussion' (singular!)
-    const qcCol = db.collection('order-discussion');
 
-    const pipeline = [
-      {
-        $match: {
-          errorType: { $ne: null },
-          $or: [{ deletedAt: null }, { deletedAt: { $exists: false } }],
-          createdAt: { $gte: cutoff }
-        }
+    // Attempt order-discussion — confirmed to have no QC fields
+    const discussionCol = db.collection('order-discussion');
+    const sampleDocs = await discussionCol.find({}).limit(3).toArray();
+    const sampleKeys = sampleDocs.length > 0 ? Object.keys(sampleDocs[0]) : [];
+
+    // Check if errorType field exists anywhere
+    const withErrorType = await discussionCol.countDocuments({ errorType: { $exists: true } });
+
+    res.status(200).json({
+      status: 'collection_mismatch',
+      message: 'order-discussion does not contain QC/error data. The real QC collection has not been identified yet.',
+      diagnosis: {
+        collectionChecked: 'order-discussion',
+        documentCount: await discussionCol.countDocuments({}),
+        fieldsFound: sampleKeys,
+        docsWithErrorType: withErrorType,
+        expectedFields: ['errorType', 'isFixedIt', 'errorAssignedTo', 'department']
       },
-      {
-        $project: {
-          _id: 0,
-          qcEventId: { $toString: '$_id' },
-          orderId: { $toString: '$order' },
-          errorType: 1,
-          isFixedIt: { $cond: [{ $eq: ['$errorType', 'i_fixed_it'] }, true, false] },
-          isKickItBack: { $cond: [{ $eq: ['$errorType', 'kick_it_back'] }, true, false] },
-          reporterUserId: '$user.foreignKeyId',
-          reporterName: {
-            $trim: {
-              input: { $concat: [{ $ifNull: ['$user.firstName', ''] }, ' ', { $ifNull: ['$user.lastName', ''] }] }
-            }
-          },
-          accountableUserId: '$errorAssignedTo.foreignKeyId',
-          accountableName: {
-            $trim: {
-              input: { $concat: [{ $ifNull: ['$errorAssignedTo.firstName', ''] }, ' ', { $ifNull: ['$errorAssignedTo.lastName', ''] }] }
-            }
-          },
-          departmentId: '$department.foreignKeyId',
-          departmentName: '$department.name',
-          issueName: '$issue.name',
-          issueCustomText: '$issue.issueCustomText',
-          createdAt: 1
-        }
-      },
-      { $sort: { createdAt: -1 } }
-    ];
-
-    const events = await qcCol.aggregate(pipeline).toArray();
-
-    const formattedEvents = events.map(evt => ({
-      ...evt,
-      createdAt: evt.createdAt ? new Date(evt.createdAt).toISOString() : null
-    }));
-
-    res.json({
-      count: formattedEvents.length,
-      collectionUsed: 'order-discussion',
-      dateRange: { from: cutoff.toISOString(), to: new Date().toISOString() },
-      refreshedAt: new Date().toISOString(),
-      events: formattedEvents
+      action: 'Run GET /qc-discovery to identify which collection holds QC/error data',
+      events: []
     });
 
   } catch (err) {
     console.error('QC events error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// —— QC Discovery ————————————————————————————————————————
+// Scans all collections in the orders DB looking for QC/error fields.
+// Run once to identify the real QC collection, then update /qc-events.
+app.get('/qc-discovery', async (req, res) => {
+  try {
+    const db = await getDb('orders');
+    const collections = await db.listCollections().toArray();
+    const collectionNames = collections.map(c => c.name);
+
+    const results = [];
+
+    // QC-relevant field signals
+    const qcFieldSignals = ['errorType', 'isFixedIt', 'isKickItBack', 'errorAssignedTo', 'kickback', 'qcError', 'qc_error', 'error_type'];
+
+    for (const colName of collectionNames) {
+      try {
+        const col = db.collection(colName);
+        const count = await col.countDocuments({});
+        if (count === 0) continue;
+
+        // Sample up to 2 docs to check fields
+        const samples = await col.find({}).limit(2).toArray();
+        const allKeys = new Set();
+        samples.forEach(doc => Object.keys(doc).forEach(k => allKeys.add(k)));
+        const keys = Array.from(allKeys);
+
+        // Check for QC signals
+        const matchedSignals = qcFieldSignals.filter(sig => keys.includes(sig));
+
+        // Check for errorType specifically with a count
+        let withErrorType = 0;
+        if (keys.includes('errorType')) {
+          withErrorType = await col.countDocuments({ errorType: { $exists: true, $ne: null } });
+        }
+
+        if (matchedSignals.length > 0 || colName.toLowerCase().includes('qc') || colName.toLowerCase().includes('error')) {
+          results.push({
+            collection: colName,
+            totalDocs: count,
+            fields: keys,
+            qcSignalsFound: matchedSignals,
+            docsWithErrorType: withErrorType,
+            likelyCandidateScore: matchedSignals.length + (withErrorType > 0 ? 5 : 0)
+          });
+        }
+      } catch (e) {
+        results.push({ collection: colName, error: e.message });
+      }
+    }
+
+    // Sort by likely candidate score
+    results.sort((a, b) => (b.likelyCandidateScore || 0) - (a.likelyCandidateScore || 0));
+
+    res.json({
+      scannedCollections: collectionNames.length,
+      candidatesFound: results.length,
+      candidates: results,
+      allCollections: collectionNames.sort()
+    });
+
+  } catch (err) {
+    console.error('QC discovery error:', err);
     res.status(500).json({ error: err.message });
   }
 });
@@ -424,29 +422,15 @@ app.get('/indexes', async (req, res) => {
         database: 'orders',
         collection: 'order-credentials',
         name: 'credential_count_query',
-        keys: { order: 1, active: 1, deletedAt: 1 },
-        reason: 'Speeds up credential count grouping per order'
+        keys: { order: 1, active: 1, createdAt: 1, deletedAt: 1 },
+        reason: 'Speeds up credential count grouping per order (now date-scoped)'
       },
       {
         database: 'orders',
         collection: 'order-discussion',
-        name: 'qc_events_query',
-        keys: { errorType: 1, deletedAt: 1, createdAt: -1 },
-        reason: 'Speeds up QC event filtering and sorting'
-      },
-      {
-        database: 'orders',
-        collection: 'order-report',
-        name: 'report_order_lookup',
-        keys: { order: 1, deletedAt: 1 },
-        reason: 'Speeds up report count lookup per order'
-      },
-      {
-        database: 'orders',
-        collection: 'order-report-item',
-        name: 'report_item_grouping',
-        keys: { orderReport: 1, deletedAt: 1 },
-        reason: 'Speeds up report item count aggregation'
+        name: 'discussion_order_lookup',
+        keys: { order: 1, createdAt: -1 },
+        reason: 'Supports order-level discussion lookups'
       }
     ]
   });
@@ -456,7 +440,7 @@ app.get('/indexes', async (req, res) => {
 app.use((req, res) => {
   res.status(404).json({
     error: 'Not found',
-    availableEndpoints: ['/health', '/collections', '/kpi-segments', '/credential-counts', '/report-counts', '/qc-events', '/indexes']
+    availableEndpoints: ['/health', '/collections', '/kpi-segments', '/credential-counts', '/qc-events', '/qc-discovery', '/indexes']
   });
 });
 
@@ -468,7 +452,7 @@ app.use((err, req, res, next) => {
 
 // —— Start ———————————————————————————————————————————————
 app.listen(CONFIG.PORT, '0.0.0.0', () => {
-  console.log(`IEE KPI Data API running on port ${CONFIG.PORT}`);
+  console.log(`IEE KPI Data API v3.0 running on port ${CONFIG.PORT}`);
   console.log(`Environment: ${CONFIG.NODE_ENV}`);
   console.log(`Rate limit: 60 requests/minute`);
   console.log(`IP allowlist: ${CONFIG.ALLOWED_IPS || 'disabled (all IPs allowed)'}`);
