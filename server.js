@@ -1,6 +1,11 @@
 // ============================================================
-// IEE KPI Data API Server — Production
-// Secured with: Helmet, Rate Limiting, API Key Auth, IP Allowlist
+// IEE KPI Data API Server — v2.0
+// CHANGES from v1:
+//   - Confirmed collection names from /collections output
+//   - Added /report-counts endpoint (Evaluation XpH unit)
+//   - Added pagination to /kpi-segments (?page=1&pageSize=5000)
+//   - Fixed QC collection name to 'order-discussion' (confirmed)
+//   - Added /indexes endpoint with recommended indexes
 // ============================================================
 
 const express = require('express');
@@ -11,71 +16,42 @@ const { MongoClient, ObjectId } = require('mongodb');
 
 const app = express();
 
-// ── Configuration (from environment variables) ─────────────
+// —— Configuration (from environment variables) ——————————————
 const CONFIG = {
   MONGO_URI: process.env.MONGO_URI,
   API_KEY: process.env.API_KEY,
   PORT: process.env.PORT || 3000,
-  // Comma-separated list of allowed IPs (optional — leave empty to skip IP check)
   ALLOWED_IPS: process.env.ALLOWED_IPS || '',
   NODE_ENV: process.env.NODE_ENV || 'production'
 };
 
-// Validate required config
-if (!CONFIG.MONGO_URI) {
-  console.error('FATAL: MONGO_URI environment variable is required');
-  process.exit(1);
-}
-if (!CONFIG.API_KEY) {
-  console.error('FATAL: API_KEY environment variable is required');
-  process.exit(1);
-}
+if (!CONFIG.MONGO_URI) { console.error('FATAL: MONGO_URI required'); process.exit(1); }
+if (!CONFIG.API_KEY) { console.error('FATAL: API_KEY required'); process.exit(1); }
 
-// ── Security Middleware ────────────────────────────────────
-// Helmet: sets secure HTTP headers
+// —— Security ————————————————————————————————————————————————
 app.use(helmet());
-
-// CORS: restrict to Google Apps Script origin
 app.use(cors({
   origin: ['https://script.google.com', 'https://script.googleusercontent.com'],
   methods: ['GET'],
   allowedHeaders: ['x-api-key', 'Content-Type']
 }));
-
-// Trust Railway proxy for accurate IP detection
 app.set('trust proxy', 1);
-
-// Rate limiting: 60 requests per minute per IP
-const limiter = rateLimit({
-  windowMs: 60 * 1000,
-  max: 60,
-  standardHeaders: true,
-  legacyHeaders: false,
-  message: { error: 'Too many requests. Limit: 60 per minute.' }
-});
-app.use(limiter);
-
-// Parse JSON
+app.use(rateLimit({ windowMs: 60000, max: 60, standardHeaders: true, legacyHeaders: false }));
 app.use(express.json());
 
-// ── IP Allowlist (optional) ────────────────────────────────
+// IP Allowlist
 function ipCheck(req, res, next) {
-  if (!CONFIG.ALLOWED_IPS) return next(); // Skip if not configured
-  const allowedList = CONFIG.ALLOWED_IPS.split(',').map(ip => ip.trim());
-  const clientIp = req.ip || req.connection.remoteAddress;
-  if (allowedList.includes(clientIp)) return next();
-  console.warn(`Blocked request from unauthorized IP: ${clientIp}`);
+  if (!CONFIG.ALLOWED_IPS) return next();
+  const allowed = CONFIG.ALLOWED_IPS.split(',').map(ip => ip.trim());
+  if (allowed.includes(req.ip)) return next();
   return res.status(403).json({ error: 'Forbidden' });
 }
 
-// ── API Key Auth ───────────────────────────────────────────
+// API Key Auth (health exempt)
 function authCheck(req, res, next) {
-  // Allow health check without auth
   if (req.path === '/health') return next();
-  const key = req.headers['x-api-key'];
-  if (!key || key !== CONFIG.API_KEY) {
-    console.warn(`Unauthorized request to ${req.path} from ${req.ip}`);
-    return res.status(401).json({ error: 'Unauthorized — invalid or missing API key' });
+  if (req.headers['x-api-key'] !== CONFIG.API_KEY) {
+    return res.status(401).json({ error: 'Unauthorized' });
   }
   next();
 }
@@ -83,7 +59,7 @@ function authCheck(req, res, next) {
 app.use(ipCheck);
 app.use(authCheck);
 
-// ── MongoDB Connection Pool ────────────────────────────────
+// —— MongoDB ————————————————————————————————————————————————
 let client;
 async function getDb(dbName) {
   if (!client) {
@@ -98,12 +74,11 @@ async function getDb(dbName) {
   return client.db(dbName);
 }
 
-// ── Request Logger ─────────────────────────────────────────
+// Request logger
 app.use((req, res, next) => {
   const start = Date.now();
   res.on('finish', () => {
-    const duration = Date.now() - start;
-    console.log(`${req.method} ${req.path} ${res.statusCode} ${duration}ms [${req.ip}]`);
+    console.log(`${req.method} ${req.path} ${res.statusCode} ${Date.now() - start}ms [${req.ip}]`);
   });
   next();
 });
@@ -112,18 +87,18 @@ app.use((req, res, next) => {
 // ENDPOINTS
 // ═══════════════════════════════════════════════════════════
 
-// ── Health Check (no auth required) ────────────────────────
+// —— Health Check (no auth) ————————————————————————————————
 app.get('/health', async (req, res) => {
   try {
     const db = await getDb('orders');
     await db.command({ ping: 1 });
-    res.json({ status: 'ok', timestamp: new Date().toISOString(), env: CONFIG.NODE_ENV });
+    res.json({ status: 'ok', timestamp: new Date().toISOString(), env: CONFIG.NODE_ENV, version: '2.0' });
   } catch (err) {
     res.status(500).json({ status: 'error', message: err.message });
   }
 });
 
-// ── Collection Discovery ───────────────────────────────────
+// —— Collection Discovery —————————————————————————————————
 app.get('/collections', async (req, res) => {
   try {
     const dbNames = ['orders', 'payment', 'user', 'master'];
@@ -143,20 +118,19 @@ app.get('/collections', async (req, res) => {
   }
 });
 
-// ── KPI Segments ───────────────────────────────────────────
+// —— KPI Segments (with pagination) ———————————————————————
+// Usage: /kpi-segments?days=90&page=1&pageSize=5000
 app.get('/kpi-segments', async (req, res) => {
   try {
-    const days = Math.min(parseInt(req.query.days) || 90, 365); // Cap at 365 days
+    const days = Math.min(parseInt(req.query.days) || 90, 365);
+    const page = Math.max(parseInt(req.query.page) || 1, 1);
+    const pageSize = Math.min(Math.max(parseInt(req.query.pageSize) || 5000, 100), 10000);
     const cutoff = new Date();
     cutoff.setDate(cutoff.getDate() - days);
 
     const db = await getDb('orders');
+    // Confirmed collection name: 'orders'
     const ordersCol = db.collection('orders');
-
-    // Step 1: Get orders with Processing history entries in our date range
-    // We use a two-pass approach for accuracy:
-    // Pass 1 — get order IDs and their FULL history (needed to compute end times)
-    // Pass 2 — extract Processing segments with computed durations
 
     const ordersPipeline = [
       {
@@ -164,12 +138,7 @@ app.get('/kpi-segments', async (req, res) => {
           paymentStatus: 'paid',
           orderType: { $in: ['evaluation', 'translation'] },
           deletedAt: null,
-          orderStatusHistory: { $exists: true, $not: { $size: 0 } }
-        }
-      },
-      // Filter orders that have at least one history entry in our date range
-      {
-        $match: {
+          orderStatusHistory: { $exists: true, $not: { $size: 0 } },
           'orderStatusHistory.createdAt': { $gte: cutoff }
         }
       },
@@ -186,8 +155,8 @@ app.get('/kpi-segments', async (req, res) => {
 
     const orders = await ordersCol.aggregate(ordersPipeline, { allowDiskUse: true }).toArray();
 
-    // Step 2: Process each order's history to extract Processing segments
-    const segments = [];
+    // Extract all Processing segments
+    const allSegments = [];
 
     for (const order of orders) {
       const history = order.orderStatusHistory || [];
@@ -196,16 +165,11 @@ app.get('/kpi-segments', async (req, res) => {
 
       for (let i = 0; i < history.length; i++) {
         const entry = history[i];
-        const statusType = entry.updatedStatus?.statusType;
+        if (entry.updatedStatus?.statusType !== 'Processing') continue;
 
-        // Only Processing statuses
-        if (statusType !== 'Processing') continue;
-
-        // Only entries within our date range
         const entryDate = new Date(entry.createdAt);
         if (entryDate < cutoff) continue;
 
-        // Compute end time from next entry
         const nextEntry = i + 1 < history.length ? history[i + 1] : null;
         const segmentEnd = nextEntry ? new Date(nextEntry.createdAt) : null;
         const durationSeconds = segmentEnd
@@ -215,13 +179,13 @@ app.get('/kpi-segments', async (req, res) => {
           ? Math.round(durationSeconds / 60 * 10) / 10
           : null;
 
-        // Skip segments with zero or negative duration (data artifacts)
+        // Skip zero/negative duration artifacts
         if (durationSeconds !== null && durationSeconds <= 0) continue;
 
         const assigned = entry.assignedTo || {};
         const user = entry.user || {};
 
-        segments.push({
+        allSegments.push({
           orderSerialNumber: order.orderSerialNumber,
           orderId: order._id.toString(),
           orderType: order.orderType,
@@ -244,12 +208,23 @@ app.get('/kpi-segments', async (req, res) => {
       }
     }
 
+    // Pagination
+    const totalCount = allSegments.length;
+    const totalPages = Math.ceil(totalCount / pageSize);
+    const startIdx = (page - 1) * pageSize;
+    const paginatedSegments = allSegments.slice(startIdx, startIdx + pageSize);
+
     res.json({
-      count: segments.length,
+      count: paginatedSegments.length,
+      totalCount,
       orderCount: orders.length,
+      page,
+      pageSize,
+      totalPages,
+      hasMore: page < totalPages,
       dateRange: { from: cutoff.toISOString(), to: new Date().toISOString() },
       refreshedAt: new Date().toISOString(),
-      segments
+      segments: paginatedSegments
     });
 
   } catch (err) {
@@ -258,7 +233,8 @@ app.get('/kpi-segments', async (req, res) => {
   }
 });
 
-// ── Credential Counts ──────────────────────────────────────
+// —— Credential Counts ————————————————————————————————————
+// For Data Entry XpH (unit = Credentials)
 app.get('/credential-counts', async (req, res) => {
   try {
     const days = Math.min(parseInt(req.query.days) || 90, 365);
@@ -266,6 +242,7 @@ app.get('/credential-counts', async (req, res) => {
     cutoff.setDate(cutoff.getDate() - days);
 
     const db = await getDb('orders');
+    // Confirmed collection name: 'order-credentials'
     const credsCol = db.collection('order-credentials');
 
     const pipeline = [
@@ -299,7 +276,69 @@ app.get('/credential-counts', async (req, res) => {
   }
 });
 
-// ── QC Events ──────────────────────────────────────────────
+// —— Report Counts (NEW) —————————————————————————————————
+// For Evaluation XpH (unit = Reports)
+// order-report-item has orderReport (ref to order-report), which has order (ref to orders)
+// We need: for each order, count of report items
+app.get('/report-counts', async (req, res) => {
+  try {
+    const db = await getDb('orders');
+    // Confirmed collection name: 'order-report-item'
+    const reportItemsCol = db.collection('order-report-item');
+    // Confirmed collection name: 'order-report'
+    const orderReportsCol = db.collection('order-report');
+
+    // Step 1: Get all order-report documents to build orderReport -> orderId map
+    const reports = await orderReportsCol.find(
+      { $or: [{ deletedAt: null }, { deletedAt: { $exists: false } }] },
+      { projection: { _id: 1, order: 1 } }
+    ).toArray();
+
+    const reportToOrderMap = {};
+    for (const r of reports) {
+      reportToOrderMap[r._id.toString()] = r.order;
+    }
+
+    // Step 2: Count report items per orderReport
+    const pipeline = [
+      {
+        $match: {
+          $or: [{ deletedAt: null }, { deletedAt: { $exists: false } }]
+        }
+      },
+      {
+        $group: {
+          _id: '$orderReport',
+          reportItemCount: { $sum: 1 }
+        }
+      }
+    ];
+
+    const itemCounts = await reportItemsCol.aggregate(pipeline).toArray();
+
+    // Step 3: Map back to orderId
+    const orderCounts = {};
+    for (const ic of itemCounts) {
+      const orderRef = reportToOrderMap[ic._id?.toString()];
+      if (!orderRef) continue;
+      const orderId = orderRef.toString();
+      orderCounts[orderId] = (orderCounts[orderId] || 0) + ic.reportItemCount;
+    }
+
+    const result = Object.entries(orderCounts).map(([orderId, count]) => ({
+      orderId,
+      reportItemCount: count
+    }));
+
+    res.json({ count: result.length, reports: result });
+
+  } catch (err) {
+    console.error('Report counts error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// —— QC Events ————————————————————————————————————————————
 app.get('/qc-events', async (req, res) => {
   try {
     const days = Math.min(parseInt(req.query.days) || 90, 365);
@@ -307,26 +346,8 @@ app.get('/qc-events', async (req, res) => {
     cutoff.setDate(cutoff.getDate() - days);
 
     const db = await getDb('orders');
-
-    // Try known collection names for QC discussions
-    const collections = await db.listCollections().toArray();
-    const collNames = collections.map(c => c.name);
-    const qcCollectionName = [
-      'order-discussions',
-      'order-discussion',
-      'order-discussion-entities',
-      'orderdiscussions'
-    ].find(name => collNames.includes(name));
-
-    if (!qcCollectionName) {
-      return res.json({
-        error: 'QC collection not found. Available collections listed.',
-        availableCollections: collNames,
-        hint: 'Look for a collection containing order discussions/messages with errorType field'
-      });
-    }
-
-    const qcCol = db.collection(qcCollectionName);
+    // Confirmed collection name: 'order-discussion' (singular!)
+    const qcCol = db.collection('order-discussion');
 
     const pipeline = [
       {
@@ -368,7 +389,6 @@ app.get('/qc-events', async (req, res) => {
 
     const events = await qcCol.aggregate(pipeline).toArray();
 
-    // Format dates after aggregation
     const formattedEvents = events.map(evt => ({
       ...evt,
       createdAt: evt.createdAt ? new Date(evt.createdAt).toISOString() : null
@@ -376,7 +396,7 @@ app.get('/qc-events', async (req, res) => {
 
     res.json({
       count: formattedEvents.length,
-      collectionUsed: qcCollectionName,
+      collectionUsed: 'order-discussion',
       dateRange: { from: cutoff.toISOString(), to: new Date().toISOString() },
       refreshedAt: new Date().toISOString(),
       events: formattedEvents
@@ -388,18 +408,65 @@ app.get('/qc-events', async (req, res) => {
   }
 });
 
-// ── 404 Handler ────────────────────────────────────────────
-app.use((req, res) => {
-  res.status(404).json({ error: 'Not found', availableEndpoints: ['/health', '/collections', '/kpi-segments', '/credential-counts', '/qc-events'] });
+// —— Recommended Indexes ——————————————————————————————————
+app.get('/indexes', async (req, res) => {
+  res.json({
+    description: 'Run these in MongoDB Atlas → Data Explorer → each collection → Indexes tab → Create Index',
+    indexes: [
+      {
+        database: 'orders',
+        collection: 'orders',
+        name: 'kpi_segments_query',
+        keys: { paymentStatus: 1, orderType: 1, deletedAt: 1, 'orderStatusHistory.createdAt': 1 },
+        reason: 'Speeds up the main KPI segments aggregation pipeline'
+      },
+      {
+        database: 'orders',
+        collection: 'order-credentials',
+        name: 'credential_count_query',
+        keys: { order: 1, active: 1, deletedAt: 1 },
+        reason: 'Speeds up credential count grouping per order'
+      },
+      {
+        database: 'orders',
+        collection: 'order-discussion',
+        name: 'qc_events_query',
+        keys: { errorType: 1, deletedAt: 1, createdAt: -1 },
+        reason: 'Speeds up QC event filtering and sorting'
+      },
+      {
+        database: 'orders',
+        collection: 'order-report',
+        name: 'report_order_lookup',
+        keys: { order: 1, deletedAt: 1 },
+        reason: 'Speeds up report count lookup per order'
+      },
+      {
+        database: 'orders',
+        collection: 'order-report-item',
+        name: 'report_item_grouping',
+        keys: { orderReport: 1, deletedAt: 1 },
+        reason: 'Speeds up report item count aggregation'
+      }
+    ]
+  });
 });
 
-// ── Error Handler ──────────────────────────────────────────
+// —— 404 Handler ——————————————————————————————————————————
+app.use((req, res) => {
+  res.status(404).json({
+    error: 'Not found',
+    availableEndpoints: ['/health', '/collections', '/kpi-segments', '/credential-counts', '/report-counts', '/qc-events', '/indexes']
+  });
+});
+
+// —— Error Handler ———————————————————————————————————————
 app.use((err, req, res, next) => {
   console.error('Unhandled error:', err);
   res.status(500).json({ error: 'Internal server error' });
 });
 
-// ── Start Server ───────────────────────────────────────────
+// —— Start ———————————————————————————————————————————————
 app.listen(CONFIG.PORT, '0.0.0.0', () => {
   console.log(`IEE KPI Data API running on port ${CONFIG.PORT}`);
   console.log(`Environment: ${CONFIG.NODE_ENV}`);
@@ -407,7 +474,6 @@ app.listen(CONFIG.PORT, '0.0.0.0', () => {
   console.log(`IP allowlist: ${CONFIG.ALLOWED_IPS || 'disabled (all IPs allowed)'}`);
 });
 
-// Graceful shutdown
 process.on('SIGTERM', async () => {
   console.log('SIGTERM received, shutting down...');
   if (client) await client.close();
