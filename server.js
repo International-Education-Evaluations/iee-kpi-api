@@ -1,5 +1,5 @@
 // ============================================================
-// IEE KPI Data API Server — v4.1
+// IEE KPI Data API Server — v4.2
 //
 // CHANGES from v2.1:
 //   - MongoClient: added retryWrites + retryReads for transparent
@@ -461,7 +461,7 @@ app.get('/health', async (req, res) => {
   try {
     const db = await getDb('orders');
     await db.command({ ping: 1 });
-    res.json({ status: 'ok', timestamp: new Date().toISOString(), env: CONFIG.NODE_ENV, version: '4.1' });
+    res.json({ status: 'ok', timestamp: new Date().toISOString(), env: CONFIG.NODE_ENV, version: '4.2' });
   } catch (err) {
     res.status(500).json({ status: 'error', message: err.message });
   }
@@ -907,10 +907,10 @@ app.get('/users', async (req, res) => {
     // GET /users?discover=true returns all distinct type values in the collection.
     // Use this once to confirm which type values represent internal staff.
     if (req.query.discover === 'true') {
-      const types = await col.distinct('type', { active: true });
-      const roleIds = await col.distinct('roleId', { active: true });
+      const types = await col.distinct('type', {});
+      const roleIds = await col.distinct('roleId', {});
       const sample = await col.find(
-        { active: true },
+        {},
         { projection: { type: 1, roleId: 1, department: 1, firstName: 1, lastName: 1 } }
       ).limit(50).toArray();
       const byType = {};
@@ -932,14 +932,15 @@ app.get('/users', async (req, res) => {
     // Staff role ObjectId (confirmed from user.role collection)
     const STAFF_ROLE_ID = '67acba952a78ccf7588a3ee1';
 
-    // Filter server-side: only internal staff types.
-    // Excludes 'customer' and any other non-staff types.
-    // type='staff' and type='system_admin' are internal IEE users.
-    // If other internal types are discovered via ?discover=true, add them here.
-    const STAFF_TYPES = ['staff', 'system_admin'];
+    // Filter: type='staff' only.
+    // 'active' field is an account-activation flag in V2, NOT employment status.
+    // Many current staff have active:false or active unset — filtering on it drops them.
+    // system_admin = system accounts (super admin, armadalogics bots), not processing staff.
+    // partner_user / customer / system_bot = external, excluded.
+    const STAFF_TYPES = ['staff'];
 
     const cursor = col.find(
-      { active: true, type: { $in: STAFF_TYPES } },
+      { type: { $in: STAFF_TYPES } },
       {
         projection: {
           _id: 1,
@@ -1055,7 +1056,7 @@ app.use((err, req, res, next) => {
 
 // —— Start ——————————————————————————————————————————————
 app.listen(CONFIG.PORT, '0.0.0.0', () => {
-  console.log(`IEE KPI Data API v4.1 running on port ${CONFIG.PORT}`);
+  console.log(`IEE KPI Data API v4.2 running on port ${CONFIG.PORT}`);
   console.log(`Environment: ${CONFIG.NODE_ENV}`);
   console.log(`Rate limit: 60 requests/minute`);
   console.log(`IP allowlist: ${CONFIG.ALLOWED_IPS || 'disabled (all IPs allowed)'}`);
