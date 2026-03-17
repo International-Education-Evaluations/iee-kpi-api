@@ -461,7 +461,7 @@ app.get('/health', async (req, res) => {
   try {
     const db = await getDb('orders');
     await db.command({ ping: 1 });
-    res.json({ status: 'ok', timestamp: new Date().toISOString(), env: CONFIG.NODE_ENV, version: '4.2' });
+    res.json({ status: 'ok', timestamp: new Date().toISOString(), env: CONFIG.NODE_ENV, version: '4.3' });
   } catch (err) {
     res.status(500).json({ status: 'error', message: err.message });
   }
@@ -1083,6 +1083,253 @@ app.get('/indexes', async (req, res) => {
   });
 });
 
+// ═══════════════════════════════════════════════════════════
+// STATUS TRANSITIONS & QUEUE SNAPSHOT
+// Added in v4.3 — tracks ALL status transitions (not just
+// Processing) to measure wait/queue times and current queue.
+// ═══════════════════════════════════════════════════════════
+
+// —— Status Transitions ————————————————————————————————————
+// Usage: /status-transitions?days=60&page=1&pageSize=5000
+//
+// Returns EVERY status transition for paid orders, not just
+// Processing. Each row = one status the order passed through,
+// with duration until the next transition.
+//
+// Key difference from /kpi-segments:
+//   /kpi-segments: only Processing statuses (worker active time)
+//   /status-transitions: ALL statuses including Holding, Waiting,
+//     Completed, etc. (full order lifecycle)
+//
+// Use cases:
+//   - How long orders sit in "Awaiting Evaluation" before pickup
+//   - How long between "Digital Records Review" and "Translation Prep"
+//   - Full order lifecycle timeline
+//   - Queue wait time analysis
+app.get('/status-transitions', async (req, res) => {
+  try {
+    const days = parsePositiveInt(req.query.days, 60, { min: 1, max: 365 });
+    const page = parsePositiveInt(req.query.page, 1, { min: 1, max: 1000000 });
+    const pageSize = parsePositiveInt(req.query.pageSize, 5000, { min: 100, max: 10000 });
+    const cutoff = getCutoff(days);
+
+    // Optional filter: only return specific statusTypes
+    // e.g., ?statusType=Holding,Waiting to get only queue statuses
+    const statusTypeFilter = req.query.statusType
+      ? req.query.statusType.split(',').map(s => s.trim()).filter(Boolean)
+      : null; // null = all status types
+
+    const db = await getDb('orders');
+    const ordersCol = db.collection('orders');
+
+    const orders = await ordersCol.aggregate([
+      {
+        $match: {
+          paymentStatus: 'paid',
+          orderType: { $in: ['evaluation', 'translation'] },
+          deletedAt: null,
+          orderStatusHistory: { $exists: true, $not: { $size: 0 } },
+          'orderStatusHistory.createdAt': { $gte: cutoff }
+        }
+      },
+      {
+        $project: {
+          orderSerialNumber: 1,
+          orderType: 1,
+          orderStatusHistory: 1
+        }
+      }
+    ], { allowDiskUse: true }).toArray();
+
+    const allTransitions = [];
+
+    for (const order of orders) {
+      const history = Array.isArray(order.orderStatusHistory) ? order.orderStatusHistory : [];
+
+      for (let i = 0; i < history.length; i++) {
+        const entry = history[i];
+        const entryDate = toDate(entry?.createdAt);
+        if (!entryDate || entryDate < cutoff) continue;
+
+        const statusSlug = entry?.updatedStatus?.slug || '';
+        const statusName = entry?.updatedStatus?.name || '';
+        const statusType = entry?.updatedStatus?.statusType || '';
+
+        // Apply statusType filter if provided
+        if (statusTypeFilter && !statusTypeFilter.includes(statusType)) continue;
+
+        const nextEntry = i + 1 < history.length ? history[i + 1] : null;
+        const nextDate = toDate(nextEntry?.createdAt);
+        const durationSeconds = nextDate
+          ? (nextDate.getTime() - entryDate.getTime()) / 1000
+          : null;
+        const durationMinutes = durationSeconds !== null
+          ? Math.round((durationSeconds / 60) * 10) / 10
+          : null;
+        const durationHours = durationSeconds !== null
+          ? Math.round((durationSeconds / 3600) * 100) / 100
+          : null;
+
+        if (durationSeconds !== null && durationSeconds <= 0) continue;
+
+        const assigned = entry?.assignedTo || {};
+        const nextStatusSlug = nextEntry?.updatedStatus?.slug || null;
+        const nextStatusName = nextEntry?.updatedStatus?.name || null;
+        const nextStatusType = nextEntry?.updatedStatus?.statusType || null;
+
+        allTransitions.push({
+          orderSerialNumber: order.orderSerialNumber,
+          orderId: String(order._id),
+          orderType: order.orderType,
+          statusSlug,
+          statusName,
+          statusType,           // 'Processing', 'Holding', 'Waiting', 'Completed', etc.
+          nextStatusSlug,
+          nextStatusName,
+          nextStatusType,
+          workerName: buildFullName(assigned),
+          workerEmail: assigned.email || null,
+          transitionAt: toIso(entryDate),
+          exitAt: toIso(nextDate),
+          durationSeconds,
+          durationMinutes,
+          durationHours,
+          isOpen: nextDate === null,  // still in this status
+          isProcessing: statusType === 'Processing',
+          isWaiting: ['Holding', 'Waiting'].includes(statusType) || statusSlug.startsWith('awaiting')
+        });
+      }
+    }
+
+    // Sort: most recent first
+    allTransitions.sort((a, b) => {
+      if (!a.transitionAt && !b.transitionAt) return 0;
+      if (!a.transitionAt) return 1;
+      if (!b.transitionAt) return -1;
+      return new Date(b.transitionAt) - new Date(a.transitionAt);
+    });
+
+    const paged = paginate(allTransitions, page, pageSize);
+    res.json({
+      count: paged.items.length,
+      totalCount: paged.totalCount,
+      orderCount: orders.length,
+      page: paged.page,
+      pageSize: paged.pageSize,
+      totalPages: paged.totalPages,
+      hasMore: paged.hasMore,
+      dateRange: { from: cutoff.toISOString(), to: new Date().toISOString() },
+      refreshedAt: new Date().toISOString(),
+      transitions: paged.items
+    });
+  } catch (err) {
+    console.error('Status transitions error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// —— Queue Snapshot ————————————————————————————————————————
+// Usage: /queue-snapshot
+//
+// Returns a real-time count of orders currently sitting in each
+// status — i.e., their LAST orderStatusHistory entry is that status
+// and there's no subsequent transition.
+//
+// This answers: "How many orders are waiting in Awaiting Evaluation
+// right now?" — a live operations metric.
+app.get('/queue-snapshot', async (req, res) => {
+  try {
+    const db = await getDb('orders');
+    const ordersCol = db.collection('orders');
+
+    // Find all paid, non-deleted orders with status history
+    // and look at their LAST status entry
+    const results = await ordersCol.aggregate([
+      {
+        $match: {
+          paymentStatus: 'paid',
+          orderType: { $in: ['evaluation', 'translation'] },
+          deletedAt: null,
+          orderStatusHistory: { $exists: true, $not: { $size: 0 } }
+        }
+      },
+      {
+        // Get the last entry in orderStatusHistory
+        $addFields: {
+          currentStatus: { $arrayElemAt: ['$orderStatusHistory', -1] }
+        }
+      },
+      {
+        // Exclude completed/cancelled orders — only show active queue
+        $match: {
+          'currentStatus.updatedStatus.statusType': {
+            $nin: ['Completed', 'Cancelled', 'Refunded', 'Voided']
+          }
+        }
+      },
+      {
+        $group: {
+          _id: {
+            slug: '$currentStatus.updatedStatus.slug',
+            name: '$currentStatus.updatedStatus.name',
+            type: '$currentStatus.updatedStatus.statusType'
+          },
+          orderCount: { $sum: 1 },
+          orderTypes: { $push: '$orderType' },
+          // Oldest order in this status — how long has the longest-waiting order been here?
+          oldestEntry: { $min: '$currentStatus.createdAt' },
+          newestEntry: { $max: '$currentStatus.createdAt' }
+        }
+      },
+      { $sort: { orderCount: -1 } }
+    ], { allowDiskUse: true }).toArray();
+
+    const now = new Date();
+    const snapshot = results.map(r => {
+      const evalCount = r.orderTypes.filter(t => t === 'evaluation').length;
+      const transCount = r.orderTypes.filter(t => t === 'translation').length;
+      const oldestDate = toDate(r.oldestEntry);
+      const newestDate = toDate(r.newestEntry);
+
+      return {
+        statusSlug: r._id.slug || '',
+        statusName: r._id.name || '',
+        statusType: r._id.type || '',
+        orderCount: r.orderCount,
+        evaluationCount: evalCount,
+        translationCount: transCount,
+        oldestWaitingSince: toIso(oldestDate),
+        oldestWaitMinutes: oldestDate
+          ? Math.round((now.getTime() - oldestDate.getTime()) / 60000)
+          : null,
+        oldestWaitHours: oldestDate
+          ? Math.round((now.getTime() - oldestDate.getTime()) / 3600000 * 10) / 10
+          : null,
+        newestEntry: toIso(newestDate),
+        isProcessingStatus: r._id.type === 'Processing',
+        isWaitingStatus: ['Holding', 'Waiting'].includes(r._id.type) || (r._id.slug || '').startsWith('awaiting')
+      };
+    });
+
+    const totalInQueue = snapshot.reduce((sum, s) => sum + s.orderCount, 0);
+    const waitingOnly = snapshot.filter(s => s.isWaitingStatus);
+    const processingOnly = snapshot.filter(s => s.isProcessingStatus);
+
+    res.json({
+      refreshedAt: new Date().toISOString(),
+      totalActiveOrders: totalInQueue,
+      waitingOrders: waitingOnly.reduce((sum, s) => sum + s.orderCount, 0),
+      processingOrders: processingOnly.reduce((sum, s) => sum + s.orderCount, 0),
+      statusCount: snapshot.length,
+      snapshot
+    });
+  } catch (err) {
+    console.error('Queue snapshot error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+
 // —— 404 / Error handlers —————————————————————————————
 app.use((req, res) => {
   res.status(404).json({
@@ -1091,6 +1338,7 @@ app.use((req, res) => {
       '/health', '/collections',
       '/kpi-segments', '/credential-counts', '/report-counts',
       '/qc-events', '/qc-orders', '/qc-summary', '/qc-discovery',
+      '/status-transitions', '/queue-snapshot',
       '/users', '/indexes'
     ]
   });
@@ -1103,7 +1351,7 @@ app.use((err, req, res, next) => {
 
 // —— Start ——————————————————————————————————————————————
 app.listen(CONFIG.PORT, '0.0.0.0', () => {
-  console.log(`IEE KPI Data API v4.2 running on port ${CONFIG.PORT}`);
+  console.log(`IEE KPI Data API v4.3 running on port ${CONFIG.PORT}`);
   console.log(`Environment: ${CONFIG.NODE_ENV}`);
   console.log(`Rate limit: 60 requests/minute`);
   console.log(`IP allowlist: ${CONFIG.ALLOWED_IPS || 'disabled (all IPs allowed)'}`);
