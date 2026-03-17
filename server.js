@@ -1228,22 +1228,28 @@ app.get('/status-transitions', async (req, res) => {
   }
 });
 
-// —— Queue Snapshot ————————————————————————————————————————
+// —— Queue Snapshot (Enhanced) ————————————————————————————
 // Usage: /queue-snapshot
 //
-// Returns a real-time count of orders currently sitting in each
-// status — i.e., their LAST orderStatusHistory entry is that status
-// and there's no subsequent transition.
+// Returns actionable queue metrics for each active status:
+//   - Order count (total, eval, translation)
+//   - Median wait time (not skewed by outliers)
+//   - Aging buckets: orders waiting >24h, >48h, >72h
+//   - Flow rate: orders entering today vs orders that were picked up today
+//   - Oldest and newest entry (for context)
 //
-// This answers: "How many orders are waiting in Awaiting Evaluation
-// right now?" — a live operations metric.
+// Terminal statuses (Completed, Refunded, Deleted, Cancelled, etc.)
+// are excluded — only Waiting, Holding, Processing, and On-Hold shown.
 app.get('/queue-snapshot', async (req, res) => {
   try {
     const db = await getDb('orders');
     const ordersCol = db.collection('orders');
 
-    // Find all paid, non-deleted orders with status history
-    // and look at their LAST status entry
+    // Terminal status types to exclude
+    const TERMINAL_TYPES = ['Completed', 'Cancelled', 'Refunded', 'Voided'];
+    // Also exclude by slug for statuses that don't have a clean statusType
+    const TERMINAL_SLUGS = ['completed', 'deleted', 'refunded', 'confirmed-fraudulent', 'expired'];
+
     const results = await ordersCol.aggregate([
       {
         $match: {
@@ -1254,17 +1260,15 @@ app.get('/queue-snapshot', async (req, res) => {
         }
       },
       {
-        // Get the last entry in orderStatusHistory
         $addFields: {
           currentStatus: { $arrayElemAt: ['$orderStatusHistory', -1] }
         }
       },
       {
-        // Exclude completed/cancelled orders — only show active queue
+        // Exclude terminal statuses
         $match: {
-          'currentStatus.updatedStatus.statusType': {
-            $nin: ['Completed', 'Cancelled', 'Refunded', 'Voided']
-          }
+          'currentStatus.updatedStatus.statusType': { $nin: TERMINAL_TYPES },
+          'currentStatus.updatedStatus.slug': { $nin: TERMINAL_SLUGS }
         }
       },
       {
@@ -1276,7 +1280,8 @@ app.get('/queue-snapshot', async (req, res) => {
           },
           orderCount: { $sum: 1 },
           orderTypes: { $push: '$orderType' },
-          // Oldest order in this status — how long has the longest-waiting order been here?
+          // Collect all entry timestamps for percentile calculation
+          entryTimes: { $push: '$currentStatus.createdAt' },
           oldestEntry: { $min: '$currentStatus.createdAt' },
           newestEntry: { $max: '$currentStatus.createdAt' }
         }
@@ -1285,9 +1290,41 @@ app.get('/queue-snapshot', async (req, res) => {
     ], { allowDiskUse: true }).toArray();
 
     const now = new Date();
+    const ONE_HOUR = 3600000;
+    const ONE_DAY = 86400000;
+    const todayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+
     const snapshot = results.map(r => {
       const evalCount = r.orderTypes.filter(t => t === 'evaluation').length;
       const transCount = r.orderTypes.filter(t => t === 'translation').length;
+
+      // Calculate wait times in hours for each order
+      const waitHours = (r.entryTimes || [])
+        .map(t => toDate(t))
+        .filter(d => d !== null)
+        .map(d => (now.getTime() - d.getTime()) / ONE_HOUR)
+        .sort((a, b) => a - b); // ascending for percentile calc
+
+      // Median wait time
+      let medianWaitHours = null;
+      if (waitHours.length > 0) {
+        const mid = Math.floor(waitHours.length / 2);
+        medianWaitHours = waitHours.length % 2 === 0
+          ? Math.round(((waitHours[mid - 1] + waitHours[mid]) / 2) * 10) / 10
+          : Math.round(waitHours[mid] * 10) / 10;
+      }
+
+      // Aging buckets
+      const over24h = waitHours.filter(h => h > 24).length;
+      const over48h = waitHours.filter(h => h > 48).length;
+      const over72h = waitHours.filter(h => h > 72).length;
+
+      // Flow rate: how many entered THIS status today
+      const enteredToday = (r.entryTimes || [])
+        .map(t => toDate(t))
+        .filter(d => d !== null && d >= todayStart)
+        .length;
+
       const oldestDate = toDate(r.oldestEntry);
       const newestDate = toDate(r.newestEntry);
 
@@ -1298,16 +1335,19 @@ app.get('/queue-snapshot', async (req, res) => {
         orderCount: r.orderCount,
         evaluationCount: evalCount,
         translationCount: transCount,
-        oldestWaitingSince: toIso(oldestDate),
-        oldestWaitMinutes: oldestDate
-          ? Math.round((now.getTime() - oldestDate.getTime()) / 60000)
-          : null,
+        medianWaitHours,
+        over24h,
+        over48h,
+        over72h,
+        enteredToday,
         oldestWaitHours: oldestDate
-          ? Math.round((now.getTime() - oldestDate.getTime()) / 3600000 * 10) / 10
+          ? Math.round((now.getTime() - oldestDate.getTime()) / ONE_HOUR * 10) / 10
           : null,
+        oldestWaitingSince: toIso(oldestDate),
         newestEntry: toIso(newestDate),
         isProcessingStatus: r._id.type === 'Processing',
-        isWaitingStatus: ['Holding', 'Waiting'].includes(r._id.type) || (r._id.slug || '').startsWith('awaiting')
+        isWaitingStatus: ['Holding', 'Waiting', 'On-Hold'].includes(r._id.type)
+          || (r._id.slug || '').startsWith('awaiting')
       };
     });
 
