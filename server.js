@@ -1084,40 +1084,29 @@ app.get('/indexes', async (req, res) => {
 });
 
 // ═══════════════════════════════════════════════════════════
-// STATUS TRANSITIONS & QUEUE SNAPSHOT
-// Added in v4.3 — tracks ALL status transitions (not just
-// Processing) to measure wait/queue times and current queue.
+// QUEUE WAIT SUMMARY & QUEUE SNAPSHOT
+// Added in v4.3 — queue-level metrics for operations.
 // ═══════════════════════════════════════════════════════════
 
-// —— Status Transitions ————————————————————————————————————
-// Usage: /status-transitions?days=60&page=1&pageSize=5000
+// —— Queue Wait Summary ———————————————————————————————————
+// Usage: /queue-wait-summary?days=60
 //
-// Returns EVERY status transition for paid orders, not just
-// Processing. Each row = one status the order passed through,
-// with duration until the next transition.
+// Aggregates ALL status transitions over the time window and returns
+// ONE ROW PER STATUS with:
+//   - Volume: how many times orders entered this status
+//   - Wait times: median, avg, p75, p90 duration in this status
+//   - Aging: how many had wait > 24hr, > 48hr, > 72hr
+//   - Flow: how many completed (exited) vs still open
+//   - Next status distribution: where orders go after this status
 //
-// Key difference from /kpi-segments:
-//   /kpi-segments: only Processing statuses (worker active time)
-//   /status-transitions: ALL statuses including Holding, Waiting,
-//     Completed, etc. (full order lifecycle)
-//
-// Use cases:
-//   - How long orders sit in "Awaiting Evaluation" before pickup
-//   - How long between "Digital Records Review" and "Translation Prep"
-//   - Full order lifecycle timeline
-//   - Queue wait time analysis
-app.get('/status-transitions', async (req, res) => {
+// Only includes non-terminal statuses. Excludes zero-duration entries.
+// This is HISTORICAL (over the window), not live — use /queue-snapshot for live.
+app.get('/queue-wait-summary', async (req, res) => {
   try {
-    const days = parsePositiveInt(req.query.days, 60, { min: 1, max: 365 });
-    const page = parsePositiveInt(req.query.page, 1, { min: 1, max: 1000000 });
-    const pageSize = parsePositiveInt(req.query.pageSize, 5000, { min: 100, max: 10000 });
+    const days = parsePositiveInt(req.query.days, 60, { min: 1, max: 900 });
     const cutoff = getCutoff(days);
 
-    // Optional filter: only return specific statusTypes
-    // e.g., ?statusType=Holding,Waiting to get only queue statuses
-    const statusTypeFilter = req.query.statusType
-      ? req.query.statusType.split(',').map(s => s.trim()).filter(Boolean)
-      : null; // null = all status types
+    const TERMINAL_SLUGS = ['completed', 'deleted', 'refunded', 'confirmed-fraudulent', 'expired'];
 
     const db = await getDb('orders');
     const ordersCol = db.collection('orders');
@@ -1134,14 +1123,14 @@ app.get('/status-transitions', async (req, res) => {
       },
       {
         $project: {
-          orderSerialNumber: 1,
           orderType: 1,
           orderStatusHistory: 1
         }
       }
     ], { allowDiskUse: true }).toArray();
 
-    const allTransitions = [];
+    // Collect durations per status
+    const statusMap = new Map();
 
     for (const order of orders) {
       const history = Array.isArray(order.orderStatusHistory) ? order.orderStatusHistory : [];
@@ -1151,85 +1140,122 @@ app.get('/status-transitions', async (req, res) => {
         const entryDate = toDate(entry?.createdAt);
         if (!entryDate || entryDate < cutoff) continue;
 
-        const statusSlug = entry?.updatedStatus?.slug || '';
-        const statusName = entry?.updatedStatus?.name || '';
-        const statusType = entry?.updatedStatus?.statusType || '';
+        const slug = entry?.updatedStatus?.slug || '';
+        const name = entry?.updatedStatus?.name || '';
+        const type = entry?.updatedStatus?.statusType || '';
 
-        // Apply statusType filter if provided
-        if (statusTypeFilter && !statusTypeFilter.includes(statusType)) continue;
+        // Skip terminal statuses
+        if (TERMINAL_SLUGS.includes(slug)) continue;
 
         const nextEntry = i + 1 < history.length ? history[i + 1] : null;
         const nextDate = toDate(nextEntry?.createdAt);
-        const durationSeconds = nextDate
-          ? (nextDate.getTime() - entryDate.getTime()) / 1000
-          : null;
-        const durationMinutes = durationSeconds !== null
-          ? Math.round((durationSeconds / 60) * 10) / 10
-          : null;
-        const durationHours = durationSeconds !== null
-          ? Math.round((durationSeconds / 3600) * 100) / 100
+        const durationHours = nextDate
+          ? (nextDate.getTime() - entryDate.getTime()) / 3600000
           : null;
 
-        if (durationSeconds !== null && durationSeconds <= 0) continue;
+        // Skip zero/negative durations
+        if (durationHours !== null && durationHours <= 0) continue;
 
-        const assigned = entry?.assignedTo || {};
-        const nextStatusSlug = nextEntry?.updatedStatus?.slug || null;
-        const nextStatusName = nextEntry?.updatedStatus?.name || null;
-        const nextStatusType = nextEntry?.updatedStatus?.statusType || null;
+        const nextSlug = nextEntry?.updatedStatus?.slug || null;
+        const nextName = nextEntry?.updatedStatus?.name || null;
+        const isOpen = nextDate === null;
 
-        allTransitions.push({
-          orderSerialNumber: order.orderSerialNumber,
-          orderId: String(order._id),
-          orderType: order.orderType,
-          statusSlug,
-          statusName,
-          statusType,           // 'Processing', 'Holding', 'Waiting', 'Completed', etc.
-          nextStatusSlug,
-          nextStatusName,
-          nextStatusType,
-          workerName: buildFullName(assigned),
-          workerEmail: assigned.email || null,
-          transitionAt: toIso(entryDate),
-          exitAt: toIso(nextDate),
-          durationSeconds,
-          durationMinutes,
-          durationHours,
-          isOpen: nextDate === null,  // still in this status
-          isProcessing: statusType === 'Processing',
-          isWaiting: ['Holding', 'Waiting'].includes(statusType) || statusSlug.startsWith('awaiting')
-        });
+        if (!statusMap.has(slug)) {
+          statusMap.set(slug, {
+            slug, name, type,
+            durations: [],     // completed durations in hours
+            openCount: 0,      // still in this status (no exit)
+            totalVolume: 0,    // total entries
+            evalCount: 0,
+            transCount: 0,
+            nextStatuses: new Map()  // where orders go after this
+          });
+        }
+
+        const bucket = statusMap.get(slug);
+        bucket.totalVolume++;
+        if (order.orderType === 'evaluation') bucket.evalCount++;
+        if (order.orderType === 'translation') bucket.transCount++;
+
+        if (isOpen) {
+          bucket.openCount++;
+        } else if (durationHours !== null) {
+          bucket.durations.push(durationHours);
+        }
+
+        // Track next status distribution
+        if (nextSlug) {
+          const ns = nextName || nextSlug;
+          bucket.nextStatuses.set(ns, (bucket.nextStatuses.get(ns) || 0) + 1);
+        }
       }
     }
 
-    // Sort: most recent first
-    allTransitions.sort((a, b) => {
-      if (!a.transitionAt && !b.transitionAt) return 0;
-      if (!a.transitionAt) return 1;
-      if (!b.transitionAt) return -1;
-      return new Date(b.transitionAt) - new Date(a.transitionAt);
-    });
+    // Compute percentiles and build response
+    function percentile(sorted, p) {
+      if (!sorted.length) return null;
+      const idx = (p / 100) * (sorted.length - 1);
+      const lo = Math.floor(idx);
+      const hi = Math.ceil(idx);
+      if (lo === hi) return Math.round(sorted[lo] * 10) / 10;
+      return Math.round((sorted[lo] + (sorted[hi] - sorted[lo]) * (idx - lo)) * 10) / 10;
+    }
 
-    const paged = paginate(allTransitions, page, pageSize);
+    const summary = [...statusMap.values()]
+      .map(s => {
+        const sorted = s.durations.slice().sort((a, b) => a - b);
+        const avg = sorted.length
+          ? Math.round((sorted.reduce((a, b) => a + b, 0) / sorted.length) * 10) / 10
+          : null;
+
+        // Top 3 next statuses
+        const topNext = [...s.nextStatuses.entries()]
+          .sort((a, b) => b[1] - a[1])
+          .slice(0, 3)
+          .map(([name, count]) => `${name} (${count})`)
+          .join(', ');
+
+        return {
+          statusName: s.name,
+          statusSlug: s.slug,
+          statusType: s.type,
+          totalVolume: s.totalVolume,
+          completedCount: sorted.length,
+          openCount: s.openCount,
+          evaluationCount: s.evalCount,
+          translationCount: s.transCount,
+          medianWaitHours: percentile(sorted, 50),
+          avgWaitHours: avg,
+          p75WaitHours: percentile(sorted, 75),
+          p90WaitHours: percentile(sorted, 90),
+          over24h: sorted.filter(h => h > 24).length,
+          over48h: sorted.filter(h => h > 48).length,
+          over72h: sorted.filter(h => h > 72).length,
+          minWaitHours: sorted.length ? Math.round(sorted[0] * 100) / 100 : null,
+          maxWaitHours: sorted.length ? Math.round(sorted[sorted.length - 1] * 10) / 10 : null,
+          topNextStatuses: topNext,
+          isWaiting: ['Holding', 'Waiting', 'On-Hold'].includes(s.type) || s.slug.startsWith('awaiting'),
+          isProcessing: s.type === 'Processing'
+        };
+      })
+      .sort((a, b) => b.totalVolume - a.totalVolume);
+
     res.json({
-      count: paged.items.length,
-      totalCount: paged.totalCount,
-      orderCount: orders.length,
-      page: paged.page,
-      pageSize: paged.pageSize,
-      totalPages: paged.totalPages,
-      hasMore: paged.hasMore,
-      dateRange: { from: cutoff.toISOString(), to: new Date().toISOString() },
       refreshedAt: new Date().toISOString(),
-      transitions: paged.items
+      days,
+      dateRange: { from: cutoff.toISOString(), to: new Date().toISOString() },
+      orderCount: orders.length,
+      statusCount: summary.length,
+      summary
     });
   } catch (err) {
-    console.error('Status transitions error:', err);
+    console.error('Queue wait summary error:', err);
     res.status(500).json({ error: err.message });
   }
 });
 
 // —— Queue Snapshot (Enhanced) ————————————————————————————
-// Usage: /queue-snapshot
+// Usage: /queue-snapshot?since=2024-01-01
 //
 // Returns actionable queue metrics for each active status:
 //   - Order count (total, eval, translation)
@@ -1240,14 +1266,21 @@ app.get('/status-transitions', async (req, res) => {
 //
 // Terminal statuses (Completed, Refunded, Deleted, Cancelled, etc.)
 // are excluded — only Waiting, Holding, Processing, and On-Hold shown.
+//
+// The `since` parameter excludes orders that entered their current status
+// before the given date. Default: 2024-01-01. This filters out abandoned
+// orders stuck in old statuses for years.
 app.get('/queue-snapshot', async (req, res) => {
   try {
     const db = await getDb('orders');
     const ordersCol = db.collection('orders');
 
+    // Default cutoff: exclude orders stuck since before 2024
+    const sinceStr = req.query.since || '2024-01-01';
+    const sinceCutoff = new Date(sinceStr + 'T00:00:00Z');
+
     // Terminal status types to exclude
     const TERMINAL_TYPES = ['Completed', 'Cancelled', 'Refunded', 'Voided'];
-    // Also exclude by slug for statuses that don't have a clean statusType
     const TERMINAL_SLUGS = ['completed', 'deleted', 'refunded', 'confirmed-fraudulent', 'expired'];
 
     const results = await ordersCol.aggregate([
@@ -1265,10 +1298,11 @@ app.get('/queue-snapshot', async (req, res) => {
         }
       },
       {
-        // Exclude terminal statuses
+        // Exclude terminal statuses AND orders stuck since before cutoff
         $match: {
           'currentStatus.updatedStatus.statusType': { $nin: TERMINAL_TYPES },
-          'currentStatus.updatedStatus.slug': { $nin: TERMINAL_SLUGS }
+          'currentStatus.updatedStatus.slug': { $nin: TERMINAL_SLUGS },
+          'currentStatus.createdAt': { $gte: sinceCutoff }
         }
       },
       {
@@ -1357,6 +1391,7 @@ app.get('/queue-snapshot', async (req, res) => {
 
     res.json({
       refreshedAt: new Date().toISOString(),
+      since: sinceStr,
       totalActiveOrders: totalInQueue,
       waitingOrders: waitingOnly.reduce((sum, s) => sum + s.orderCount, 0),
       processingOrders: processingOnly.reduce((sum, s) => sum + s.orderCount, 0),
@@ -1378,7 +1413,7 @@ app.use((req, res) => {
       '/health', '/collections',
       '/kpi-segments', '/credential-counts', '/report-counts',
       '/qc-events', '/qc-orders', '/qc-summary', '/qc-discovery',
-      '/status-transitions', '/queue-snapshot',
+      '/queue-wait-summary', '/queue-snapshot',
       '/users', '/indexes'
     ]
   });
