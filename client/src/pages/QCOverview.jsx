@@ -1,9 +1,18 @@
 import React, { useEffect, useState, useMemo } from 'react';
 import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, PieChart, Pie, Cell } from 'recharts';
-import { Card, Table, Section, Pills, FilterBar, FilterSelect, FilterInput, FilterReset, Skel, fmt, fmtI, fmtP } from '../components/UI';
+import { Card, Table, Section, Pills, FilterBar, FilterSelect, FilterReset, Skel, fmt, fmtI, fmtP } from '../components/UI';
+import DashboardGrid, { Widget } from '../components/DashboardGrid';
 import { api } from '../hooks/useApi';
-const TT={contentStyle:{background:'#ffffff',border:'1px solid #e2e8f0',borderRadius:8,color:'#0f172a',fontSize:12}};
-const COLORS=['#4CAF50','#F44336','#FF9800','#2196F3','#9C27B0','#00BCD4','#795548'];
+const TT={contentStyle:{background:'#ffffff',border:'1px solid #e2e8f0',borderRadius:8,color:'#0f172a',fontSize:12,boxShadow:'0 4px 12px rgba(0,0,0,0.08)'}};
+const COLORS=['#00aeef','#16a34a','#d97706','#ea580c','#9333ea','#0891b2','#dc2626'];
+
+const DEFAULT_LAYOUT = [
+  { i: 'filters', x: 0, y: 0, w: 12, h: 1, static: true },
+  { i: 'cards', x: 0, y: 1, w: 12, h: 2, minH: 2 },
+  { i: 'byDept', x: 0, y: 3, w: 6, h: 5, minW: 4, minH: 3 },
+  { i: 'pie', x: 6, y: 3, w: 6, h: 5, minW: 4, minH: 3 },
+  { i: 'breakdown', x: 0, y: 8, w: 12, h: 7, minW: 6, minH: 4 },
+];
 
 export default function QCOverview() {
   const [events, setEvents] = useState([]);
@@ -38,37 +47,56 @@ export default function QCOverview() {
   const clearF=()=>{setFDept('');setFType('');setFErr('');};
 
   return (
-    <div className="space-y-5">
+    <div className="space-y-3">
       <div><h1 className="text-xl font-display font-bold text-ink-900">QC Overview</h1><p className="text-xs text-ink-400 mt-0.5">Quality control events · Last 60 days</p></div>
-      <FilterBar>
-        <FilterSelect label="Department" value={fDept} onChange={setFDept} options={depts} />
-        <FilterSelect label="Order Type" value={fType} onChange={setFType} options={['evaluation','translation']} />
-        <FilterSelect label="Error Type" value={fErr} onChange={setFErr} options={[{value:'i_fixed_it',label:'Fixed It'},{value:'kick_it_back',label:'Kick It Back'}]} />
-        <FilterReset onClick={clearF} />
-      </FilterBar>
 
-      <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-5 gap-2.5">
-        <Card label="QC Events" value={fmtI(m?.total)} color="green" loading={loading} />
-        <Card label="Fixed It" value={fmtI(m?.fi)} sub={fmtP(m?.fiP)} loading={loading} />
-        <Card label="Kick It Back" value={fmtI(m?.kb)} sub={fmtP(m?.kbP)} color="red" loading={loading} />
-        <Card label="Orders" value={fmtI(m?.orders)} color="slate" loading={loading} />
-        <Card label="Accountable Users" value={fmtI(m?.users)} color="plum" loading={loading} />
-      </div>
+      <DashboardGrid pageId="qc-overview" defaultLayout={DEFAULT_LAYOUT}>
+        <div key="filters">
+          <FilterBar>
+            <FilterSelect label="Department" value={fDept} onChange={setFDept} options={depts} />
+            <FilterSelect label="Order Type" value={fType} onChange={setFType} options={['evaluation','translation']} />
+            <FilterSelect label="Error Type" value={fErr} onChange={setFErr} options={[{value:'i_fixed_it',label:'Fixed It'},{value:'kick_it_back',label:'Kick It Back'}]} />
+            <FilterReset onClick={clearF} />
+          </FilterBar>
+        </div>
 
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-3">
-        <div className="card-surface p-4"><Section title="By Department">
-          {loading?<Skel rows={5} cols={1}/>:<ResponsiveContainer width="100%" height={260}><BarChart data={byDept} layout="vertical" margin={{left:10,right:15}}><XAxis type="number" tick={{fill:'#64748b',fontSize:10}} /><YAxis type="category" dataKey="dept" width={150} tick={{fill:'#64748b',fontSize:10}} /><Tooltip {...TT} /><Bar dataKey="fi" stackId="a" fill="#16a34a" name="Fixed It" /><Bar dataKey="kb" stackId="a" fill="#C62828" name="Kick Back" radius={[0,4,4,0]} /></BarChart></ResponsiveContainer>}
-        </Section></div>
-        <div className="card-surface p-4"><Section title="Distribution">
-          {loading?<Skel rows={5}/>:<ResponsiveContainer width="100%" height={260}><PieChart><Pie data={byDept.map(d=>({name:d.dept,value:d.total}))} cx="50%" cy="50%" innerRadius={55} outerRadius={100} paddingAngle={2} dataKey="value">{byDept.map((_,i)=><Cell key={i} fill={COLORS[i%COLORS.length]} />)}</Pie><Tooltip {...TT} /></PieChart></ResponsiveContainer>}
-        </Section></div>
-      </div>
+        <div key="cards">
+          <Widget title="QC Summary">
+            <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-5 gap-2">
+              <Card label="QC Events" value={fmtI(m?.total)} color="brand" loading={loading} />
+              <Card label="Fixed It" value={fmtI(m?.fi)} sub={fmtP(m?.fiP)} color="green" loading={loading} />
+              <Card label="Kick It Back" value={fmtI(m?.kb)} sub={fmtP(m?.kbP)} color="red" loading={loading} />
+              <Card label="Orders" value={fmtI(m?.orders)} color="slate" loading={loading} />
+              <Card label="Accountable Users" value={fmtI(m?.users)} color="plum" loading={loading} />
+            </div>
+          </Widget>
+        </div>
 
-      <Section title="Breakdown" right={<Pills tabs={[{key:'dept',label:'Department'},{key:'issue',label:'Issue'},{key:'user',label:'User'}]} active={view} onChange={setView} />}>
-        {view==='dept'&&<Table cols={[{key:'dept',label:'Department',w:160},{key:'total',label:'Events',right:true,render:v=>fmtI(v)},{key:'fi',label:'Fixed',right:true,render:v=>fmtI(v)},{key:'kb',label:'Kick Back',right:true,render:(v)=><span className={v>0?'text-red-600':''}>{fmtI(v)}</span>},{key:'fiP',label:'% Fixed',right:true,render:v=>fmtP(v)},{key:'orders',label:'Orders',right:true,render:v=>fmtI(v)},{key:'users',label:'Users',right:true,render:v=>fmtI(v)}]} rows={byDept} />}
-        {view==='issue'&&<Table cols={[{key:'issue',label:'Issue',w:250},{key:'total',label:'Events',right:true,render:v=>fmtI(v)},{key:'fi',label:'Fixed',right:true,render:v=>fmtI(v)},{key:'kb',label:'Kick Back',right:true,render:(v)=><span className={v>0?'text-red-600':''}>{fmtI(v)}</span>}]} rows={byIssue} />}
-        {view==='user'&&<Table cols={[{key:'user',label:'User',w:180},{key:'dept',label:'Dept',w:140},{key:'total',label:'Errors',right:true,render:v=>fmtI(v)},{key:'fi',label:'Fixed',right:true,render:v=>fmtI(v)},{key:'kb',label:'Kick Back',right:true,render:(v)=><span className={v>0?'text-red-600':''}>{fmtI(v)}</span>},{key:'issues',label:'Issue Types',right:true,render:v=>fmtI(v)}]} rows={byUser} />}
-      </Section>
+        <div key="byDept">
+          <Widget title="By Department — Fixed vs Kick Back">
+            {loading ? <Skel rows={5} /> :
+            <ResponsiveContainer width="100%" height="100%"><BarChart data={byDept} layout="vertical" margin={{left:10,right:15}}><XAxis type="number" tick={{fill:'#64748b',fontSize:10}} /><YAxis type="category" dataKey="dept" width={150} tick={{fill:'#64748b',fontSize:10}} /><Tooltip {...TT} /><Bar dataKey="fi" stackId="a" fill="#16a34a" name="Fixed It" /><Bar dataKey="kb" stackId="a" fill="#dc2626" name="Kick Back" radius={[0,4,4,0]} /></BarChart></ResponsiveContainer>}
+          </Widget>
+        </div>
+
+        <div key="pie">
+          <Widget title="Department Distribution">
+            {loading ? <Skel rows={5} /> :
+            <ResponsiveContainer width="100%" height="100%"><PieChart><Pie data={byDept.map(d=>({name:d.dept,value:d.total}))} cx="50%" cy="50%" innerRadius={55} outerRadius={100} paddingAngle={2} dataKey="value">{byDept.map((_,i)=><Cell key={i} fill={COLORS[i%COLORS.length]} />)}</Pie><Tooltip {...TT} /></PieChart></ResponsiveContainer>}
+          </Widget>
+        </div>
+
+        <div key="breakdown">
+          <Widget title={<div className="flex items-center justify-between w-full">
+            <span>Detail Breakdown</span>
+            <Pills tabs={[{key:'dept',label:'Department'},{key:'issue',label:'Issue'},{key:'user',label:'User'}]} active={view} onChange={setView} />
+          </div>}>
+            {view==='dept'&&<Table cols={[{key:'dept',label:'Department',w:160},{key:'total',label:'Events',right:true,render:v=>fmtI(v)},{key:'fi',label:'Fixed',right:true,render:v=>fmtI(v)},{key:'kb',label:'Kick Back',right:true,render:(v)=><span className={v>0?'text-red-600':''}>{fmtI(v)}</span>},{key:'fiP',label:'% Fixed',right:true,render:v=>fmtP(v)},{key:'orders',label:'Orders',right:true,render:v=>fmtI(v)},{key:'users',label:'Users',right:true,render:v=>fmtI(v)}]} rows={byDept} />}
+            {view==='issue'&&<Table cols={[{key:'issue',label:'Issue',w:250},{key:'total',label:'Events',right:true,render:v=>fmtI(v)},{key:'fi',label:'Fixed',right:true,render:v=>fmtI(v)},{key:'kb',label:'Kick Back',right:true,render:(v)=><span className={v>0?'text-red-600':''}>{fmtI(v)}</span>}]} rows={byIssue} />}
+            {view==='user'&&<Table cols={[{key:'user',label:'User',w:180},{key:'dept',label:'Dept',w:140},{key:'total',label:'Errors',right:true,render:v=>fmtI(v)},{key:'fi',label:'Fixed',right:true,render:v=>fmtI(v)},{key:'kb',label:'Kick Back',right:true,render:(v)=><span className={v>0?'text-red-600':''}>{fmtI(v)}</span>},{key:'issues',label:'Issue Types',right:true,render:v=>fmtI(v)}]} rows={byUser} />}
+          </Widget>
+        </div>
+      </DashboardGrid>
     </div>
   );
 }

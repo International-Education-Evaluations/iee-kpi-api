@@ -2908,6 +2908,8 @@ async function runBackfill(options = {}) {
     const segCol = configDb.collection('backfill_kpi_segments');
     const qcCol = configDb.collection('backfill_qc_events');
     const usrCol = configDb.collection('backfill_users');
+    const prodDb = await getDb('orders');
+    let fullBatchResults = null; // set if full refresh runs batched
 
     // ── Determine what to fetch ─────────────────────────────
     let segmentCutoff;
@@ -2921,12 +2923,170 @@ async function runBackfill(options = {}) {
       upperBound = options.dateTo ? new Date(options.dateTo + 'T23:59:59.999Z') : null;
       push(`Date range: ${segmentCutoff.toISOString()} → ${upperBound ? upperBound.toISOString() : 'now'}`);
     } else if (isFullRefresh) {
+      // Full refresh runs in monthly batches to avoid timeout
       const days = options.days || 90;
-      segmentCutoff = getCutoff(days);
-      qcCutoff = getCutoff(days);
       await segCol.deleteMany({});
       await qcCol.deleteMany({});
-      push(`Full refresh: cleared all, window=${days} days`);
+      push(`Full refresh: cleared all, will batch ${days} days in monthly chunks`);
+
+      // Build month boundaries from oldest to newest
+      const startDate = getCutoff(days);
+      const endDate = new Date();
+      const monthBounds = [];
+      let cursor = new Date(startDate.getFullYear(), startDate.getMonth(), 1);
+      while (cursor < endDate) {
+        const monthStart = new Date(Math.max(cursor.getTime(), startDate.getTime()));
+        const nextMonth = new Date(cursor.getFullYear(), cursor.getMonth() + 1, 0, 23, 59, 59, 999);
+        const monthEnd = new Date(Math.min(nextMonth.getTime(), endDate.getTime()));
+        monthBounds.push({ from: monthStart, to: monthEnd });
+        cursor = new Date(cursor.getFullYear(), cursor.getMonth() + 1, 1);
+      }
+
+      push(`Batching into ${monthBounds.length} monthly chunks`);
+
+      let totalOrders = 0, totalSegOps = 0, totalUpsertedSegs = 0, totalQcRaw = 0, totalUpsertedQc = 0;
+
+      for (let bi = 0; bi < monthBounds.length; bi++) {
+        const batch = monthBounds[bi];
+        const batchLabel = `${batch.from.toISOString().slice(0,7)}`;
+        push(`Batch ${bi+1}/${monthBounds.length}: ${batchLabel} (${batch.from.toISOString().slice(0,10)} → ${batch.to.toISOString().slice(0,10)})`);
+
+        // Segments for this month
+        const batchOrders = await prodDb.collection('orders').aggregate([
+          {
+            $match: {
+              paymentStatus: 'paid',
+              orderType: { $in: ['evaluation', 'translation'] },
+              deletedAt: null,
+              orderStatusHistory: { $exists: true, $not: { $size: 0 } },
+              'orderStatusHistory.createdAt': { $gte: batch.from, $lte: batch.to }
+            }
+          },
+          {
+            $project: {
+              orderSerialNumber: 1, orderType: 1, parentOrderId: 1,
+              reportItems: 1, orderStatusHistory: 1,
+              lastAssignedAt: 1, orderVersion: 1, orderSource: 1
+            }
+          }
+        ], { allowDiskUse: true }).toArray();
+
+        totalOrders += batchOrders.length;
+
+        // Build segment ops for this batch
+        const batchSegOps = [];
+        for (const order of batchOrders) {
+          const history = Array.isArray(order.orderStatusHistory) ? order.orderStatusHistory : [];
+          const reportCount = Array.isArray(order.reportItems) ? order.reportItems.length : 0;
+          const reportName = Array.isArray(order.reportItems) ? (order.reportItems[0]?.name || null) : null;
+
+          for (let i = 0; i < history.length; i++) {
+            const entry = history[i];
+            if (entry?.updatedStatus?.statusType !== 'Processing') continue;
+            const entryDate = toDate(entry?.createdAt);
+            if (!entryDate || entryDate < batch.from || entryDate > batch.to) continue;
+            const nextEntry = i + 1 < history.length ? history[i + 1] : null;
+            const segEnd = toDate(nextEntry?.createdAt);
+            const durSec = segEnd ? (segEnd.getTime() - entryDate.getTime()) / 1000 : null;
+            if (durSec !== null && durSec <= 0) continue;
+            const durMin = durSec !== null ? Math.round((durSec / 60) * 10) / 10 : null;
+            const assigned = entry?.assignedTo || {};
+            const user = entry?.user || {};
+            const preciseEnd = entry?.anotherStatusUpdatedAt ? toDate(entry.anotherStatusUpdatedAt) : null;
+            const effectiveEnd = preciseEnd || segEnd;
+            const eDurSec = effectiveEnd ? (effectiveEnd.getTime() - entryDate.getTime()) / 1000 : durSec;
+            const eDurMin = eDurSec !== null ? Math.round((eDurSec / 60) * 10) / 10 : durMin;
+            const compositeKey = `${String(order._id)}_${entry?.updatedStatus?.slug || ''}_${entryDate.toISOString()}`;
+
+            batchSegOps.push({
+              updateOne: {
+                filter: { _compositeKey: compositeKey },
+                update: { $set: {
+                  _compositeKey: compositeKey,
+                  orderSerialNumber: order.orderSerialNumber,
+                  orderId: String(order._id), orderType: order.orderType,
+                  parentOrderId: order.parentOrderId || null,
+                  reportItemCount: reportCount, reportItemName: reportName,
+                  statusSlug: entry?.updatedStatus?.slug || '',
+                  statusName: entry?.updatedStatus?.name || '',
+                  workerUserId: assigned.foreignKeyId || assigned.v2Id || null,
+                  workerName: buildFullName(assigned),
+                  workerEmail: assigned.email || null,
+                  changedByName: buildFullName(user),
+                  segmentStart: toIso(entryDate),
+                  segmentEnd: toIso(effectiveEnd || segEnd),
+                  durationSeconds: eDurSec ?? durSec,
+                  durationMinutes: eDurMin ?? durMin,
+                  isOpen: (effectiveEnd || segEnd) === null,
+                  isErrorReporting: !!entry?.isErrorReporting,
+                  lastAssignedAt: order.lastAssignedAt ? toIso(toDate(order.lastAssignedAt)) : null,
+                  orderVersion: order.orderVersion || null,
+                  orderSource: order.orderSource || null,
+                  _backfilledAt: new Date()
+                }},
+                upsert: true
+              }
+            });
+          }
+        }
+
+        totalSegOps += batchSegOps.length;
+        if (batchSegOps.length > 0) {
+          for (let i = 0; i < batchSegOps.length; i += 2000) {
+            const result = await segCol.bulkWrite(batchSegOps.slice(i, i + 2000), { ordered: false });
+            totalUpsertedSegs += result.upsertedCount || 0;
+          }
+        }
+
+        // QC events for this month
+        const batchQc = await prodDb.collection('order-discussion').find({
+          type: 'system_logs', 'category.slug': 'quality_control',
+          createdAt: { $gte: batch.from, $lte: batch.to }, deletedAt: null
+        }, {
+          projection: { order: 1, user: 1, category: 1, department: 1, issue: 1, errorType: 1, errorAssignedTo: 1, text: 1, createdAt: 1 }
+        }).toArray();
+
+        totalQcRaw += batchQc.length;
+        const batchQcOps = batchQc.map(doc => ({
+          updateOne: {
+            filter: { _qcKey: String(doc._id) },
+            update: { $set: {
+              _qcKey: String(doc._id),
+              orderId: doc.order ? String(doc.order) : null,
+              reporterName: doc.user ? [doc.user.firstName, doc.user.lastName].filter(Boolean).join(' ') : null,
+              reporterEmail: doc.user?.email || null,
+              departmentName: doc.department?.name || null,
+              departmentShortName: doc.department?.shortName || null,
+              issueName: doc.issue?.name || null,
+              errorType: doc.errorType || null,
+              errorAssignedToName: doc.errorAssignedTo ? [doc.errorAssignedTo.firstName, doc.errorAssignedTo.lastName].filter(Boolean).join(' ') : null,
+              errorAssignedToEmail: doc.errorAssignedTo?.email || null,
+              categoryName: doc.category?.name || null,
+              text: doc.text || null,
+              qcCreatedAt: doc.createdAt ? toIso(toDate(doc.createdAt)) : null,
+              _backfilledAt: new Date()
+            }},
+            upsert: true
+          }
+        }));
+
+        if (batchQcOps.length > 0) {
+          for (let i = 0; i < batchQcOps.length; i += 2000) {
+            const result = await qcCol.bulkWrite(batchQcOps.slice(i, i + 2000), { ordered: false });
+            totalUpsertedQc += result.upsertedCount || 0;
+          }
+        }
+
+        push(`  → ${batchOrders.length} orders, ${batchSegOps.length} segs, ${batchQc.length} QC`);
+      }
+
+      // After all batches, set these for the metadata
+      segmentCutoff = getCutoff(days);
+      qcCutoff = getCutoff(days);
+
+      // Skip the normal segment/QC processing below — jump straight to users + metadata
+      // We set a flag so the code below knows batches already ran
+      fullBatchResults = { totalOrders, totalSegOps, totalUpsertedSegs, totalQcRaw, totalUpsertedQc };
     } else {
       // Find the latest record we already have
       const latestSeg = await segCol
@@ -2955,12 +3115,16 @@ async function runBackfill(options = {}) {
     }
 
     // ═════════════════════════════════════════════════════════
-    // 1. KPI SEGMENTS
+    // 1. KPI SEGMENTS + 2. QC EVENTS
+    // (Skipped if full refresh already ran batched above)
     // ═════════════════════════════════════════════════════════
+
+    let upsertedSegs = 0, updatedSegs = 0, segOpsCount = 0, qcRawCount = 0, upsertedQc = 0, ordersScanned = 0, openOrdersRechecked = 0;
+
+    if (!fullBatchResults) {
 
     // 1a. Fetch orders with history entries in the cutoff window
     push('Querying production orders...');
-    const prodDb = await getDb('orders');
     const orders = await prodDb.collection('orders').aggregate([
       {
         $match: {
@@ -3158,6 +3322,34 @@ async function runBackfill(options = {}) {
 
     push(`QC events: ${upsertedQc} new out of ${qcRaw.length} processed`);
 
+    ordersScanned = allOrders.size;
+    openOrdersRechecked = openOrders.length;
+    segOpsCount = segOps.length;
+    qcRawCount = qcRaw.length;
+
+    } // end if (!fullBatchResults)
+
+    // If full batch ran, pull numbers from there
+    if (fullBatchResults) {
+      ordersScanned = fullBatchResults.totalOrders;
+      segOpsCount = fullBatchResults.totalSegOps;
+      upsertedSegs = fullBatchResults.totalUpsertedSegs;
+      qcRawCount = fullBatchResults.totalQcRaw;
+      upsertedQc = fullBatchResults.totalUpsertedQc;
+    }
+
+    // Ensure indexes exist regardless of path
+    await segCol.createIndex({ _compositeKey: 1 }, { unique: true }).catch(() => {});
+    await segCol.createIndex({ workerEmail: 1 }).catch(() => {});
+    await segCol.createIndex({ statusSlug: 1 }).catch(() => {});
+    await segCol.createIndex({ orderType: 1 }).catch(() => {});
+    await segCol.createIndex({ segmentStart: -1 }).catch(() => {});
+    await segCol.createIndex({ isOpen: 1 }).catch(() => {});
+    await qcCol.createIndex({ _qcKey: 1 }, { unique: true }).catch(() => {});
+    await qcCol.createIndex({ departmentName: 1 }).catch(() => {});
+    await qcCol.createIndex({ errorType: 1 }).catch(() => {});
+    await qcCol.createIndex({ qcCreatedAt: -1 }).catch(() => {});
+
     // ═════════════════════════════════════════════════════════
     // 3. USERS (always full replace — small dataset, can change)
     // ═════════════════════════════════════════════════════════
@@ -3200,13 +3392,13 @@ async function runBackfill(options = {}) {
       mode: isFullRefresh ? 'full' : 'incremental',
       triggeredBy: options.triggeredBy || 'system',
       counts: {
-        ordersScanned: allOrders.size,
-        openOrdersRechecked: openOrders.length,
-        segmentsProcessed: segOps.length,
+        ordersScanned,
+        openOrdersRechecked,
+        segmentsProcessed: segOpsCount,
         segmentsNew: upsertedSegs,
         segmentsUpdated: updatedSegs,
         segmentsTotal: totalSegs,
-        qcProcessed: qcRaw.length,
+        qcProcessed: qcRawCount,
         qcNew: upsertedQc,
         qcTotal: totalQc,
         users: userDocs.length,
