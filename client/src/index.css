@@ -1,0 +1,24 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+body { font-family: 'IBM Plex Sans', system-ui, sans-serif; -webkit-font-smoothing: antialiased; }
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.12); border-radius: 3px; }
+
+.glass { background: rgba(255,255,255,0.035); backdrop-filter: blur(8px); border: 1px solid rgba(255,255,255,0.07); }
+@keyframes pulse-soft { 0%,100%{opacity:1} 50%{opacity:0.5} }
+.loading { animation: pulse-soft 1.5s ease-in-out infinite; }
+
+.tbl th { @apply text-[11px] font-semibold uppercase tracking-wider text-slate-400 px-3 py-2.5 text-left; background:rgba(255,255,255,0.025); }
+.tbl td { @apply px-3 py-2 text-sm text-slate-300 border-t border-slate-700/40; }
+.tbl tr:hover td { background:rgba(255,255,255,0.025); }
+
+/* Chat */
+.chat-user { @apply bg-navy-600/20 border border-navy-500/20 rounded-xl px-4 py-3; }
+.chat-ai { @apply bg-slate-800/50 border border-slate-700/30 rounded-xl px-4 py-3; }
+.chat-ai p { @apply mb-2 last:mb-0; }
+.chat-ai ul { @apply list-disc pl-5 mb-2; }
+.chat-ai strong { @apply text-white; }
+.chat-ai code { @apply bg-slate-700/50 px-1.5 py-0.5 rounded text-xs font-mono text-emerald-300; }
