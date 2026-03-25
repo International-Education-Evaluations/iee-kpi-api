@@ -14,7 +14,7 @@ export default function QCOverview() {
   const [fErr, setFErr] = useState('');
 
   useEffect(() => { load(); }, []);
-  async function load() { setLoading(true); try { const d=await api('/qc-events?days=60&includeHtml=false&includeText=false'); setEvents(d.events||[]); } catch(e){console.error(e);} setLoading(false); }
+  async function load() { setLoading(true); try { const d=await api('/data/qc-events?days=60&includeHtml=false&includeText=false'); setEvents(d.events||[]); } catch(e){console.error(e);} setLoading(false); }
 
   const filtered = useMemo(()=>events.filter(e=>{
     if(fDept&&e.departmentName!==fDept) return false;

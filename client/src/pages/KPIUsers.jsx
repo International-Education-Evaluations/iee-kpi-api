@@ -22,7 +22,7 @@ export default function KPIUsers() {
     setLoading(true);
     try {
       let all=[], p=1, more=true;
-      while(more){const d=await api(`/kpi-segments?days=60&page=${p}&pageSize=5000`);all=all.concat(d.segments||[]);more=d.hasMore;p++;}
+      while(more){const d=await api(`/data/kpi-segments?days=60&page=${p}&pageSize=5000`);all=all.concat(d.segments||[]);more=d.hasMore;p++;}
       const dis = disambiguateWorkers(all);
       setSegs(dis);
       const m={};

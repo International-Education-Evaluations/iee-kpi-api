@@ -504,7 +504,8 @@ function authMiddleware(req, res, next) {
   // Skip auth for SPA page routes (no dot = not an API path, not a file)
   // API routes all start with known prefixes; everything else is a React route
   const apiPrefixes = ['/kpi-', '/qc-', '/queue-', '/credential', '/report-',
-    '/users', '/collections', '/indexes', '/config/', '/auth/', '/ai/', '/glossary', '/email/'];
+    '/users', '/collections', '/indexes', '/config/', '/auth/', '/ai/', '/glossary', '/email/',
+    '/backfill/', '/data/', '/reports/', '/user/'];
   const isApiRoute = apiPrefixes.some(p => req.path.startsWith(p));
   if (!isApiRoute && req.method === 'GET' && !req.path.includes('.')) {
     return next(); // Let SPA fallback handle it
@@ -570,7 +571,7 @@ app.get('/health', async (req, res) => {
   try {
     const db = await getDb('orders');
     await db.command({ ping: 1 });
-    res.json({ status: 'ok', timestamp: new Date().toISOString(), env: CONFIG.NODE_ENV, version: '4.3' });
+    res.json({ status: 'ok', timestamp: new Date().toISOString(), env: CONFIG.NODE_ENV, version: '5.1' });
   } catch (err) {
     res.status(500).json({ status: 'error', message: err.message });
   }
@@ -2875,6 +2876,827 @@ app.post('/email/send-now', requireRole('admin', 'manager'), async (req, res) =>
 
 
 // ═══════════════════════════════════════════════════════════
+// DATA BACKFILL SYSTEM
+// ═══════════════════════════════════════════════════════════
+// Copies KPI segments, QC events, queue snapshots, and users
+// from production MongoDB into iee_dashboard for fast local reads.
+// Admin-triggered or auto-scheduled.
+// ═══════════════════════════════════════════════════════════
+
+let backfillRunning = false;
+
+async function runBackfill(options = {}) {
+  if (backfillRunning) return { error: 'Backfill already in progress' };
+  backfillRunning = true;
+  const startTime = Date.now();
+  const log = [];
+  const push = (msg) => { log.push(`[${((Date.now()-startTime)/1000).toFixed(1)}s] ${msg}`); console.log(`[BACKFILL] ${msg}`); };
+
+  try {
+    const configDb = await getConfigDb();
+    const isFullRefresh = !!options.full;
+
+    push(`Starting ${isFullRefresh ? 'FULL' : 'INCREMENTAL'} backfill`);
+
+    await configDb.collection('backfill_metadata').updateOne(
+      { _id: 'status' },
+      { $set: { running: true, startedAt: new Date(), triggeredBy: options.triggeredBy || 'system', mode: isFullRefresh ? 'full' : 'incremental' } },
+      { upsert: true }
+    );
+
+    const segCol = configDb.collection('backfill_kpi_segments');
+    const qcCol = configDb.collection('backfill_qc_events');
+    const usrCol = configDb.collection('backfill_users');
+
+    // ── Determine what to fetch ─────────────────────────────
+    let segmentCutoff;
+    let qcCutoff;
+
+    if (isFullRefresh) {
+      const days = options.days || 90;
+      segmentCutoff = getCutoff(days);
+      qcCutoff = getCutoff(days);
+      await segCol.deleteMany({});
+      await qcCol.deleteMany({});
+      push(`Full refresh: cleared all, window=${days} days`);
+    } else {
+      // Find the latest record we already have
+      const latestSeg = await segCol
+        .findOne({}, { sort: { segmentStart: -1 }, projection: { segmentStart: 1 } });
+      const latestQc = await qcCol
+        .findOne({}, { sort: { qcCreatedAt: -1 }, projection: { qcCreatedAt: 1 } });
+
+      if (!latestSeg && !latestQc) {
+        // Empty — seed with full window
+        const days = options.days || 90;
+        segmentCutoff = getCutoff(days);
+        qcCutoff = getCutoff(days);
+        push(`No existing data — seeding full ${days}-day window`);
+      } else {
+        // Overlap buffer: 2 hours catches stragglers
+        const bufferMs = 2 * 60 * 60 * 1000;
+        segmentCutoff = latestSeg?.segmentStart
+          ? new Date(new Date(latestSeg.segmentStart).getTime() - bufferMs)
+          : getCutoff(options.days || 90);
+        qcCutoff = latestQc?.qcCreatedAt
+          ? new Date(new Date(latestQc.qcCreatedAt).getTime() - bufferMs)
+          : getCutoff(options.days || 90);
+        push(`Incremental from seg=${segmentCutoff.toISOString()}, qc=${qcCutoff.toISOString()}`);
+      }
+    }
+
+    // ═════════════════════════════════════════════════════════
+    // 1. KPI SEGMENTS
+    // ═════════════════════════════════════════════════════════
+
+    // 1a. Fetch orders with history entries in the cutoff window
+    push('Querying production orders...');
+    const prodDb = await getDb('orders');
+    const orders = await prodDb.collection('orders').aggregate([
+      {
+        $match: {
+          paymentStatus: 'paid',
+          orderType: { $in: ['evaluation', 'translation'] },
+          deletedAt: null,
+          orderStatusHistory: { $exists: true, $not: { $size: 0 } },
+          'orderStatusHistory.createdAt': { $gte: segmentCutoff }
+        }
+      },
+      {
+        $project: {
+          orderSerialNumber: 1, orderType: 1, parentOrderId: 1,
+          reportItems: 1, orderStatusHistory: 1,
+          lastAssignedAt: 1, orderVersion: 1, orderSource: 1
+        }
+      }
+    ], { allowDiskUse: true }).toArray();
+    push(`Fetched ${orders.length} orders`);
+
+    // 1b. Also fetch orders that have open segments in our backfill
+    //     (they may have closed since last run, even if outside the 2hr buffer)
+    const openSegments = await segCol.find({ isOpen: true }, { projection: { orderId: 1 } }).toArray();
+    const openOrderIds = [...new Set(openSegments.map(s => s.orderId))];
+    let openOrders = [];
+    if (openOrderIds.length > 0 && !isFullRefresh) {
+      push(`Re-checking ${openOrderIds.length} orders with open segments...`);
+      // Convert string IDs back to ObjectId for the query
+      // ObjectId already imported at top of file
+      const objectIds = openOrderIds.map(id => { try { return new ObjectId(id); } catch { return null; } }).filter(Boolean);
+      if (objectIds.length > 0) {
+        openOrders = await prodDb.collection('orders').find(
+          { _id: { $in: objectIds } },
+          { projection: { orderSerialNumber: 1, orderType: 1, parentOrderId: 1, reportItems: 1, orderStatusHistory: 1, lastAssignedAt: 1, orderVersion: 1, orderSource: 1 } }
+        ).toArray();
+        push(`Fetched ${openOrders.length} previously-open orders`);
+      }
+    }
+
+    // 1c. Merge and deduplicate by _id
+    const allOrders = new Map();
+    for (const o of orders) allOrders.set(String(o._id), o);
+    for (const o of openOrders) allOrders.set(String(o._id), o); // overwrite with fresh copy
+
+    // 1d. Build segments
+    const segOps = []; // bulkWrite operations
+    for (const order of allOrders.values()) {
+      const history = Array.isArray(order.orderStatusHistory) ? order.orderStatusHistory : [];
+      const reportCount = Array.isArray(order.reportItems) ? order.reportItems.length : 0;
+      const reportName = Array.isArray(order.reportItems) ? (order.reportItems[0]?.name || null) : null;
+
+      for (let i = 0; i < history.length; i++) {
+        const entry = history[i];
+        if (entry?.updatedStatus?.statusType !== 'Processing') continue;
+        const entryDate = toDate(entry?.createdAt);
+        if (!entryDate) continue;
+
+        // For incremental: skip segments we definitely already have and that are closed
+        // (they're immutable). Only process if:
+        //   - The segment is in the cutoff window, OR
+        //   - The order had an open segment we're re-checking
+        if (!isFullRefresh && entryDate < segmentCutoff && !openOrderIds.includes(String(order._id))) continue;
+
+        const nextEntry = i + 1 < history.length ? history[i + 1] : null;
+        const segEnd = toDate(nextEntry?.createdAt);
+        const durSec = segEnd ? (segEnd.getTime() - entryDate.getTime()) / 1000 : null;
+        if (durSec !== null && durSec <= 0) continue;
+        const durMin = durSec !== null ? Math.round((durSec / 60) * 10) / 10 : null;
+        const assigned = entry?.assignedTo || {};
+        const user = entry?.user || {};
+        const preciseEnd = entry?.anotherStatusUpdatedAt ? toDate(entry.anotherStatusUpdatedAt) : null;
+        const effectiveEnd = preciseEnd || segEnd;
+        const eDurSec = effectiveEnd ? (effectiveEnd.getTime() - entryDate.getTime()) / 1000 : durSec;
+        const eDurMin = eDurSec !== null ? Math.round((eDurSec / 60) * 10) / 10 : durMin;
+
+        const compositeKey = `${String(order._id)}_${entry?.updatedStatus?.slug || ''}_${entryDate.toISOString()}`;
+
+        segOps.push({
+          updateOne: {
+            filter: { _compositeKey: compositeKey },
+            update: { $set: {
+              _compositeKey: compositeKey,
+              orderSerialNumber: order.orderSerialNumber,
+              orderId: String(order._id),
+              orderType: order.orderType,
+              parentOrderId: order.parentOrderId || null,
+              reportItemCount: reportCount,
+              reportItemName: reportName,
+              statusSlug: entry?.updatedStatus?.slug || '',
+              statusName: entry?.updatedStatus?.name || '',
+              workerUserId: assigned.foreignKeyId || assigned.v2Id || null,
+              workerName: buildFullName(assigned),
+              workerEmail: assigned.email || null,
+              changedByName: buildFullName(user),
+              segmentStart: toIso(entryDate),
+              segmentEnd: toIso(effectiveEnd || segEnd),
+              durationSeconds: eDurSec ?? durSec,
+              durationMinutes: eDurMin ?? durMin,
+              isOpen: (effectiveEnd || segEnd) === null,
+              isErrorReporting: !!entry?.isErrorReporting,
+              lastAssignedAt: order.lastAssignedAt ? toIso(toDate(order.lastAssignedAt)) : null,
+              orderVersion: order.orderVersion || null,
+              orderSource: order.orderSource || null,
+              _backfilledAt: new Date()
+            }},
+            upsert: true
+          }
+        });
+      }
+    }
+
+    // 1e. Execute bulk upsert (one network round trip)
+    let upsertedSegs = 0, updatedSegs = 0;
+    if (segOps.length > 0) {
+      // bulkWrite in batches of 2000 (MongoDB limit is 100k but smaller is safer)
+      for (let i = 0; i < segOps.length; i += 2000) {
+        const batch = segOps.slice(i, i + 2000);
+        const result = await segCol.bulkWrite(batch, { ordered: false });
+        upsertedSegs += result.upsertedCount || 0;
+        updatedSegs += result.modifiedCount || 0;
+      }
+    }
+
+    // 1f. Indexes (idempotent, fast if already exist)
+    await segCol.createIndex({ _compositeKey: 1 }, { unique: true }).catch(() => {});
+    await segCol.createIndex({ workerEmail: 1 }).catch(() => {});
+    await segCol.createIndex({ statusSlug: 1 }).catch(() => {});
+    await segCol.createIndex({ orderType: 1 }).catch(() => {});
+    await segCol.createIndex({ segmentStart: -1 }).catch(() => {});
+    await segCol.createIndex({ isOpen: 1 }).catch(() => {});
+
+    push(`Segments: ${upsertedSegs} new, ${updatedSegs} updated, ${segOps.length} processed`);
+
+    // ═════════════════════════════════════════════════════════
+    // 2. QC EVENTS
+    // ═════════════════════════════════════════════════════════
+
+    push('Querying production QC events...');
+    // Query order-discussion directly with our cutoff (don't go through getQcEventsDataset)
+    const qcRaw = await prodDb.collection('order-discussion').find({
+      type: 'system_logs',
+      'category.slug': 'quality_control',
+      createdAt: { $gte: qcCutoff },
+      deletedAt: null
+    }, {
+      projection: {
+        order: 1, user: 1, category: 1, department: 1, issue: 1,
+        errorType: 1, errorAssignedTo: 1, text: 1, createdAt: 1
+      }
+    }).toArray();
+
+    push(`Fetched ${qcRaw.length} QC events from production`);
+
+    const qcOps = qcRaw.map(doc => {
+      const qcKey = String(doc._id); // MongoDB _id is the natural unique key
+      return {
+        updateOne: {
+          filter: { _qcKey: qcKey },
+          update: { $set: {
+            _qcKey: qcKey,
+            orderId: doc.order ? String(doc.order) : null,
+            reporterName: doc.user ? [doc.user.firstName, doc.user.lastName].filter(Boolean).join(' ') : null,
+            reporterEmail: doc.user?.email || null,
+            departmentName: doc.department?.name || null,
+            departmentShortName: doc.department?.shortName || null,
+            issueName: doc.issue?.name || null,
+            errorType: doc.errorType || null,
+            errorAssignedToName: doc.errorAssignedTo ? [doc.errorAssignedTo.firstName, doc.errorAssignedTo.lastName].filter(Boolean).join(' ') : null,
+            errorAssignedToEmail: doc.errorAssignedTo?.email || null,
+            categoryName: doc.category?.name || null,
+            text: doc.text || null,
+            qcCreatedAt: doc.createdAt ? toIso(toDate(doc.createdAt)) : null,
+            _backfilledAt: new Date()
+          }},
+          upsert: true
+        }
+      };
+    });
+
+    let upsertedQc = 0;
+    if (qcOps.length > 0) {
+      for (let i = 0; i < qcOps.length; i += 2000) {
+        const batch = qcOps.slice(i, i + 2000);
+        const result = await qcCol.bulkWrite(batch, { ordered: false });
+        upsertedQc += result.upsertedCount || 0;
+      }
+    }
+
+    await qcCol.createIndex({ _qcKey: 1 }, { unique: true }).catch(() => {});
+    await qcCol.createIndex({ departmentName: 1 }).catch(() => {});
+    await qcCol.createIndex({ errorType: 1 }).catch(() => {});
+    await qcCol.createIndex({ qcCreatedAt: -1 }).catch(() => {});
+
+    push(`QC events: ${upsertedQc} new out of ${qcRaw.length} processed`);
+
+    // ═════════════════════════════════════════════════════════
+    // 3. USERS (always full replace — small dataset, can change)
+    // ═════════════════════════════════════════════════════════
+
+    push('Fetching users...');
+    const userDb = await getDb('user');
+    const users = await userDb.collection('users').find(
+      { deletedAt: null },
+      { projection: { firstName: 1, middleName: 1, lastName: 1, email: 1, type: 1, active: 1, department: 1 } }
+    ).toArray();
+
+    const userDocs = users.map(u => ({
+      v2Id: String(u._id),
+      fullName: [u.firstName, u.middleName, u.lastName].filter(Boolean).join(' ').trim(),
+      email: u.email, type: u.type, isActive: u.active !== false,
+      departmentName: u.department?.name || null,
+      _backfilledAt: new Date()
+    }));
+
+    await usrCol.deleteMany({});
+    if (userDocs.length > 0) await usrCol.insertMany(userDocs, { ordered: false });
+    await usrCol.createIndex({ email: 1 }).catch(() => {});
+
+    push(`Users: ${userDocs.length} (full replace)`);
+
+    // ═════════════════════════════════════════════════════════
+    // 4. METADATA + HISTORY
+    // ═════════════════════════════════════════════════════════
+
+    const elapsed = Date.now() - startTime;
+    const totalSegs = await segCol.countDocuments();
+    const totalQc = await qcCol.countDocuments();
+    const openCount = await segCol.countDocuments({ isOpen: true });
+
+    const metadata = {
+      running: false,
+      lastRunAt: new Date(),
+      lastRunDurationMs: elapsed,
+      lastRunDurationSec: Math.round(elapsed / 100) / 10,
+      mode: isFullRefresh ? 'full' : 'incremental',
+      triggeredBy: options.triggeredBy || 'system',
+      counts: {
+        ordersScanned: allOrders.size,
+        openOrdersRechecked: openOrders.length,
+        segmentsProcessed: segOps.length,
+        segmentsNew: upsertedSegs,
+        segmentsUpdated: updatedSegs,
+        segmentsTotal: totalSegs,
+        qcProcessed: qcRaw.length,
+        qcNew: upsertedQc,
+        qcTotal: totalQc,
+        users: userDocs.length,
+        openSegments: openCount
+      },
+      log
+    };
+
+    await configDb.collection('backfill_metadata').replaceOne(
+      { _id: 'status' }, { _id: 'status', ...metadata }, { upsert: true }
+    );
+
+    // History: capped at 50 via simple delete
+    const { _id: _, ...historyDoc } = { ...metadata };
+    await configDb.collection('backfill_history').insertOne({ ...historyDoc, completedAt: new Date() });
+    await configDb.collection('backfill_history')
+      .deleteMany({ completedAt: { $lt: new Date(Date.now() - 7 * 24 * 60 * 60 * 1000) } }); // keep 7 days
+
+    push(`Done in ${(elapsed/1000).toFixed(1)}s — ${upsertedSegs} new segs, ${updatedSegs} updated, ${upsertedQc} new QC, ${totalSegs} total`);
+    backfillRunning = false;
+    return metadata;
+
+  } catch (err) {
+    push(`ERROR: ${err.message}`);
+    backfillRunning = false;
+    try {
+      const configDb = await getConfigDb();
+      await configDb.collection('backfill_metadata').updateOne(
+        { _id: 'status' },
+        { $set: { running: false, lastError: err.message, lastErrorAt: new Date(), log } },
+        { upsert: true }
+      );
+    } catch {}
+    return { error: err.message, log };
+  }
+}
+
+// —— POST /backfill/run — Admin trigger ——————————————————
+// Body: { days: 90, full: false }
+// full=true: wipes and re-seeds everything (first run, or recovery)
+// full=false (default): incremental — only fetches new records
+app.post('/backfill/run', requireRole('admin'), async (req, res) => {
+  try {
+    const days = parsePositiveInt(req.body.days, 90, { min: 1, max: 365 });
+    const full = !!req.body.full;
+    if (backfillRunning) return res.status(409).json({ error: 'Backfill already in progress' });
+
+    res.json({ success: true, message: `${full ? 'Full' : 'Incremental'} backfill started. Check /backfill/status.` });
+    runBackfill({ days, full, triggeredBy: req.user?.name || 'admin' });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// —— GET /backfill/status ————————————————————————————————
+app.get('/backfill/status', async (req, res) => {
+  try {
+    const db = await getConfigDb();
+    const status = await db.collection('backfill_metadata').findOne({ _id: 'status' });
+
+    // Also get collection counts
+    const [segCount, qcCount, usrCount] = await Promise.all([
+      db.collection('backfill_kpi_segments').countDocuments().catch(() => 0),
+      db.collection('backfill_qc_events').countDocuments().catch(() => 0),
+      db.collection('backfill_users').countDocuments().catch(() => 0)
+    ]);
+
+    res.json({
+      ...status,
+      currentCounts: { segments: segCount, qcEvents: qcCount, users: usrCount },
+      isRunning: backfillRunning
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// —— GET /backfill/history ———————————————————————————————
+app.get('/backfill/history', requireRole('admin', 'manager'), async (req, res) => {
+  try {
+    const db = await getConfigDb();
+    const history = await db.collection('backfill_metadata')
+      .find({ type: 'history' })
+      .sort({ lastRunAt: -1 })
+      .limit(20)
+      .toArray();
+    res.json({ count: history.length, history });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// —— PUT /backfill/settings —————————————————————————————
+app.put('/backfill/settings', requireRole('admin'), async (req, res) => {
+  try {
+    const { autoRefreshMinutes, days, enabled } = req.body;
+    const db = await getConfigDb();
+    const settings = {
+      autoRefreshMinutes: Math.max(autoRefreshMinutes || 5, 2), // min 2 minutes
+      days: Math.min(days || 90, 365),
+      enabled: enabled !== false,
+      updatedBy: req.user?.name,
+      updatedAt: new Date()
+    };
+    await db.collection('backfill_metadata').replaceOne(
+      { _id: 'settings' }, { _id: 'settings', ...settings }, { upsert: true }
+    );
+    await auditLog('update_backfill_settings', 'backfill_metadata', settings, req.user?.name);
+    res.json({ success: true, settings });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// —— GET /backfill/settings —————————————————————————————
+app.get('/backfill/settings', async (req, res) => {
+  try {
+    const db = await getConfigDb();
+    const settings = await db.collection('backfill_metadata').findOne({ _id: 'settings' });
+    res.json(settings || { autoRefreshMinutes: 5, days: 90, enabled: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════
+// FAST READ ENDPOINTS — Read from backfill collections
+// These replace the slow live queries for the dashboard.
+// The original endpoints still work for GAS/Bruno (live data).
+// ═══════════════════════════════════════════════════════════
+
+// —— GET /data/kpi-segments — Fast read from backfill ————
+app.get('/data/kpi-segments', async (req, res) => {
+  try {
+    const page = parsePositiveInt(req.query.page, 1);
+    const pageSize = parsePositiveInt(req.query.pageSize, 5000, { min: 1, max: 10000 });
+    const db = await getConfigDb();
+    const col = db.collection('backfill_kpi_segments');
+
+    // Build filter
+    const filter = {};
+    if (req.query.orderType) filter.orderType = req.query.orderType;
+    if (req.query.workerEmail) filter.workerEmail = req.query.workerEmail;
+    if (req.query.statusSlug) filter.statusSlug = req.query.statusSlug;
+    if (req.query.from) filter.segmentStart = { $gte: req.query.from };
+    if (req.query.to) filter.segmentStart = { ...filter.segmentStart, $lte: req.query.to + 'T23:59:59' };
+
+    const totalCount = await col.countDocuments(filter);
+    const segments = await col.find(filter)
+      .sort({ segmentStart: -1 })
+      .skip((page - 1) * pageSize)
+      .limit(pageSize)
+      .toArray();
+
+    const meta = await db.collection('backfill_metadata').findOne({ _id: 'status' });
+
+    res.json({
+      count: segments.length,
+      totalCount,
+      page,
+      pageSize,
+      totalPages: Math.ceil(totalCount / pageSize),
+      hasMore: page * pageSize < totalCount,
+      source: 'backfill',
+      lastBackfillAt: meta?.lastRunAt || null,
+      lastBackfillDuration: meta?.lastRunDurationSec || null,
+      segments
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// —— GET /data/qc-events — Fast read from backfill ———————
+app.get('/data/qc-events', async (req, res) => {
+  try {
+    const page = parsePositiveInt(req.query.page, 1);
+    const pageSize = parsePositiveInt(req.query.pageSize, 5000, { min: 1, max: 10000 });
+    const db = await getConfigDb();
+    const col = db.collection('backfill_qc_events');
+
+    const filter = {};
+    if (req.query.departmentName) filter.departmentName = req.query.departmentName;
+    if (req.query.errorType) filter.errorType = req.query.errorType;
+    if (req.query.orderType) filter.orderType = req.query.orderType;
+
+    const totalCount = await col.countDocuments(filter);
+    const events = await col.find(filter)
+      .sort({ qcCreatedAt: -1 })
+      .skip((page - 1) * pageSize)
+      .limit(pageSize)
+      .toArray();
+
+    const meta = await db.collection('backfill_metadata').findOne({ _id: 'status' });
+
+    res.json({
+      count: events.length,
+      totalCount,
+      page, pageSize,
+      totalPages: Math.ceil(totalCount / pageSize),
+      hasMore: page * pageSize < totalCount,
+      source: 'backfill',
+      lastBackfillAt: meta?.lastRunAt || null,
+      events
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// —— GET /data/users — Fast read from backfill ——————————
+app.get('/data/users', async (req, res) => {
+  try {
+    const db = await getConfigDb();
+    const users = await db.collection('backfill_users').find({}).sort({ fullName: 1 }).toArray();
+    res.json({ count: users.length, source: 'backfill', users });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── Backfill auto-scheduler ─────────────────────────────
+function startBackfillScheduler() {
+  let lastCheckMs = 0;
+
+  setInterval(async () => {
+    try {
+      const db = await getConfigDb();
+      const settings = await db.collection('backfill_metadata').findOne({ _id: 'settings' });
+      if (!settings?.enabled) return;
+
+      const intervalMs = (settings.autoRefreshMinutes || 5) * 60 * 1000;
+      const status = await db.collection('backfill_metadata').findOne({ _id: 'status' });
+      const lastRun = status?.lastRunAt ? new Date(status.lastRunAt).getTime() : 0;
+
+      if (Date.now() - lastRun >= intervalMs && !backfillRunning) {
+        console.log(`[BACKFILL-CRON] Auto-backfill triggered (interval: ${settings.autoRefreshMinutes}min)`);
+        runBackfill({ days: settings.days || 90, triggeredBy: 'auto-scheduler' });
+      }
+    } catch (err) {
+      console.error('[BACKFILL-CRON] Error:', err.message);
+    }
+  }, 30000); // Check every 30 seconds
+
+  console.log('Backfill auto-scheduler started (checks every 30s)');
+}
+
+
+// ═══════════════════════════════════════════════════════════
+// REPORT BUILDER — Server-side aggregation against backfill data
+// ═══════════════════════════════════════════════════════════
+
+// —— POST /reports/query — Execute a report ——————————————
+app.post('/reports/query', async (req, res) => {
+  try {
+    const { source, metric, groupBy, filters, dateGrouping } = req.body;
+    if (!source || !metric || !groupBy) {
+      return res.status(400).json({ error: 'source, metric, and groupBy required' });
+    }
+
+    const db = await getConfigDb();
+    const colName = source === 'qc' ? 'backfill_qc_events' : 'backfill_kpi_segments';
+    const col = db.collection(colName);
+
+    // Build match filter
+    const match = {};
+    if (filters) {
+      if (filters.dateFrom) {
+        const dateField = source === 'qc' ? 'qcCreatedAt' : 'segmentStart';
+        match[dateField] = { ...match[dateField], $gte: filters.dateFrom };
+      }
+      if (filters.dateTo) {
+        const dateField = source === 'qc' ? 'qcCreatedAt' : 'segmentStart';
+        match[dateField] = { ...match[dateField], $lte: filters.dateTo + 'T23:59:59' };
+      }
+      if (filters.workers?.length) match.workerEmail = { $in: filters.workers };
+      if (filters.statuses?.length) match.statusSlug = { $in: filters.statuses };
+      if (filters.orderTypes?.length) match.orderType = { $in: filters.orderTypes };
+      if (filters.departments?.length) match.departmentName = { $in: filters.departments };
+      if (filters.errorTypes?.length) match.errorType = { $in: filters.errorTypes };
+      if (filters.excludeOpen) match.isOpen = { $ne: true };
+    }
+
+    // Build group key
+    const dateField = source === 'qc' ? 'qcCreatedAt' : 'segmentStart';
+    let groupKey;
+    switch (groupBy) {
+      case 'worker': groupKey = source === 'qc' ? '$errorAssignedToName' : '$workerName'; break;
+      case 'workerEmail': groupKey = source === 'qc' ? '$errorAssignedToEmail' : '$workerEmail'; break;
+      case 'status': groupKey = '$statusSlug'; break;
+      case 'statusName': groupKey = '$statusName'; break;
+      case 'department': groupKey = '$departmentName'; break;
+      case 'orderType': groupKey = '$orderType'; break;
+      case 'errorType': groupKey = '$errorType'; break;
+      case 'issueName': groupKey = '$issueName'; break;
+      case 'date':
+        // Group by day/week/month
+        if (dateGrouping === 'week') {
+          groupKey = { $dateToString: { format: '%G-W%V', date: { $dateFromString: { dateString: `$${dateField}` } } } };
+        } else if (dateGrouping === 'month') {
+          groupKey = { $substr: [`$${dateField}`, 0, 7] };
+        } else {
+          groupKey = { $substr: [`$${dateField}`, 0, 10] }; // day
+        }
+        break;
+      default: groupKey = '$' + groupBy;
+    }
+
+    // Build metric aggregation
+    let metricField;
+    switch (metric) {
+      case 'count': metricField = { $sum: 1 }; break;
+      case 'avgDuration': metricField = { $avg: '$durationMinutes' }; break;
+      case 'totalHours': metricField = { $sum: { $divide: ['$durationMinutes', 60] } }; break;
+      case 'totalMinutes': metricField = { $sum: '$durationMinutes' }; break;
+      case 'maxDuration': metricField = { $max: '$durationMinutes' }; break;
+      case 'minDuration': metricField = { $min: '$durationMinutes' }; break;
+      case 'uniqueOrders': metricField = { $addToSet: '$orderSerialNumber' }; break;
+      default: metricField = { $sum: 1 };
+    }
+
+    const pipeline = [
+      { $match: match },
+      { $group: { _id: groupKey, value: metricField, count: { $sum: 1 } } },
+      { $sort: { value: -1 } },
+      { $limit: 200 }
+    ];
+
+    let results = await col.aggregate(pipeline).toArray();
+
+    // Post-process uniqueOrders to get count
+    if (metric === 'uniqueOrders') {
+      results = results.map(r => ({ ...r, value: Array.isArray(r.value) ? r.value.length : 0 }));
+    }
+
+    // Round numeric values
+    results = results.map(r => ({
+      label: r._id || 'N/A',
+      value: typeof r.value === 'number' ? Math.round(r.value * 100) / 100 : r.value,
+      count: r.count
+    }));
+
+    const totalDocs = await col.countDocuments(match);
+
+    res.json({
+      source, metric, groupBy, dateGrouping,
+      filters,
+      totalMatched: totalDocs,
+      resultCount: results.length,
+      results
+    });
+  } catch (err) {
+    console.error('Report query error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// —— GET /reports/filters — Available filter values ——————
+app.get('/reports/filters', async (req, res) => {
+  try {
+    const db = await getConfigDb();
+    const [workers, statuses, departments, errorTypes] = await Promise.all([
+      db.collection('backfill_kpi_segments').distinct('workerEmail'),
+      db.collection('backfill_kpi_segments').distinct('statusSlug'),
+      db.collection('backfill_qc_events').distinct('departmentName'),
+      db.collection('backfill_qc_events').distinct('errorType')
+    ]);
+
+    // Worker name map
+    const workerNames = {};
+    const workerDocs = await db.collection('backfill_kpi_segments')
+      .aggregate([
+        { $match: { workerEmail: { $ne: null } } },
+        { $group: { _id: '$workerEmail', name: { $first: '$workerName' } } }
+      ]).toArray();
+    workerDocs.forEach(w => { workerNames[w._id] = w.name; });
+
+    // Status name map
+    const statusNames = {};
+    const statusDocs = await db.collection('backfill_kpi_segments')
+      .aggregate([
+        { $match: { statusSlug: { $ne: null } } },
+        { $group: { _id: '$statusSlug', name: { $first: '$statusName' } } }
+      ]).toArray();
+    statusDocs.forEach(s => { statusNames[s._id] = s.name; });
+
+    res.json({
+      workers: workers.filter(Boolean).map(e => ({ email: e, name: workerNames[e] || e })).sort((a, b) => (a.name || '').localeCompare(b.name || '')),
+      statuses: statuses.filter(Boolean).map(s => ({ slug: s, name: statusNames[s] || s })).sort((a, b) => (a.name || '').localeCompare(b.name || '')),
+      departments: departments.filter(Boolean).sort(),
+      errorTypes: errorTypes.filter(Boolean).sort(),
+      orderTypes: ['evaluation', 'translation']
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// —— POST /reports/export — CSV export ———————————————————
+app.post('/reports/export', async (req, res) => {
+  try {
+    const { source, filters } = req.body;
+    const db = await getConfigDb();
+    const colName = source === 'qc' ? 'backfill_qc_events' : 'backfill_kpi_segments';
+
+    const match = {};
+    if (filters) {
+      if (filters.dateFrom) {
+        const df = source === 'qc' ? 'qcCreatedAt' : 'segmentStart';
+        match[df] = { ...match[df], $gte: filters.dateFrom };
+      }
+      if (filters.dateTo) {
+        const df = source === 'qc' ? 'qcCreatedAt' : 'segmentStart';
+        match[df] = { ...match[df], $lte: filters.dateTo + 'T23:59:59' };
+      }
+      if (filters.workers?.length) match.workerEmail = { $in: filters.workers };
+      if (filters.statuses?.length) match.statusSlug = { $in: filters.statuses };
+      if (filters.orderTypes?.length) match.orderType = { $in: filters.orderTypes };
+    }
+
+    const docs = await db.collection(colName).find(match).sort({ segmentStart: -1 }).limit(50000).toArray();
+
+    if (!docs.length) return res.status(404).json({ error: 'No data found for these filters' });
+
+    // Build CSV
+    const keys = Object.keys(docs[0]).filter(k => !k.startsWith('_'));
+    const header = keys.join(',');
+    const rows = docs.map(d => keys.map(k => {
+      const v = d[k];
+      if (v === null || v === undefined) return '';
+      const s = String(v);
+      return s.includes(',') || s.includes('"') || s.includes('\n') ? `"${s.replace(/"/g, '""')}"` : s;
+    }).join(','));
+
+    res.setHeader('Content-Type', 'text/csv');
+    res.setHeader('Content-Disposition', `attachment; filename="iee-${source}-export-${new Date().toISOString().slice(0, 10)}.csv"`);
+    res.send([header, ...rows].join('\n'));
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// —— Saved Reports CRUD ————————————————————————————————
+app.get('/reports/saved', async (req, res) => {
+  try {
+    const db = await getConfigDb();
+    const reports = await db.collection('dashboard_saved_reports')
+      .find({}).sort({ updatedAt: -1 }).toArray();
+    res.json({ count: reports.length, reports });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.post('/reports/saved', async (req, res) => {
+  try {
+    const { name, config } = req.body;
+    if (!name || !config) return res.status(400).json({ error: 'name and config required' });
+    const db = await getConfigDb();
+    const doc = { name, config, createdBy: req.user?.name || 'unknown', createdAt: new Date(), updatedAt: new Date() };
+    const result = await db.collection('dashboard_saved_reports').insertOne(doc);
+    res.json({ success: true, id: result.insertedId, report: doc });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.delete('/reports/saved/:id', async (req, res) => {
+  try {
+    const db = await getConfigDb();
+    await db.collection('dashboard_saved_reports').deleteOne({ _id: new ObjectId(req.params.id) });
+    res.json({ success: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// ═══════════════════════════════════════════════════════════
+// USER LAYOUT PREFERENCES — Persist dashboard grid layouts
+// ═══════════════════════════════════════════════════════════
+
+app.get('/user/layout/:page', async (req, res) => {
+  try {
+    const db = await getConfigDb();
+    const layout = await db.collection('dashboard_user_layouts').findOne({
+      userId: req.user?.userId || req.user?.email,
+      page: req.params.page
+    });
+    res.json({ layout: layout?.layout || null });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.put('/user/layout/:page', async (req, res) => {
+  try {
+    const { layout } = req.body;
+    if (!layout) return res.status(400).json({ error: 'layout required' });
+    const db = await getConfigDb();
+    await db.collection('dashboard_user_layouts').updateOne(
+      { userId: req.user?.userId || req.user?.email, page: req.params.page },
+      { $set: { layout, updatedAt: new Date() } },
+      { upsert: true }
+    );
+    res.json({ success: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// ═══════════════════════════════════════════════════════════
 // STATIC FILE SERVING — React dashboard (MUST be after ALL API routes)
 // ═══════════════════════════════════════════════════════════
 const distPath = path.join(__dirname, 'dist');
@@ -2899,6 +3721,10 @@ app.use((req, res) => {
       '/auth/login', '/auth/setup', '/auth/me', '/auth/users',
       '/ai/chat', '/ai/system-prompt', '/ai/guardrails',
       '/glossary', '/email/schedules', '/email/send-now',
+      '/backfill/run', '/backfill/status', '/backfill/settings', '/backfill/history',
+      '/data/kpi-segments', '/data/qc-events', '/data/users',
+      '/reports/query', '/reports/filters', '/reports/export', '/reports/saved',
+      '/user/layout/:page',
       '/users', '/indexes'
     ]
   });
@@ -2918,6 +3744,8 @@ app.listen(CONFIG.PORT, '0.0.0.0', () => {
   // Start cron scheduler for automated emails
   if (CONFIG.SENDGRID_API_KEY) { startCronScheduler(); }
   else { console.log('SendGrid not configured — email scheduler disabled'); }
+  // Start backfill auto-scheduler
+  startBackfillScheduler();
 });
 
 // ═══════════════════════════════════════════════════════════

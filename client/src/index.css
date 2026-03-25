@@ -22,3 +22,16 @@ body { font-family: 'IBM Plex Sans', system-ui, sans-serif; -webkit-font-smoothi
 .chat-ai ul { @apply list-disc pl-5 mb-2; }
 .chat-ai strong { @apply text-white; }
 .chat-ai code { @apply bg-slate-700/50 px-1.5 py-0.5 rounded text-xs font-mono text-emerald-300; }
+
+/* react-grid-layout overrides */
+.react-grid-item.react-grid-placeholder {
+  background: rgba(61, 107, 171, 0.15) !important;
+  border: 2px dashed rgba(61, 107, 171, 0.4) !important;
+  border-radius: 12px;
+  opacity: 1 !important;
+}
+.react-grid-item > .react-resizable-handle::after {
+  border-color: rgba(255,255,255,0.15) !important;
+}
+.react-grid-item.resizing { opacity: 0.8; }
+.react-grid-item.react-draggable-dragging { z-index: 100; opacity: 0.9; box-shadow: 0 20px 40px rgba(0,0,0,0.4); }

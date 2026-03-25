@@ -12,7 +12,9 @@ import GlossaryPage from './pages/GlossaryPage';
 import GuardrailsPage from './pages/GuardrailsPage';
 import SettingsPage from './pages/SettingsPage';
 import EmailPage from './pages/EmailPage';
+import ReportBuilder from './pages/ReportBuilder';
 import AdminUsers from './pages/AdminUsers';
+import BackfillPage from './pages/BackfillPage';
 
 function AuthGuard() {
   if (!isAuth()) return <Navigate to="/login" replace />;
@@ -37,6 +39,7 @@ export default function App() {
           <Route path="/qc" element={<QCOverview />} />
           <Route path="/queue" element={<QueueOps />} />
           <Route path="/chat" element={<ChatPage />} />
+          <Route path="/reports" element={<ReportBuilder />} />
           <Route path="/settings" element={<SettingsPage />} />
           <Route element={<ManagerGuard />}>
             <Route path="/glossary" element={<GlossaryPage />} />
@@ -45,6 +48,7 @@ export default function App() {
           <Route element={<AdminGuard />}>
             <Route path="/ai/config" element={<GuardrailsPage />} />
             <Route path="/admin/users" element={<AdminUsers />} />
+            <Route path="/admin/backfill" element={<BackfillPage />} />
           </Route>
         </Route>
         <Route path="*" element={<Navigate to="/" replace />} />

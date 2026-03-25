@@ -8,11 +8,13 @@ const NAV = [
   { to:'/qc', icon:'◆', label:'QC Overview', section:'QC' },
   { to:'/queue', icon:'◧', label:'Queue Ops', section:'OPS' },
   { to:'/chat', icon:'✦', label:'AI Assistant', section:'AI' },
+  { to:'/reports', icon:'▦', label:'Report Builder', section:'AI' },
   { to:'/glossary', icon:'◇', label:'Glossary', section:'AI', managerOnly:true },
   { to:'/ai/config', icon:'⊘', label:'AI Config', section:'AI', adminOnly:true },
   { to:'/settings', icon:'⚙', label:'Configuration', section:'CONFIG' },
   { to:'/email', icon:'✉', label:'Email Reports', section:'CONFIG', managerOnly:true },
   { to:'/admin/users', icon:'◎', label:'User Management', section:'ADMIN', adminOnly:true },
+  { to:'/admin/backfill', icon:'↻', label:'Data Backfill', section:'ADMIN', adminOnly:true },
 ];
 
 const SEC_COLORS = { KPI:'text-blue-400', QC:'text-emerald-400', OPS:'text-purple-400', AI:'text-amber-400', CONFIG:'text-slate-400', ADMIN:'text-red-400' };
