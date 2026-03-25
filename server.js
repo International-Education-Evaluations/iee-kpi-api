@@ -469,7 +469,25 @@ function verifyToken(token) {
 }
 
 function authMiddleware(req, res, next) {
+  // Skip auth for public routes
   if (req.path === '/health' || req.path === '/auth/login' || req.path === '/auth/setup') return next();
+
+  // Skip auth for static assets and SPA routes (React handles auth client-side)
+  // Static files: .js, .css, .html, .png, .svg, .ico, .woff, etc.
+  if (req.path.startsWith('/assets/') || req.path.endsWith('.js') || req.path.endsWith('.css') ||
+      req.path.endsWith('.html') || req.path.endsWith('.png') || req.path.endsWith('.svg') ||
+      req.path.endsWith('.ico') || req.path.endsWith('.woff') || req.path.endsWith('.woff2')) {
+    return next();
+  }
+
+  // Skip auth for SPA page routes (no dot = not an API path, not a file)
+  // API routes all start with known prefixes; everything else is a React route
+  const apiPrefixes = ['/kpi-', '/qc-', '/queue-', '/credential', '/report-',
+    '/users', '/collections', '/indexes', '/config/', '/auth/', '/ai/', '/glossary', '/email/'];
+  const isApiRoute = apiPrefixes.some(p => req.path.startsWith(p));
+  if (!isApiRoute && req.method === 'GET' && !req.path.includes('.')) {
+    return next(); // Let SPA fallback handle it
+  }
 
   // JWT Bearer token
   const authHeader = req.headers.authorization;
