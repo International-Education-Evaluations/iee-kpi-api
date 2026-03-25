@@ -19,9 +19,9 @@ import BackfillPage from './pages/BackfillPage';
 function AuthGuard() {
   if (!isAuth()) return <Navigate to="/login" replace />;
   return (
-    <div className="flex min-h-screen">
+    <div className="flex min-h-screen bg-surface-100">
       <Sidebar />
-      <main className="flex-1 p-5 overflow-auto min-h-screen"><Outlet /></main>
+      <main className="ml-56 flex-1 p-6 overflow-auto min-h-screen"><Outlet /></main>
     </div>
   );
 }

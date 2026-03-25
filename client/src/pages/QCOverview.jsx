@@ -2,7 +2,7 @@ import React, { useEffect, useState, useMemo } from 'react';
 import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, PieChart, Pie, Cell } from 'recharts';
 import { Card, Table, Section, Pills, FilterBar, FilterSelect, FilterInput, FilterReset, Skel, fmt, fmtI, fmtP } from '../components/UI';
 import { api } from '../hooks/useApi';
-const TT={contentStyle:{background:'#1e293b',border:'1px solid rgba(255,255,255,0.08)',borderRadius:8,color:'#fff',fontSize:12}};
+const TT={contentStyle:{background:'#ffffff',border:'1px solid #e2e8f0',borderRadius:8,color:'#0f172a',fontSize:12}};
 const COLORS=['#4CAF50','#F44336','#FF9800','#2196F3','#9C27B0','#00BCD4','#795548'];
 
 export default function QCOverview() {
@@ -39,7 +39,7 @@ export default function QCOverview() {
 
   return (
     <div className="space-y-5">
-      <div><h1 className="text-xl font-display font-bold text-white">QC Overview</h1><p className="text-xs text-slate-400 mt-0.5">Quality control events · Last 60 days</p></div>
+      <div><h1 className="text-xl font-display font-bold text-ink-900">QC Overview</h1><p className="text-xs text-ink-400 mt-0.5">Quality control events · Last 60 days</p></div>
       <FilterBar>
         <FilterSelect label="Department" value={fDept} onChange={setFDept} options={depts} />
         <FilterSelect label="Order Type" value={fType} onChange={setFType} options={['evaluation','translation']} />
@@ -56,18 +56,18 @@ export default function QCOverview() {
       </div>
 
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-3">
-        <div className="glass rounded-xl p-4"><Section title="By Department">
-          {loading?<Skel rows={5} cols={1}/>:<ResponsiveContainer width="100%" height={260}><BarChart data={byDept} layout="vertical" margin={{left:10,right:15}}><XAxis type="number" tick={{fill:'#94a3b8',fontSize:10}} /><YAxis type="category" dataKey="dept" width={150} tick={{fill:'#94a3b8',fontSize:10}} /><Tooltip {...TT} /><Bar dataKey="fi" stackId="a" fill="#2E7D32" name="Fixed It" /><Bar dataKey="kb" stackId="a" fill="#C62828" name="Kick Back" radius={[0,4,4,0]} /></BarChart></ResponsiveContainer>}
+        <div className="card-surface p-4"><Section title="By Department">
+          {loading?<Skel rows={5} cols={1}/>:<ResponsiveContainer width="100%" height={260}><BarChart data={byDept} layout="vertical" margin={{left:10,right:15}}><XAxis type="number" tick={{fill:'#64748b',fontSize:10}} /><YAxis type="category" dataKey="dept" width={150} tick={{fill:'#64748b',fontSize:10}} /><Tooltip {...TT} /><Bar dataKey="fi" stackId="a" fill="#16a34a" name="Fixed It" /><Bar dataKey="kb" stackId="a" fill="#C62828" name="Kick Back" radius={[0,4,4,0]} /></BarChart></ResponsiveContainer>}
         </Section></div>
-        <div className="glass rounded-xl p-4"><Section title="Distribution">
+        <div className="card-surface p-4"><Section title="Distribution">
           {loading?<Skel rows={5}/>:<ResponsiveContainer width="100%" height={260}><PieChart><Pie data={byDept.map(d=>({name:d.dept,value:d.total}))} cx="50%" cy="50%" innerRadius={55} outerRadius={100} paddingAngle={2} dataKey="value">{byDept.map((_,i)=><Cell key={i} fill={COLORS[i%COLORS.length]} />)}</Pie><Tooltip {...TT} /></PieChart></ResponsiveContainer>}
         </Section></div>
       </div>
 
       <Section title="Breakdown" right={<Pills tabs={[{key:'dept',label:'Department'},{key:'issue',label:'Issue'},{key:'user',label:'User'}]} active={view} onChange={setView} />}>
-        {view==='dept'&&<Table cols={[{key:'dept',label:'Department',w:160},{key:'total',label:'Events',right:true,render:v=>fmtI(v)},{key:'fi',label:'Fixed',right:true,render:v=>fmtI(v)},{key:'kb',label:'Kick Back',right:true,render:(v)=><span className={v>0?'text-red-400':''}>{fmtI(v)}</span>},{key:'fiP',label:'% Fixed',right:true,render:v=>fmtP(v)},{key:'orders',label:'Orders',right:true,render:v=>fmtI(v)},{key:'users',label:'Users',right:true,render:v=>fmtI(v)}]} rows={byDept} />}
-        {view==='issue'&&<Table cols={[{key:'issue',label:'Issue',w:250},{key:'total',label:'Events',right:true,render:v=>fmtI(v)},{key:'fi',label:'Fixed',right:true,render:v=>fmtI(v)},{key:'kb',label:'Kick Back',right:true,render:(v)=><span className={v>0?'text-red-400':''}>{fmtI(v)}</span>}]} rows={byIssue} />}
-        {view==='user'&&<Table cols={[{key:'user',label:'User',w:180},{key:'dept',label:'Dept',w:140},{key:'total',label:'Errors',right:true,render:v=>fmtI(v)},{key:'fi',label:'Fixed',right:true,render:v=>fmtI(v)},{key:'kb',label:'Kick Back',right:true,render:(v)=><span className={v>0?'text-red-400':''}>{fmtI(v)}</span>},{key:'issues',label:'Issue Types',right:true,render:v=>fmtI(v)}]} rows={byUser} />}
+        {view==='dept'&&<Table cols={[{key:'dept',label:'Department',w:160},{key:'total',label:'Events',right:true,render:v=>fmtI(v)},{key:'fi',label:'Fixed',right:true,render:v=>fmtI(v)},{key:'kb',label:'Kick Back',right:true,render:(v)=><span className={v>0?'text-red-600':''}>{fmtI(v)}</span>},{key:'fiP',label:'% Fixed',right:true,render:v=>fmtP(v)},{key:'orders',label:'Orders',right:true,render:v=>fmtI(v)},{key:'users',label:'Users',right:true,render:v=>fmtI(v)}]} rows={byDept} />}
+        {view==='issue'&&<Table cols={[{key:'issue',label:'Issue',w:250},{key:'total',label:'Events',right:true,render:v=>fmtI(v)},{key:'fi',label:'Fixed',right:true,render:v=>fmtI(v)},{key:'kb',label:'Kick Back',right:true,render:(v)=><span className={v>0?'text-red-600':''}>{fmtI(v)}</span>}]} rows={byIssue} />}
+        {view==='user'&&<Table cols={[{key:'user',label:'User',w:180},{key:'dept',label:'Dept',w:140},{key:'total',label:'Errors',right:true,render:v=>fmtI(v)},{key:'fi',label:'Fixed',right:true,render:v=>fmtI(v)},{key:'kb',label:'Kick Back',right:true,render:(v)=><span className={v>0?'text-red-600':''}>{fmtI(v)}</span>},{key:'issues',label:'Issue Types',right:true,render:v=>fmtI(v)}]} rows={byUser} />}
       </Section>
     </div>
   );

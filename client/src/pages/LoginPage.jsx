@@ -23,48 +23,57 @@ export default function LoginPage() {
   };
 
   return (
-    <div className="min-h-screen bg-slate-900 flex items-center justify-center px-4">
-      <div className="fixed inset-0 opacity-[0.015]" style={{backgroundImage:'radial-gradient(circle at 1px 1px, white 1px, transparent 0)',backgroundSize:'24px 24px'}} />
+    <div className="min-h-screen bg-gradient-to-br from-surface-100 via-white to-brand-50 flex items-center justify-center px-4">
+      {/* Subtle pattern */}
+      <div className="fixed inset-0 opacity-[0.03]" style={{backgroundImage:'radial-gradient(circle at 1px 1px, #00aeef 0.5px, transparent 0)',backgroundSize:'32px 32px'}} />
+
       <div className="w-full max-w-sm relative">
+        {/* Logo */}
         <div className="text-center mb-8">
-          <h1 className="font-display text-3xl font-bold text-white tracking-tight">IEE <span className="text-navy-400">Operations</span></h1>
-          <p className="text-slate-500 text-sm mt-2">KPI · QC · Queue Dashboard</p>
-        </div>
-        <div className="glass rounded-2xl p-7">
-          <div className="flex gap-2 mb-5">
-            <button onClick={() => setMode('login')} className={`flex-1 py-1.5 rounded-lg text-xs font-medium transition-all ${mode==='login'?'bg-navy-600 text-white':'text-slate-400 hover:text-white'}`}>Sign In</button>
-            <button onClick={() => setMode('setup')} className={`flex-1 py-1.5 rounded-lg text-xs font-medium transition-all ${mode==='setup'?'bg-navy-600 text-white':'text-slate-400 hover:text-white'}`}>First-Time Setup</button>
+          <div className="inline-flex items-center justify-center w-14 h-14 rounded-2xl bg-brand-500 shadow-lg shadow-brand-200 mb-4">
+            <span className="text-ink-900 font-display font-bold text-xl">IEE</span>
           </div>
+          <h1 className="font-display text-2xl font-bold text-ink-900 tracking-tight">Operations Dashboard</h1>
+          <p className="text-ink-400 text-sm mt-1.5">KPI · QC · Queue · Reports</p>
+        </div>
+
+        {/* Card */}
+        <div className="card-surface p-7">
+          <div className="flex gap-1 mb-5 bg-surface-100 rounded-lg p-1 border border-surface-200">
+            <button onClick={() => setMode('login')} className={`flex-1 py-2 rounded-md text-xs font-semibold transition-all ${mode==='login'?'bg-white text-brand-600 shadow-card border border-surface-200':'text-ink-500 hover:text-ink-700 border border-transparent'}`}>Sign In</button>
+            <button onClick={() => setMode('setup')} className={`flex-1 py-2 rounded-md text-xs font-semibold transition-all ${mode==='setup'?'bg-white text-brand-600 shadow-card border border-surface-200':'text-ink-500 hover:text-ink-700 border border-transparent'}`}>First-Time Setup</button>
+          </div>
+
           <form onSubmit={submit} className="space-y-4">
             {mode === 'setup' && <>
               <div>
-                <label className="block text-[10px] font-medium uppercase tracking-wider text-slate-400 mb-1">Setup Secret</label>
+                <label className="block text-[11px] font-semibold uppercase tracking-wider text-ink-400 mb-1.5">Setup Secret</label>
                 <input type="password" value={setupSecret} onChange={e => setSetupSecret(e.target.value)} placeholder="Provided by administrator"
-                  className="w-full px-3.5 py-2 bg-slate-800/50 border border-amber-600/40 rounded-lg text-white placeholder-slate-500 text-sm focus:outline-none focus:border-amber-400" />
+                  className="w-full px-3.5 py-2.5 bg-amber-50 border border-amber-200 rounded-lg text-ink-900 placeholder-ink-400 text-sm focus:outline-none focus:border-amber-400 focus:ring-2 focus:ring-amber-100" />
               </div>
               <div>
-                <label className="block text-[10px] font-medium uppercase tracking-wider text-slate-400 mb-1">Your Name</label>
+                <label className="block text-[11px] font-semibold uppercase tracking-wider text-ink-400 mb-1.5">Your Name</label>
                 <input type="text" value={name} onChange={e => setName(e.target.value)} placeholder="Andrew Nguyen"
-                  className="w-full px-3.5 py-2 bg-slate-800/50 border border-slate-600/40 rounded-lg text-white placeholder-slate-500 text-sm focus:outline-none focus:border-navy-400" />
+                  className="w-full px-3.5 py-2.5 bg-white border border-surface-200 rounded-lg text-ink-900 placeholder-ink-400 text-sm focus:outline-none focus:border-brand-400 focus:ring-2 focus:ring-brand-100" />
               </div>
             </>}
             <div>
-              <label className="block text-[10px] font-medium uppercase tracking-wider text-slate-400 mb-1">Email</label>
+              <label className="block text-[11px] font-semibold uppercase tracking-wider text-ink-400 mb-1.5">Email</label>
               <input type="email" value={email} onChange={e => setEmail(e.target.value)} placeholder="you@myiee.org"
-                className="w-full px-3.5 py-2 bg-slate-800/50 border border-slate-600/40 rounded-lg text-white placeholder-slate-500 text-sm focus:outline-none focus:border-navy-400" />
+                className="w-full px-3.5 py-2.5 bg-white border border-surface-200 rounded-lg text-ink-900 placeholder-ink-400 text-sm focus:outline-none focus:border-brand-400 focus:ring-2 focus:ring-brand-100" />
             </div>
             <div>
-              <label className="block text-[10px] font-medium uppercase tracking-wider text-slate-400 mb-1">Password</label>
+              <label className="block text-[11px] font-semibold uppercase tracking-wider text-ink-400 mb-1.5">Password</label>
               <input type="password" value={password} onChange={e => setPassword(e.target.value)} placeholder="••••••••"
-                className="w-full px-3.5 py-2 bg-slate-800/50 border border-slate-600/40 rounded-lg text-white placeholder-slate-500 text-sm focus:outline-none focus:border-navy-400" />
+                className="w-full px-3.5 py-2.5 bg-white border border-surface-200 rounded-lg text-ink-900 placeholder-ink-400 text-sm focus:outline-none focus:border-brand-400 focus:ring-2 focus:ring-brand-100" />
             </div>
-            {error && <div className="text-red-400 text-sm bg-red-500/10 border border-red-500/20 rounded-lg px-3 py-2">{error}</div>}
+            {error && <div className="text-red-700 text-sm bg-red-50 border border-red-200 rounded-lg px-3 py-2.5 font-medium">{error}</div>}
             <button type="submit" disabled={loading}
-              className="w-full py-2.5 bg-navy-600 hover:bg-navy-500 disabled:bg-slate-700 text-white rounded-lg font-medium text-sm transition-colors shadow-lg shadow-navy-600/15">
+              className="w-full py-2.5 bg-brand-500 hover:bg-brand-600 disabled:bg-surface-200 disabled:text-ink-400 text-ink-900 rounded-lg font-semibold text-sm transition-all shadow-lg shadow-brand-200">
               {loading ? 'Connecting...' : mode === 'setup' ? 'Create Admin Account' : 'Sign In'}
             </button>
           </form>
-          {mode === 'setup' && <p className="text-[10px] text-slate-500 mt-3 text-center">Requires setup secret from your administrator. Only works once.</p>}
+          {mode === 'setup' && <p className="text-[11px] text-ink-400 mt-3 text-center">Requires setup secret. Only works once.</p>}
         </div>
       </div>
     </div>

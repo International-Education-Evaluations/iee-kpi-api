@@ -5,8 +5,8 @@ import { Card, Table, Section, Pills, Skel, FilterBar, FilterSelect, FilterInput
 import DashboardGrid, { Widget } from '../components/DashboardGrid';
 import { api } from '../hooks/useApi';
 
-const TT = { contentStyle:{ background:'#1e293b', border:'1px solid rgba(255,255,255,0.08)', borderRadius:8, color:'#fff', fontSize:12 } };
-const BUCKET_COLORS = { 'Exclude Short':'#616161', 'Out-of-Range Short':'#F57F17', 'In-Range':'#2E7D32', 'Out-of-Range Long':'#E65100', 'Exclude Long':'#B71C1C', 'Unclassified':'#424242', 'Open':'#1565C0' };
+const TT = { contentStyle:{ background:'#ffffff', border:'1px solid #e2e8f0', borderRadius:8, color:'#0f172a', fontSize:12, boxShadow:'0 4px 12px rgba(0,0,0,0.08)' } };
+const BUCKET_COLORS = { 'Exclude Short':'#94a3b8', 'Out-of-Range Short':'#F57F17', 'In-Range':'#16a34a', 'Out-of-Range Long':'#E65100', 'Exclude Long':'#B71C1C', 'Unclassified':'#cbd5e1', 'Open':'#3b82f6' };
 
 const DEFAULT_LAYOUT = [
   { i: 'filters', x: 0, y: 0, w: 12, h: 1, static: true },
@@ -102,7 +102,7 @@ export default function KPIOverview() {
 
   return (
     <div className="space-y-3">
-      <div><h1 className="text-xl font-display font-bold text-white">KPI Overview</h1><p className="text-xs text-slate-400 mt-0.5">Processing performance · Last 60 days · Drag widgets to customize</p></div>
+      <div><h1 className="text-xl font-display font-bold text-ink-900">KPI Overview</h1><p className="text-xs text-ink-400 mt-0.5">Processing performance · Last 60 days · Drag widgets to customize</p></div>
 
       <DashboardGrid pageId="kpi-overview" defaultLayout={DEFAULT_LAYOUT}>
         {/* Filters — static, not draggable */}
@@ -136,24 +136,24 @@ export default function KPIOverview() {
           <Widget title="5-Bucket Classification">
             {bucketStats ? <div>
               <div className="grid grid-cols-3 gap-2">
-                <div className="text-center p-2 rounded-lg bg-emerald-600/10 border border-emerald-500/20">
-                  <div className="text-xl font-bold text-emerald-400">{bucketStats.inRangePercent}%</div>
-                  <div className="text-[10px] text-slate-400">In-Range</div>
+                <div className="text-center p-2 rounded-lg bg-emerald-50 border border-emerald-200">
+                  <div className="text-xl font-bold text-emerald-600">{bucketStats.inRangePercent}%</div>
+                  <div className="text-[10px] text-ink-400">In-Range</div>
                 </div>
-                <div className="text-center p-2 rounded-lg bg-orange-600/10 border border-orange-500/20">
-                  <div className="text-xl font-bold text-orange-400">{bucketStats.outRangeShortPercent}%</div>
-                  <div className="text-[10px] text-slate-400">Out Short</div>
+                <div className="text-center p-2 rounded-lg bg-amber-50 border border-amber-200">
+                  <div className="text-xl font-bold text-amber-600">{bucketStats.outRangeShortPercent}%</div>
+                  <div className="text-[10px] text-ink-400">Out Short</div>
                 </div>
-                <div className="text-center p-2 rounded-lg bg-red-600/10 border border-red-500/20">
-                  <div className="text-xl font-bold text-red-400">{bucketStats.outRangeLongPercent}%</div>
-                  <div className="text-[10px] text-slate-400">Out Long</div>
+                <div className="text-center p-2 rounded-lg bg-red-50 border border-red-200">
+                  <div className="text-xl font-bold text-red-600">{bucketStats.outRangeLongPercent}%</div>
+                  <div className="text-[10px] text-ink-400">Out Long</div>
                 </div>
               </div>
-              <div className="flex gap-2 mt-2 text-[10px] text-slate-500">
+              <div className="flex gap-2 mt-2 text-[10px] text-ink-500">
                 <span>Excluded: {bucketStats.excludedPercent}%</span>
                 <span>Unclassified: {bucketStats.unclassifiedPercent}%</span>
               </div>
-            </div> : <div className="text-slate-500 text-xs">No benchmarks configured</div>}
+            </div> : <div className="text-ink-500 text-xs">No benchmarks configured</div>}
           </Widget>
         </div>
 
@@ -161,12 +161,12 @@ export default function KPIOverview() {
           <Widget title="Bucket Distribution">
             {bucketChartData.length > 0 ? <ResponsiveContainer width="100%" height="100%">
               <BarChart data={bucketChartData} margin={{left:0,right:10}}>
-                <XAxis dataKey="bucket" tick={{fill:'#94a3b8',fontSize:9}} angle={-20} textAnchor="end" height={50} />
-                <YAxis tick={{fill:'#94a3b8',fontSize:10}} />
+                <XAxis dataKey="bucket" tick={{fill:'#64748b',fontSize:9}} angle={-20} textAnchor="end" height={50} />
+                <YAxis tick={{fill:'#64748b',fontSize:10}} />
                 <Tooltip {...TT} />
                 <Bar dataKey="count" radius={[3,3,0,0]}>{bucketChartData.map((d,i) => <Cell key={i} fill={d.fill} />)}</Bar>
               </BarChart>
-            </ResponsiveContainer> : <div className="text-slate-500 text-xs">Run classification first</div>}
+            </ResponsiveContainer> : <div className="text-ink-500 text-xs">Run classification first</div>}
           </Widget>
         </div>
 
@@ -176,9 +176,9 @@ export default function KPIOverview() {
             {loading ? <Skel rows={6} cols={1} /> :
             <ResponsiveContainer width="100%" height="100%">
               <BarChart data={byStatus.slice(0,10)} layout="vertical" margin={{left:10,right:15}}>
-                <XAxis type="number" tick={{fill:'#94a3b8',fontSize:10}} />
-                <YAxis type="category" dataKey="status" width={150} tick={{fill:'#94a3b8',fontSize:10}} />
-                <Tooltip {...TT} /><Bar dataKey="count" fill="#3d6bab" radius={[0,4,4,0]} />
+                <XAxis type="number" tick={{fill:'#64748b',fontSize:10}} />
+                <YAxis type="category" dataKey="status" width={150} tick={{fill:'#64748b',fontSize:10}} />
+                <Tooltip {...TT} /><Bar dataKey="count" fill="#00aeef" radius={[0,4,4,0]} />
               </BarChart>
             </ResponsiveContainer>}
           </Widget>
@@ -189,9 +189,9 @@ export default function KPIOverview() {
             {loading ? <Skel rows={6} cols={1} /> :
             <ResponsiveContainer width="100%" height="100%">
               <BarChart data={daily} margin={{left:0,right:10}}>
-                <XAxis dataKey="date" tick={{fill:'#94a3b8',fontSize:9}} angle={-45} textAnchor="end" height={55} />
-                <YAxis tick={{fill:'#94a3b8',fontSize:10}} />
-                <Tooltip {...TT} /><Bar dataKey="count" fill="#2E7D32" radius={[3,3,0,0]} />
+                <XAxis dataKey="date" tick={{fill:'#64748b',fontSize:9}} angle={-45} textAnchor="end" height={55} />
+                <YAxis tick={{fill:'#64748b',fontSize:10}} />
+                <Tooltip {...TT} /><Bar dataKey="count" fill="#16a34a" radius={[3,3,0,0]} />
               </BarChart>
             </ResponsiveContainer>}
           </Widget>

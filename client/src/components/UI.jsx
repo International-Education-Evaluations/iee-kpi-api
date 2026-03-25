@@ -6,21 +6,23 @@ export const fmtI = n => n==null||n===''?'—':Number(n).toLocaleString('en-US')
 export const fmtP = n => n==null?'—':Math.round(n*100)+'%';
 
 // ── Metric Card ─────────────────────────────────────────────
-const CARD_COLORS = {
-  navy:'from-navy-600/25 to-navy-800/10 border-navy-500/25',
-  green:'from-emerald-600/25 to-emerald-800/10 border-emerald-600/25',
-  plum:'from-plum-500/25 to-plum-600/10 border-plum-400/25',
-  amber:'from-amber-500/20 to-amber-600/10 border-amber-500/25',
-  red:'from-red-500/20 to-red-700/10 border-red-500/25',
-  slate:'from-slate-600/25 to-slate-800/10 border-slate-500/25'
+const CARD_STYLES = {
+  brand: { bg:'bg-brand-50', border:'border-brand-200', accent:'text-brand-600', icon:'bg-brand-100' },
+  green: { bg:'bg-emerald-50', border:'border-emerald-200', accent:'text-emerald-600', icon:'bg-emerald-100' },
+  amber: { bg:'bg-amber-50', border:'border-amber-200', accent:'text-amber-600', icon:'bg-amber-100' },
+  red:   { bg:'bg-red-50', border:'border-red-200', accent:'text-red-600', icon:'bg-red-100' },
+  plum:  { bg:'bg-purple-50', border:'border-purple-200', accent:'text-purple-600', icon:'bg-purple-100' },
+  slate: { bg:'bg-slate-50', border:'border-slate-200', accent:'text-slate-600', icon:'bg-slate-100' },
+  navy:  { bg:'bg-ocean-50', border:'border-ocean-200', accent:'text-ocean-600', icon:'bg-ocean-100' },
 };
-export function Card({ label, value, sub, color='navy', loading }) {
+export function Card({ label, value, sub, color='brand', loading }) {
+  const s = CARD_STYLES[color] || CARD_STYLES.brand;
   return (
-    <div className={`rounded-xl bg-gradient-to-br ${CARD_COLORS[color]||CARD_COLORS.navy} border p-4 transition-all hover:scale-[1.01]`}>
-      <div className="text-[11px] font-medium uppercase tracking-wider text-slate-400 mb-1.5">{label}</div>
-      {loading ? <div className="h-8 w-20 bg-slate-700/40 rounded loading" /> : <>
-        <div className="text-2xl font-display font-bold text-white leading-tight">{value??'—'}</div>
-        {sub && <div className="text-[11px] text-slate-400 mt-0.5">{sub}</div>}
+    <div className={`card-surface ${s.bg} ${s.border} p-4 group`}>
+      <div className="text-[11px] font-semibold uppercase tracking-wider text-ink-400 mb-1.5">{label}</div>
+      {loading ? <div className="h-8 w-20 rounded-lg loading" /> : <>
+        <div className={`text-2xl font-display font-bold ${s.accent} leading-tight`}>{value??'—'}</div>
+        {sub && <div className="text-[11px] text-ink-400 mt-0.5">{sub}</div>}
       </>}
     </div>
   );
@@ -28,11 +30,11 @@ export function Card({ label, value, sub, color='navy', loading }) {
 
 // ── Data Table ──────────────────────────────────────────────
 export function Table({ cols, rows, onRow, empty='No data' }) {
-  if (!rows?.length) return <div className="glass rounded-xl p-8 text-center text-slate-500">{empty}</div>;
+  if (!rows?.length) return <div className="card-surface p-8 text-center text-ink-400">{empty}</div>;
   return (
-    <div className="glass rounded-xl overflow-hidden">
+    <div className="card-surface overflow-hidden">
       <div className="overflow-x-auto">
-        <table className="tbl w-full">
+        <table className="tbl">
           <thead><tr>{cols.map((c,i) => <th key={i} className={c.right?'text-right':''} style={{minWidth:c.w}}>{c.label}</th>)}</tr></thead>
           <tbody>{rows.map((r,i) => (
             <tr key={i} className={onRow?'cursor-pointer':''} onClick={() => onRow?.(r)}>
@@ -47,14 +49,14 @@ export function Table({ cols, rows, onRow, empty='No data' }) {
 
 // ── Filter Bar ──────────────────────────────────────────────
 export function FilterBar({ children }) {
-  return <div className="glass rounded-xl px-4 py-3 flex flex-wrap items-end gap-3">{children}</div>;
+  return <div className="card-surface px-4 py-3 flex flex-wrap items-end gap-3">{children}</div>;
 }
 export function FilterSelect({ label, value, onChange, options, allLabel='All' }) {
   return (
     <div>
-      <label className="block text-[10px] font-medium uppercase tracking-wider text-slate-500 mb-1">{label}</label>
+      <label className="block text-[10px] font-semibold uppercase tracking-wider text-ink-400 mb-1">{label}</label>
       <select value={value} onChange={e => onChange(e.target.value)}
-        className="px-3 py-1.5 bg-slate-800/70 border border-slate-600/40 rounded-lg text-sm text-white focus:outline-none focus:border-navy-400 min-w-[140px]">
+        className="px-3 py-1.5 bg-white border border-surface-200 rounded-lg text-sm text-ink-800 focus:outline-none focus:border-brand-400 focus:ring-2 focus:ring-brand-100 min-w-[140px]">
         <option value="">{allLabel}</option>
         {options.map(o => <option key={typeof o==='string'?o:o.value} value={typeof o==='string'?o:o.value}>{typeof o==='string'?o:o.label}</option>)}
       </select>
@@ -64,22 +66,24 @@ export function FilterSelect({ label, value, onChange, options, allLabel='All' }
 export function FilterInput({ label, value, onChange, placeholder, type='text' }) {
   return (
     <div>
-      <label className="block text-[10px] font-medium uppercase tracking-wider text-slate-500 mb-1">{label}</label>
+      <label className="block text-[10px] font-semibold uppercase tracking-wider text-ink-400 mb-1">{label}</label>
       <input type={type} value={value} onChange={e => onChange(e.target.value)} placeholder={placeholder}
-        className="px-3 py-1.5 bg-slate-800/70 border border-slate-600/40 rounded-lg text-sm text-white placeholder-slate-500 focus:outline-none focus:border-navy-400 min-w-[140px]" />
+        className="px-3 py-1.5 bg-white border border-surface-200 rounded-lg text-sm text-ink-800 placeholder-ink-400 focus:outline-none focus:border-brand-400 focus:ring-2 focus:ring-brand-100 min-w-[140px]" />
     </div>
   );
 }
 export function FilterReset({ onClick }) {
-  return <button onClick={onClick} className="px-3 py-1.5 text-xs text-slate-400 hover:text-white transition-colors self-end">Clear filters</button>;
+  return <button onClick={onClick} className="px-3 py-1.5 text-xs text-ink-400 hover:text-brand-600 font-medium transition-colors self-end">Clear filters</button>;
 }
 
 // ── Pills ───────────────────────────────────────────────────
 export function Pills({ tabs, active, onChange }) {
   return (
-    <div className="flex gap-1 bg-slate-800/40 rounded-lg p-1">
+    <div className="flex gap-0.5 bg-surface-100 rounded-lg p-1 border border-surface-200">
       {tabs.map(t => <button key={t.key} onClick={() => onChange(t.key)}
-        className={`px-3.5 py-1.5 rounded-md text-xs font-medium transition-all ${active===t.key?'bg-navy-600 text-white shadow':'text-slate-400 hover:text-white hover:bg-slate-700/40'}`}>
+        className={`px-3.5 py-1.5 rounded-md text-xs font-semibold transition-all ${active===t.key
+          ?'bg-white text-brand-600 shadow-card border border-surface-200'
+          :'text-ink-500 hover:text-ink-700 border border-transparent'}`}>
         {t.label}
       </button>)}
     </div>
@@ -92,8 +96,8 @@ export function Section({ title, sub, right, children }) {
     <div>
       <div className="flex items-end justify-between mb-3">
         <div>
-          <h2 className="text-lg font-display font-bold text-white">{title}</h2>
-          {sub && <p className="text-xs text-slate-400 mt-0.5">{sub}</p>}
+          <h2 className="text-base font-display font-bold text-ink-900">{title}</h2>
+          {sub && <p className="text-xs text-ink-400 mt-0.5">{sub}</p>}
         </div>
         {right}
       </div>
@@ -104,13 +108,12 @@ export function Section({ title, sub, right, children }) {
 
 // ── Loading ─────────────────────────────────────────────────
 export function Skel({ rows=5, cols=4 }) {
-  return <div className="glass rounded-xl p-4 space-y-3">
-    {Array.from({length:rows}).map((_,i) => <div key={i} className="flex gap-4">{Array.from({length:cols}).map((_,j) => <div key={j} className="h-4 bg-slate-700/40 rounded loading flex-1" />)}</div>)}
+  return <div className="card-surface p-4 space-y-3">
+    {Array.from({length:rows}).map((_,i) => <div key={i} className="flex gap-4">{Array.from({length:cols}).map((_,j) => <div key={j} className="h-4 rounded-lg loading flex-1" />)}</div>)}
   </div>;
 }
 
 // ── Worker name disambiguator ───────────────────────────────
-// When names are duplicated, append email for clarity
 export function disambiguateWorkers(items, nameKey='workerName', emailKey='workerEmail') {
   const nameCounts = {};
   for (const item of items) {

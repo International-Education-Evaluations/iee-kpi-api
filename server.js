@@ -2895,12 +2895,13 @@ async function runBackfill(options = {}) {
   try {
     const configDb = await getConfigDb();
     const isFullRefresh = !!options.full;
+    const hasDateRange = !!(options.dateFrom || options.dateTo);
 
-    push(`Starting ${isFullRefresh ? 'FULL' : 'INCREMENTAL'} backfill`);
+    push(`Starting ${isFullRefresh ? 'FULL' : hasDateRange ? 'DATE RANGE' : 'INCREMENTAL'} backfill`);
 
     await configDb.collection('backfill_metadata').updateOne(
       { _id: 'status' },
-      { $set: { running: true, startedAt: new Date(), triggeredBy: options.triggeredBy || 'system', mode: isFullRefresh ? 'full' : 'incremental' } },
+      { $set: { running: true, startedAt: new Date(), triggeredBy: options.triggeredBy || 'system', mode: isFullRefresh ? 'full' : hasDateRange ? 'range' : 'incremental' } },
       { upsert: true }
     );
 
@@ -2911,8 +2912,15 @@ async function runBackfill(options = {}) {
     // ── Determine what to fetch ─────────────────────────────
     let segmentCutoff;
     let qcCutoff;
+    let upperBound = null; // null = no upper limit (fetch to now)
 
-    if (isFullRefresh) {
+    if (hasDateRange) {
+      // Explicit date range — backfill only this window
+      segmentCutoff = options.dateFrom ? new Date(options.dateFrom) : getCutoff(options.days || 90);
+      qcCutoff = options.dateFrom ? new Date(options.dateFrom) : getCutoff(options.days || 90);
+      upperBound = options.dateTo ? new Date(options.dateTo + 'T23:59:59.999Z') : null;
+      push(`Date range: ${segmentCutoff.toISOString()} → ${upperBound ? upperBound.toISOString() : 'now'}`);
+    } else if (isFullRefresh) {
       const days = options.days || 90;
       segmentCutoff = getCutoff(days);
       qcCutoff = getCutoff(days);
@@ -2933,8 +2941,9 @@ async function runBackfill(options = {}) {
         qcCutoff = getCutoff(days);
         push(`No existing data — seeding full ${days}-day window`);
       } else {
-        // Overlap buffer: 2 hours catches stragglers
-        const bufferMs = 2 * 60 * 60 * 1000;
+        // Overlap buffer: 15 minutes catches in-flight orders
+        // (an order transitioning status right at the boundary)
+        const bufferMs = 15 * 60 * 1000;
         segmentCutoff = latestSeg?.segmentStart
           ? new Date(new Date(latestSeg.segmentStart).getTime() - bufferMs)
           : getCutoff(options.days || 90);
@@ -2959,7 +2968,9 @@ async function runBackfill(options = {}) {
           orderType: { $in: ['evaluation', 'translation'] },
           deletedAt: null,
           orderStatusHistory: { $exists: true, $not: { $size: 0 } },
-          'orderStatusHistory.createdAt': { $gte: segmentCutoff }
+          'orderStatusHistory.createdAt': upperBound
+            ? { $gte: segmentCutoff, $lte: upperBound }
+            : { $gte: segmentCutoff }
         }
       },
       {
@@ -3094,7 +3105,7 @@ async function runBackfill(options = {}) {
     const qcRaw = await prodDb.collection('order-discussion').find({
       type: 'system_logs',
       'category.slug': 'quality_control',
-      createdAt: { $gte: qcCutoff },
+      createdAt: upperBound ? { $gte: qcCutoff, $lte: upperBound } : { $gte: qcCutoff },
       deletedAt: null
     }, {
       projection: {
@@ -3234,17 +3245,26 @@ async function runBackfill(options = {}) {
 }
 
 // —— POST /backfill/run — Admin trigger ——————————————————
-// Body: { days: 90, full: false }
-// full=true: wipes and re-seeds everything (first run, or recovery)
-// full=false (default): incremental — only fetches new records
+// Body options:
+//   { full: true, days: 90 }          — wipe + re-seed last N days
+//   { dateFrom: "2025-01-01", dateTo: "2025-01-31" }  — backfill specific range
+//   {}                                 — incremental (only new since last run)
 app.post('/backfill/run', requireRole('admin'), async (req, res) => {
   try {
-    const days = parsePositiveInt(req.body.days, 90, { min: 1, max: 365 });
-    const full = !!req.body.full;
+    const { days, full, dateFrom, dateTo } = req.body;
     if (backfillRunning) return res.status(409).json({ error: 'Backfill already in progress' });
 
-    res.json({ success: true, message: `${full ? 'Full' : 'Incremental'} backfill started. Check /backfill/status.` });
-    runBackfill({ days, full, triggeredBy: req.user?.name || 'admin' });
+    const opts = {
+      days: days ? Math.min(Math.max(parseInt(days) || 90, 1), 365) : 90,
+      full: !!full,
+      dateFrom: dateFrom || null,
+      dateTo: dateTo || null,
+      triggeredBy: req.user?.name || 'admin'
+    };
+
+    const mode = full ? 'Full' : (dateFrom || dateTo) ? `Range ${dateFrom || '...'}→${dateTo || 'now'}` : 'Incremental';
+    res.json({ success: true, message: `${mode} backfill started. Check /backfill/status.` });
+    runBackfill(opts);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -3294,7 +3314,7 @@ app.put('/backfill/settings', requireRole('admin'), async (req, res) => {
     const { autoRefreshMinutes, days, enabled } = req.body;
     const db = await getConfigDb();
     const settings = {
-      autoRefreshMinutes: Math.max(autoRefreshMinutes || 5, 2), // min 2 minutes
+      autoRefreshMinutes: Math.max(autoRefreshMinutes || 5, 1), // min 1 minute
       days: Math.min(days || 90, 365),
       enabled: enabled !== false,
       updatedBy: req.user?.name,
@@ -3438,9 +3458,9 @@ function startBackfillScheduler() {
     } catch (err) {
       console.error('[BACKFILL-CRON] Error:', err.message);
     }
-  }, 30000); // Check every 30 seconds
+  }, 15000); // Check every 15 seconds
 
-  console.log('Backfill auto-scheduler started (checks every 30s)');
+  console.log('Backfill auto-scheduler started (checks every 15s)');
 }
 
 

@@ -3,7 +3,7 @@ import { useSearchParams } from 'react-router-dom';
 import { BarChart, Bar, LineChart, Line, XAxis, YAxis, Tooltip, ResponsiveContainer } from 'recharts';
 import { Card, Table, Section, Skel, FilterBar, FilterSelect, FilterInput, fmt, fmtI, disambiguateWorkers } from '../components/UI';
 import { api } from '../hooks/useApi';
-const TT={contentStyle:{background:'#1e293b',border:'1px solid rgba(255,255,255,0.08)',borderRadius:8,color:'#fff',fontSize:12}};
+const TT={contentStyle:{background:'#ffffff',border:'1px solid #e2e8f0',borderRadius:8,color:'#0f172a',fontSize:12}};
 
 export default function KPIUsers() {
   const [segs, setSegs] = useState([]);
@@ -59,7 +59,7 @@ export default function KPIUsers() {
 
   return (
     <div className="space-y-5">
-      <div><h1 className="text-xl font-display font-bold text-white">User Drill-Down</h1><p className="text-xs text-slate-400 mt-0.5">Individual worker performance · Last 60 days</p></div>
+      <div><h1 className="text-xl font-display font-bold text-ink-900">User Drill-Down</h1><p className="text-xs text-ink-400 mt-0.5">Individual worker performance · Last 60 days</p></div>
       <FilterBar>
         <FilterSelect label="Worker" value={sel} onChange={setSel} options={workers} allLabel="Select worker..." />
         {sel && <FilterSelect label="Status" value={fStatus} onChange={setFStatus} options={statuses} />}
@@ -73,16 +73,16 @@ export default function KPIUsers() {
           <Card label="Avg Duration" value={fmt(m.avg)} sub="min" /><Card label="Total Hours" value={fmt(m.hrs)} /><Card label="Orders" value={fmtI(m.orders)} color="plum" />
         </div>
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-3">
-          <div className="glass rounded-xl p-4"><Section title="Daily Activity" sub={selName}>
-            <ResponsiveContainer width="100%" height={220}><BarChart data={daily} margin={{left:0,right:10}}><XAxis dataKey="date" tick={{fill:'#94a3b8',fontSize:9}} angle={-45} textAnchor="end" height={50} /><YAxis tick={{fill:'#94a3b8',fontSize:10}} /><Tooltip {...TT} /><Bar dataKey="segs" fill="#3d6bab" radius={[3,3,0,0]} /></BarChart></ResponsiveContainer>
+          <div className="card-surface p-4"><Section title="Daily Activity" sub={selName}>
+            <ResponsiveContainer width="100%" height={220}><BarChart data={daily} margin={{left:0,right:10}}><XAxis dataKey="date" tick={{fill:'#64748b',fontSize:9}} angle={-45} textAnchor="end" height={50} /><YAxis tick={{fill:'#64748b',fontSize:10}} /><Tooltip {...TT} /><Bar dataKey="segs" fill="#3d6bab" radius={[3,3,0,0]} /></BarChart></ResponsiveContainer>
           </Section></div>
-          <div className="glass rounded-xl p-4"><Section title="Avg Duration Trend" sub="Minutes per segment">
-            <ResponsiveContainer width="100%" height={220}><LineChart data={daily} margin={{left:0,right:10}}><XAxis dataKey="date" tick={{fill:'#94a3b8',fontSize:9}} angle={-45} textAnchor="end" height={50} /><YAxis tick={{fill:'#94a3b8',fontSize:10}} /><Tooltip {...TT} /><Line type="monotone" dataKey="avg" stroke="#2E7D32" strokeWidth={2} dot={{r:1.5}} /></LineChart></ResponsiveContainer>
+          <div className="card-surface p-4"><Section title="Avg Duration Trend" sub="Minutes per segment">
+            <ResponsiveContainer width="100%" height={220}><LineChart data={daily} margin={{left:0,right:10}}><XAxis dataKey="date" tick={{fill:'#64748b',fontSize:9}} angle={-45} textAnchor="end" height={50} /><YAxis tick={{fill:'#64748b',fontSize:10}} /><Tooltip {...TT} /><Line type="monotone" dataKey="avg" stroke="#2E7D32" strokeWidth={2} dot={{r:1.5}} /></LineChart></ResponsiveContainer>
           </Section></div>
         </div>
         <Section title="By Status"><Table cols={[{key:'status',label:'Status',w:200},{key:'count',label:'Segments',right:true,render:v=>fmtI(v)},{key:'closed',label:'Closed',right:true,render:v=>fmtI(v)},{key:'avg',label:'Avg Min',right:true,render:v=>fmt(v)}]} rows={byStatus} /></Section>
       </>}
-      {sel && !m && !loading && <div className="glass rounded-xl p-8 text-center text-slate-500">No segments for this worker.</div>}
+      {sel && !m && !loading && <div className="card-surface p-8 text-center text-ink-500">No segments for this worker.</div>}
     </div>
   );
 }

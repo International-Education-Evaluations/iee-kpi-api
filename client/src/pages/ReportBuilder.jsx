@@ -4,7 +4,7 @@ import { Section, Skel, FilterBar, FilterSelect, FilterInput, FilterReset, fmtI,
 import { api } from '../hooks/useApi';
 
 const TT = { contentStyle: { background: '#1e293b', border: '1px solid rgba(255,255,255,0.08)', borderRadius: 8, color: '#fff', fontSize: 12 } };
-const PIE_COLORS = ['#3d6bab', '#2E7D32', '#F57F17', '#E65100', '#7B1FA2', '#00838F', '#C62828', '#4527A0', '#AD1457', '#1565C0'];
+const PIE_COLORS = ['#00aeef', '#16a34a', '#F57F17', '#E65100', '#7B1FA2', '#00838F', '#C62828', '#4527A0', '#AD1457', '#1565C0'];
 
 const METRICS = [
   { value: 'count', label: 'Count' },
@@ -107,105 +107,105 @@ export default function ReportBuilder() {
   return (
     <div className="space-y-4">
       <div className="flex items-center justify-between">
-        <div><h1 className="text-xl font-display font-bold text-white">Report Builder</h1>
-          <p className="text-xs text-slate-400 mt-0.5">Create custom reports from KPI and QC data</p></div>
+        <div><h1 className="text-xl font-display font-bold text-ink-900">Report Builder</h1>
+          <p className="text-xs text-ink-400 mt-0.5">Create custom reports from KPI and QC data</p></div>
         <div className="flex gap-2">
-          <button onClick={exportCsv} disabled={exporting} className="px-3 py-1.5 bg-slate-700 hover:bg-slate-600 text-white text-xs rounded-lg font-medium">
+          <button onClick={exportCsv} disabled={exporting} className="px-3 py-1.5 bg-slate-700 hover:bg-slate-600 text-ink-900 text-xs rounded-lg font-medium">
             {exporting ? 'Exporting...' : 'Export CSV'}
           </button>
-          <button onClick={runReport} disabled={loading} className="px-4 py-1.5 bg-navy-600 hover:bg-navy-500 text-white text-xs rounded-lg font-medium">
+          <button onClick={runReport} disabled={loading} className="px-4 py-1.5 bg-brand-500 hover:bg-brand-600 text-ink-900 text-xs rounded-lg font-medium">
             {loading ? 'Running...' : 'Run Report'}
           </button>
         </div>
       </div>
 
       {/* Config Panel */}
-      <div className="glass rounded-xl p-4">
+      <div className="card-surface p-4">
         <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-3">
           <div>
-            <label className="text-[10px] text-slate-400 uppercase block mb-1">Data Source</label>
+            <label className="text-[10px] text-ink-400 uppercase block mb-1">Data Source</label>
             <select value={config.source} onChange={e => { upd('source', e.target.value); upd('groupBy', e.target.value === 'qc' ? 'department' : 'worker'); }}
-              className="w-full px-2.5 py-1.5 bg-slate-800/60 border border-slate-600/40 rounded text-sm text-white">
+              className="w-full px-2.5 py-1.5 bg-white border border-surface-200 rounded text-sm text-ink-900">
               <option value="kpi">KPI Segments</option><option value="qc">QC Events</option>
             </select>
           </div>
           <div>
-            <label className="text-[10px] text-slate-400 uppercase block mb-1">Metric</label>
+            <label className="text-[10px] text-ink-400 uppercase block mb-1">Metric</label>
             <select value={config.metric} onChange={e => upd('metric', e.target.value)}
-              className="w-full px-2.5 py-1.5 bg-slate-800/60 border border-slate-600/40 rounded text-sm text-white">
+              className="w-full px-2.5 py-1.5 bg-white border border-surface-200 rounded text-sm text-ink-900">
               {METRICS.map(m => <option key={m.value} value={m.value}>{m.label}</option>)}
             </select>
           </div>
           <div>
-            <label className="text-[10px] text-slate-400 uppercase block mb-1">Group By</label>
+            <label className="text-[10px] text-ink-400 uppercase block mb-1">Group By</label>
             <select value={config.groupBy} onChange={e => upd('groupBy', e.target.value)}
-              className="w-full px-2.5 py-1.5 bg-slate-800/60 border border-slate-600/40 rounded text-sm text-white">
+              className="w-full px-2.5 py-1.5 bg-white border border-surface-200 rounded text-sm text-ink-900">
               {groupByOpts.map(g => <option key={g.value} value={g.value}>{g.label}</option>)}
             </select>
           </div>
           {config.groupBy === 'date' && <div>
-            <label className="text-[10px] text-slate-400 uppercase block mb-1">Date Grouping</label>
+            <label className="text-[10px] text-ink-400 uppercase block mb-1">Date Grouping</label>
             <select value={config.dateGrouping} onChange={e => upd('dateGrouping', e.target.value)}
-              className="w-full px-2.5 py-1.5 bg-slate-800/60 border border-slate-600/40 rounded text-sm text-white">
+              className="w-full px-2.5 py-1.5 bg-white border border-surface-200 rounded text-sm text-ink-900">
               <option value="day">Day</option><option value="week">Week</option><option value="month">Month</option>
             </select>
           </div>}
           <div>
-            <label className="text-[10px] text-slate-400 uppercase block mb-1">Chart Type</label>
+            <label className="text-[10px] text-ink-400 uppercase block mb-1">Chart Type</label>
             <select value={config.chartType} onChange={e => upd('chartType', e.target.value)}
-              className="w-full px-2.5 py-1.5 bg-slate-800/60 border border-slate-600/40 rounded text-sm text-white">
+              className="w-full px-2.5 py-1.5 bg-white border border-surface-200 rounded text-sm text-ink-900">
               {CHARTS.map(c => <option key={c.value} value={c.value}>{c.label}</option>)}
             </select>
           </div>
           <div className="flex items-end">
             <label className="flex items-center gap-2 cursor-pointer">
               <input type="checkbox" checked={config.filters.excludeOpen} onChange={e => updF('excludeOpen', e.target.checked)}
-                className="w-3.5 h-3.5 rounded border-slate-600 bg-slate-800 text-emerald-500" />
-              <span className="text-[11px] text-slate-300">Exclude open</span>
+                className="w-3.5 h-3.5 rounded border-surface-200 bg-white text-emerald-500" />
+              <span className="text-[11px] text-ink-600">Exclude open</span>
             </label>
           </div>
         </div>
 
         {/* Filters */}
-        <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mt-3 pt-3 border-t border-slate-700/30">
+        <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mt-3 pt-3 border-t border-surface-200">
           <div>
-            <label className="text-[10px] text-slate-400 uppercase block mb-1">From</label>
+            <label className="text-[10px] text-ink-400 uppercase block mb-1">From</label>
             <input type="date" value={config.filters.dateFrom} onChange={e => updF('dateFrom', e.target.value)}
-              className="w-full px-2.5 py-1.5 bg-slate-800/60 border border-slate-600/40 rounded text-sm text-white" />
+              className="w-full px-2.5 py-1.5 bg-white border border-surface-200 rounded text-sm text-ink-900" />
           </div>
           <div>
-            <label className="text-[10px] text-slate-400 uppercase block mb-1">To</label>
+            <label className="text-[10px] text-ink-400 uppercase block mb-1">To</label>
             <input type="date" value={config.filters.dateTo} onChange={e => updF('dateTo', e.target.value)}
-              className="w-full px-2.5 py-1.5 bg-slate-800/60 border border-slate-600/40 rounded text-sm text-white" />
+              className="w-full px-2.5 py-1.5 bg-white border border-surface-200 rounded text-sm text-ink-900" />
           </div>
           {config.source === 'kpi' && filterOpts && <>
             <div>
-              <label className="text-[10px] text-slate-400 uppercase block mb-1">Workers</label>
+              <label className="text-[10px] text-ink-400 uppercase block mb-1">Workers</label>
               <select multiple value={config.filters.workers} onChange={e => updF('workers', [...e.target.selectedOptions].map(o => o.value))}
-                className="w-full px-2 py-1 bg-slate-800/60 border border-slate-600/40 rounded text-[11px] text-white h-16">
+                className="w-full px-2 py-1 bg-white border border-surface-200 rounded text-[11px] text-ink-900 h-16">
                 {filterOpts.workers.map(w => <option key={w.email} value={w.email}>{w.name}</option>)}
               </select>
             </div>
             <div>
-              <label className="text-[10px] text-slate-400 uppercase block mb-1">Statuses</label>
+              <label className="text-[10px] text-ink-400 uppercase block mb-1">Statuses</label>
               <select multiple value={config.filters.statuses} onChange={e => updF('statuses', [...e.target.selectedOptions].map(o => o.value))}
-                className="w-full px-2 py-1 bg-slate-800/60 border border-slate-600/40 rounded text-[11px] text-white h-16">
+                className="w-full px-2 py-1 bg-white border border-surface-200 rounded text-[11px] text-ink-900 h-16">
                 {filterOpts.statuses.map(s => <option key={s.slug} value={s.slug}>{s.name}</option>)}
               </select>
             </div>
           </>}
           {config.source === 'qc' && filterOpts && <>
             <div>
-              <label className="text-[10px] text-slate-400 uppercase block mb-1">Departments</label>
+              <label className="text-[10px] text-ink-400 uppercase block mb-1">Departments</label>
               <select multiple value={config.filters.departments} onChange={e => updF('departments', [...e.target.selectedOptions].map(o => o.value))}
-                className="w-full px-2 py-1 bg-slate-800/60 border border-slate-600/40 rounded text-[11px] text-white h-16">
+                className="w-full px-2 py-1 bg-white border border-surface-200 rounded text-[11px] text-ink-900 h-16">
                 {filterOpts.departments.map(d => <option key={d} value={d}>{d}</option>)}
               </select>
             </div>
             <div>
-              <label className="text-[10px] text-slate-400 uppercase block mb-1">Error Type</label>
+              <label className="text-[10px] text-ink-400 uppercase block mb-1">Error Type</label>
               <select multiple value={config.filters.errorTypes} onChange={e => updF('errorTypes', [...e.target.selectedOptions].map(o => o.value))}
-                className="w-full px-2 py-1 bg-slate-800/60 border border-slate-600/40 rounded text-[11px] text-white h-16">
+                className="w-full px-2 py-1 bg-white border border-surface-200 rounded text-[11px] text-ink-900 h-16">
                 {filterOpts.errorTypes.map(e => <option key={e} value={e}>{e}</option>)}
               </select>
             </div>
@@ -216,18 +216,18 @@ export default function ReportBuilder() {
       {/* Save / Load */}
       <div className="flex items-center gap-2 flex-wrap">
         <input type="text" value={saveName} onChange={e => setSaveName(e.target.value)} placeholder="Report name..."
-          className="px-2.5 py-1 bg-slate-800/60 border border-slate-600/40 rounded text-xs text-white w-48" />
-        <button onClick={saveReport} disabled={!saveName} className="px-3 py-1 bg-emerald-600 hover:bg-emerald-500 disabled:bg-slate-700 text-white text-[11px] rounded font-medium">Save</button>
+          className="px-2.5 py-1 bg-white border border-surface-200 rounded text-xs text-ink-900 w-48" />
+        <button onClick={saveReport} disabled={!saveName} className="px-3 py-1 bg-emerald-600 hover:bg-emerald-500 disabled:bg-surface-200 disabled:text-ink-400 text-ink-900 text-[11px] rounded font-medium">Save</button>
         {savedReports.map(r => (
-          <div key={r._id} className="flex items-center gap-1 px-2 py-0.5 bg-slate-800/40 border border-slate-600/30 rounded group">
-            <button onClick={() => loadReport(r)} className="text-[11px] text-navy-400 hover:text-white">{r.name}</button>
-            <button onClick={() => deleteReport(r._id)} className="text-[10px] text-red-400 opacity-0 group-hover:opacity-100">×</button>
+          <div key={r._id} className="flex items-center gap-1 px-2 py-0.5 bg-surface-50 border border-surface-200 rounded group">
+            <button onClick={() => loadReport(r)} className="text-[11px] text-brand-600 hover:text-ink-900">{r.name}</button>
+            <button onClick={() => deleteReport(r._id)} className="text-[10px] text-red-600 opacity-0 group-hover:opacity-100">×</button>
           </div>
         ))}
       </div>
 
       {/* Results */}
-      {results && <div className="glass rounded-xl p-4">
+      {results && <div className="card-surface p-4">
         <div className="flex items-center justify-between mb-3">
           <Section title="Results" sub={`${fmtI(results.totalMatched)} records matched · ${results.resultCount} groups`} />
         </div>
@@ -246,19 +246,19 @@ export default function ReportBuilder() {
               <BarChart data={data.slice(0, 20)} layout="vertical" margin={{ left: 10, right: 15 }}>
                 <XAxis type="number" tick={{ fill: '#94a3b8', fontSize: 10 }} />
                 <YAxis type="category" dataKey="label" width={150} tick={{ fill: '#94a3b8', fontSize: 10 }} />
-                <Tooltip {...TT} /><Bar dataKey="value" fill="#3d6bab" radius={[0, 4, 4, 0]} />
+                <Tooltip {...TT} /><Bar dataKey="value" fill="#00aeef" radius={[0, 4, 4, 0]} />
               </BarChart>
             ) : config.chartType === 'line' ? (
               <LineChart data={data} margin={{ left: 0, right: 15 }}>
                 <XAxis dataKey="label" tick={{ fill: '#94a3b8', fontSize: 9 }} angle={-45} textAnchor="end" height={60} />
                 <YAxis tick={{ fill: '#94a3b8', fontSize: 10 }} />
-                <Tooltip {...TT} /><Line type="monotone" dataKey="value" stroke="#3d6bab" strokeWidth={2} dot={{ r: 3 }} />
+                <Tooltip {...TT} /><Line type="monotone" dataKey="value" stroke="#00aeef" strokeWidth={2} dot={{ r: 3 }} />
               </LineChart>
             ) : (
               <BarChart data={data.slice(0, 30)} margin={{ left: 0, right: 15 }}>
                 <XAxis dataKey="label" tick={{ fill: '#94a3b8', fontSize: 9 }} angle={-45} textAnchor="end" height={60} />
                 <YAxis tick={{ fill: '#94a3b8', fontSize: 10 }} />
-                <Tooltip {...TT} /><Bar dataKey="value" fill="#3d6bab" radius={[3, 3, 0, 0]} />
+                <Tooltip {...TT} /><Bar dataKey="value" fill="#00aeef" radius={[3, 3, 0, 0]} />
               </BarChart>
             )}
           </ResponsiveContainer>
@@ -273,15 +273,15 @@ export default function ReportBuilder() {
           </tr></thead>
           <tbody>{data.map((r, i) => (
             <tr key={i}>
-              <td className="text-sm font-medium text-white">{r.label}</td>
+              <td className="text-sm font-medium text-ink-900">{r.label}</td>
               <td className="text-sm text-right font-mono">{fmt(r.value)}</td>
-              <td className="text-xs text-right text-slate-400">{fmtI(r.count)}</td>
+              <td className="text-xs text-right text-ink-400">{fmtI(r.count)}</td>
             </tr>
           ))}</tbody></table>
         </div>
       </div>}
 
-      {!results && !loading && <div className="glass rounded-xl p-12 text-center text-slate-500">
+      {!results && !loading && <div className="card-surface p-12 text-center text-ink-500">
         Configure your report above and click "Run Report" to see results.
       </div>}
     </div>
