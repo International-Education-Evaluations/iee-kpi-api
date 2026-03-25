@@ -44,6 +44,7 @@ const app = express();
 // —— Configuration ————————————————————————————————————————
 const CONFIG = {
   MONGO_URI: process.env.MONGO_URI,
+  MONGO_CONFIG_URI: process.env.MONGO_CONFIG_URI || '',
   API_KEY: process.env.API_KEY,
   PORT: process.env.PORT || 3000,
   ALLOWED_IPS: process.env.ALLOWED_IPS || '',
@@ -281,6 +282,8 @@ function buildQcEvent(doc, order) {
 }
 
 // —— MongoDB ————————————————————————————————————————————
+// Two clients: read-only for production data, read-write for dashboard config.
+// If MONGO_CONFIG_URI is not set, falls back to MONGO_URI (single cluster mode).
 let client;
 async function getDb(dbName) {
   if (!client) {
@@ -288,13 +291,30 @@ async function getDb(dbName) {
       maxPoolSize: 10,
       serverSelectionTimeoutMS: 10000,
       connectTimeoutMS: 10000,
-      retryWrites: true,  // auto-retry on transient write failures / reconnect
-      retryReads: true    // auto-retry on transient read failures / reconnect
+      retryWrites: true,
+      retryReads: true
     });
     await client.connect();
-    console.log('Connected to MongoDB Atlas');
+    console.log('Connected to MongoDB Atlas (production data - read)');
   }
   return client.db(dbName);
+}
+
+let configClient;
+async function getConfigDb() {
+  const uri = CONFIG.MONGO_CONFIG_URI || CONFIG.MONGO_URI;
+  if (!configClient) {
+    configClient = new MongoClient(uri, {
+      maxPoolSize: 5,
+      serverSelectionTimeoutMS: 10000,
+      connectTimeoutMS: 10000,
+      retryWrites: true,
+      retryReads: true
+    });
+    await configClient.connect();
+    console.log(`Connected to MongoDB Atlas (config - readWrite)${CONFIG.MONGO_CONFIG_URI ? ' [separate cluster]' : ' [same cluster]'}`);
+  }
+  return configClient.db('iee_dashboard');
 }
 
 // Batch-fetches parent order docs for a list of order IDs (used by QC enrichment).
@@ -2390,11 +2410,7 @@ async function internalFetch(path) {
 //              dashboard_user_levels, dashboard_audit_log
 // ═══════════════════════════════════════════════════════════
 
-const CONFIG_DB = 'iee_dashboard';
-
-async function getConfigDb() {
-  return getDb(CONFIG_DB);
-}
+// CONFIG_DB connection is defined above with the MongoDB connection code
 
 async function auditLog(action, collection, data, changedBy) {
   try {
@@ -3007,7 +3023,8 @@ function startCronScheduler() {
 
 async function shutdown(signal) {
   console.log(`${signal} received, shutting down...`);
-  try { if (client) { await client.close(); console.log('MongoDB connection closed.'); } } catch {}
+  try { if (client) { await client.close(); console.log('Production MongoDB closed.'); } } catch {}
+  try { if (configClient) { await configClient.close(); console.log('Config MongoDB closed.'); } } catch {}
   process.exit(0);
 }
 
