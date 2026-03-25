@@ -27,8 +27,8 @@ export async function doLogin(email, password) {
   return d.user;
 }
 
-export async function doSetup(email, password, name) {
-  const r = await fetch('/auth/setup', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ email, password, name }) });
+export async function doSetup(email, password, name, setupSecret) {
+  const r = await fetch('/auth/setup', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ email, password, name, setupSecret }) });
   const d = await r.json();
   if (!r.ok) throw new Error(d.error || 'Setup failed');
   setToken(d.token); setUser(d.user);

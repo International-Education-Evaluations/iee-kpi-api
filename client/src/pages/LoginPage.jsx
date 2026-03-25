@@ -7,6 +7,7 @@ export default function LoginPage() {
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [name, setName] = useState('');
+  const [setupSecret, setSetupSecret] = useState('');
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
   const nav = useNavigate();
@@ -14,7 +15,7 @@ export default function LoginPage() {
   const submit = async e => {
     e.preventDefault(); setError(''); setLoading(true);
     try {
-      if (mode === 'setup') { await doSetup(email, password, name); }
+      if (mode === 'setup') { await doSetup(email, password, name, setupSecret); }
       else { await doLogin(email, password); }
       nav('/');
     } catch (err) { setError(err.message); }
@@ -35,11 +36,18 @@ export default function LoginPage() {
             <button onClick={() => setMode('setup')} className={`flex-1 py-1.5 rounded-lg text-xs font-medium transition-all ${mode==='setup'?'bg-navy-600 text-white':'text-slate-400 hover:text-white'}`}>First-Time Setup</button>
           </div>
           <form onSubmit={submit} className="space-y-4">
-            {mode === 'setup' && <div>
-              <label className="block text-[10px] font-medium uppercase tracking-wider text-slate-400 mb-1">Your Name</label>
-              <input type="text" value={name} onChange={e => setName(e.target.value)} placeholder="Andrew Nguyen"
-                className="w-full px-3.5 py-2 bg-slate-800/50 border border-slate-600/40 rounded-lg text-white placeholder-slate-500 text-sm focus:outline-none focus:border-navy-400" />
-            </div>}
+            {mode === 'setup' && <>
+              <div>
+                <label className="block text-[10px] font-medium uppercase tracking-wider text-slate-400 mb-1">Setup Secret</label>
+                <input type="password" value={setupSecret} onChange={e => setSetupSecret(e.target.value)} placeholder="Provided by administrator"
+                  className="w-full px-3.5 py-2 bg-slate-800/50 border border-amber-600/40 rounded-lg text-white placeholder-slate-500 text-sm focus:outline-none focus:border-amber-400" />
+              </div>
+              <div>
+                <label className="block text-[10px] font-medium uppercase tracking-wider text-slate-400 mb-1">Your Name</label>
+                <input type="text" value={name} onChange={e => setName(e.target.value)} placeholder="Andrew Nguyen"
+                  className="w-full px-3.5 py-2 bg-slate-800/50 border border-slate-600/40 rounded-lg text-white placeholder-slate-500 text-sm focus:outline-none focus:border-navy-400" />
+              </div>
+            </>}
             <div>
               <label className="block text-[10px] font-medium uppercase tracking-wider text-slate-400 mb-1">Email</label>
               <input type="email" value={email} onChange={e => setEmail(e.target.value)} placeholder="you@myiee.org"
@@ -56,7 +64,7 @@ export default function LoginPage() {
               {loading ? 'Connecting...' : mode === 'setup' ? 'Create Admin Account' : 'Sign In'}
             </button>
           </form>
-          {mode === 'setup' && <p className="text-[10px] text-slate-500 mt-3 text-center">First-time setup creates the initial admin account. Only works once.</p>}
+          {mode === 'setup' && <p className="text-[10px] text-slate-500 mt-3 text-center">Requires setup secret from your administrator. Only works once.</p>}
         </div>
       </div>
     </div>

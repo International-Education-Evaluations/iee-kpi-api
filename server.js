@@ -52,6 +52,7 @@ const CONFIG = {
   SENDGRID_API_KEY: process.env.SENDGRID_API_KEY || '',
   SENDGRID_TEMPLATE_ID: process.env.SENDGRID_TEMPLATE_ID || '',
   SENDGRID_FROM_EMAIL: process.env.SENDGRID_FROM_EMAIL || 'ops@myiee.org',
+  SETUP_SECRET: process.env.SETUP_SECRET || '',
   NODE_ENV: process.env.NODE_ENV || 'production'
 };
 
@@ -1690,12 +1691,18 @@ app.get('/queue-snapshot', async (req, res) => {
 // ═══════════════════════════════════════════════════════════
 
 // —— POST /auth/setup — First-time admin creation ——————————
-// Only works if no users exist yet. Creates the initial admin.
+// Only works if no users exist yet AND the setup secret matches.
+// Set SETUP_SECRET in Railway env vars. Without it, setup is disabled.
 app.post('/auth/setup', async (req, res) => {
   try {
-    const { email, password, name } = req.body;
+    const { email, password, name, setupSecret } = req.body;
     if (!email || !password || !name) {
       return res.status(400).json({ error: 'email, password, and name required' });
+    }
+
+    // Require setup secret if configured (recommended)
+    if (CONFIG.SETUP_SECRET && setupSecret !== CONFIG.SETUP_SECRET) {
+      return res.status(403).json({ error: 'Invalid setup secret' });
     }
 
     const db = await getConfigDb();
