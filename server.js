@@ -63,6 +63,14 @@ if (!CONFIG.API_KEY) { console.error('FATAL: API_KEY required'); process.exit(1)
 
 // —— Security ————————————————————————————————————————————
 app.use(helmet());
+app.set('etag', false); // Disable ETags — parallel paginated requests get 304 instead of data
+
+// Prevent browser caching on all /data/* endpoints
+// These are live backfill reads that must always return fresh data
+app.use('/data', (req, res, next) => {
+  res.set('Cache-Control', 'no-store');
+  next();
+});
 app.use(cors({
   origin: function(origin, callback) {
     // Allow GAS, Railway dashboard, and localhost dev
@@ -3215,8 +3223,16 @@ async function runUserSync(configDb, push) {
   try {
     push('User sync: fetching from production...');
     const userDb = await getDb('user');
+    // Filter to staff only: must have a department assigned.
+    // Without this filter the query returns ~150k records (all users ever created
+    // including customers, partners, etc.). Staff have department populated;
+    // non-staff do not. This reduces the sync set to ~500-2000 rows.
     const users = await userDb.collection('user').find(
-      { deletedAt: null },
+      {
+        deletedAt: null,
+        'department': { $exists: true, $ne: null },
+        'department.name': { $exists: true, $ne: '' }
+      },
       { projection: { firstName: 1, middleName: 1, lastName: 1, email: 1, type: 1, active: 1, department: 1, v1Id: 1, legacyId: 1, foreignKeyId: 1 } }
     ).toArray();
 
@@ -3230,8 +3246,10 @@ async function runUserSync(configDb, push) {
       _backfilledAt: new Date()
     }));
 
-    if (userDocs.length === 0) {
-      push('User sync: WARNING — 0 users returned from production, skipping write to avoid data loss');
+    // Guard: if production returns 0 staff, something is wrong with the query or connection.
+    // Don't wipe the collection. Also guard against suspiciously low counts.
+    if (userDocs.length < 5) {
+      push(`User sync: WARNING — only ${userDocs.length} users returned (expected hundreds), skipping write to avoid data loss`);
       userSyncRunning = false;
       return { count: 0, skipped: true };
     }
@@ -3799,6 +3817,26 @@ async function runBackfill(options = {}) {
     }
 
     // ═════════════════════════════════════════════════════════
+    // 3b. QUEUE WAIT SUMMARY — backfill into config DB
+    // ═════════════════════════════════════════════════════════
+    // Previously called live on every Queue Ops page load (/queue-wait-summary?days=450)
+    // which runs a 450-day production MongoDB aggregation (10-22s, blocks the UI).
+    // Now pre-computed here and served instantly from /data/queue-wait-summary.
+    // 90-day window — 450 days was excessive and the primary cause of timeouts.
+    try {
+      push('Computing queue wait summary...');
+      const waitResult = await internalFetch('/queue-wait-summary?days=90');
+      await configDb.collection('backfill_queue_wait_summary').updateOne(
+        { _id: 'current' },
+        { $set: { ...waitResult, _backfilledAt: new Date() } },
+        { upsert: true }
+      );
+      push(`Queue wait summary: ${waitResult.statusCount || 0} statuses over ${waitResult.days || 90} days`);
+    } catch (wErr) {
+      push(`Queue wait summary: SKIPPED (${wErr.message})`);
+    }
+
+    // ═════════════════════════════════════════════════════════
     // 4. USERS — decoupled sync (60-minute cadence, staging swap)
     // ═════════════════════════════════════════════════════════
     // Users don't change at KPI frequency. Running a 150k-doc full replace
@@ -4029,7 +4067,7 @@ app.get('/backfill/next', async (req, res) => {
 app.get('/data/kpi-segments', async (req, res) => {
   try {
     const page = parsePositiveInt(req.query.page, 1);
-    const pageSize = parsePositiveInt(req.query.pageSize, 5000, { min: 1, max: 10000 });
+    const pageSize = parsePositiveInt(req.query.pageSize, 10000, { min: 1, max: 10000 }); // raised from 5000 — halves round trips
     const db = await getConfigDb();
     const col = db.collection('backfill_kpi_segments');
 
@@ -4043,7 +4081,18 @@ app.get('/data/kpi-segments', async (req, res) => {
     if (req.query.to) filter.segmentStart = { ...filter.segmentStart, $lte: req.query.to + 'T23:59:59' };
 
     const totalCount = await col.countDocuments(filter);
-    const segments = await col.find(filter)
+    // Project only fields the client needs — cuts 4MB pages down to ~1.5MB
+    const CLIENT_PROJECTION = {
+      orderSerialNumber:1, orderId:1, orderType:1,
+      statusSlug:1, statusName:1,
+      workerUserId:1, workerName:1, workerEmail:1,
+      departmentName:1,
+      segmentStart:1, segmentEnd:1,
+      durationMinutes:1, durationSeconds:1,
+      isOpen:1, userLevel:1,
+      _compositeKey:1
+    };
+    const segments = await col.find(filter, { projection: CLIENT_PROJECTION })
       .sort({ segmentStart: -1 })
       .skip((page - 1) * pageSize)
       .limit(pageSize)
@@ -4188,6 +4237,28 @@ app.get('/data/queue-status-orders', async (req, res) => {
     });
 
     res.json({ count: rows.length, statusSlug, statusName: rows[0]?.statusName || statusSlug, rows });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// —— GET /data/queue-wait-summary — Fast read from backfill ——————————————————
+// Returns the pre-computed queue wait summary from the last backfill run.
+// Replaces the live /queue-wait-summary?days=450 call (10-22s production query)
+// with a sub-millisecond config DB read. Falls back to live if not yet cached.
+app.get('/data/queue-wait-summary', async (req, res) => {
+  try {
+    const db = await getConfigDb();
+    const cached = await db.collection('backfill_queue_wait_summary').findOne({ _id: 'current' });
+    if (cached) {
+      delete cached._id;
+      res.json({ ...cached, source: 'backfill' });
+    } else {
+      // No cache yet (first deploy) — fall back to live with a shorter window
+      console.log('[QUEUE-WAIT] No cache found, falling back to live /queue-wait-summary?days=90');
+      const live = await internalFetch('/queue-wait-summary?days=90');
+      res.json({ ...live, source: 'live-fallback' });
+    }
   } catch (err) {
     res.status(500).json({ error: err.message });
   }

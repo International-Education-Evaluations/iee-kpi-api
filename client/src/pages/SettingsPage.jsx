@@ -202,3 +202,244 @@ function ThresholdConfig() {
     </div>
   );
 }
+
+// ── BenchmarkConfig ───────────────────────────────────────────
+// One row per status slug. Columns: Status, Team (auto-detected), XpH Unit,
+// L0–L5 benchmark values. Uses GET /config/benchmarks for existing rows and
+// GET /config/benchmarks/statuses for the status dropdown when adding.
+function BenchmarkConfig() {
+  const [benchmarks, setBenchmarks] = useState([]);
+  const [statuses, setStatuses]     = useState([]);
+  const [loading, setLoading]       = useState(true);
+  const [saving, setSaving]         = useState(null);
+  const [adding, setAdding]         = useState(false);
+  const [newRow, setNewRow]         = useState(null);
+  const [editSlug, setEditSlug]     = useState(null);
+  const [editRow, setEditRow]       = useState(null);
+  const [filter, setFilter]         = useState('');
+  const canEdit = isManagerPlus();
+  const lvls = ['l0','l1','l2','l3','l4','l5'];
+
+  useEffect(() => {
+    (async () => {
+      setLoading(true);
+      try {
+        const [bData, sData] = await Promise.all([
+          api('/config/benchmarks'),
+          api('/config/benchmarks/statuses').catch(() => ({ statuses: [] })),
+        ]);
+        setBenchmarks(bData.benchmarks || []);
+        setStatuses(sData.statuses || []);
+      } catch (e) { console.error(e); }
+      setLoading(false);
+    })();
+  }, []);
+
+  // Auto-detect team from status name (mirrors GAS logic)
+  const detectTeam = (statusName) => {
+    const n = (statusName || '').toLowerCase();
+    if (n.includes('translation')) return 'Translation';
+    if (n.includes('evaluation') || n.includes('eval')) return 'Evaluation';
+    if (n.includes('digital')) return 'Digital';
+    if (n.includes('shipment') || n.includes('fulfillment')) return 'Fulfillment';
+    return '';
+  };
+
+  const saveRow = async (row) => {
+    const key = row.status;
+    setSaving(key);
+    try {
+      await api('/config/benchmarks', {
+        method: 'PUT',
+        body: JSON.stringify({ ...row, changedBy: getUser()?.name }),
+      });
+      setBenchmarks(prev => {
+        const idx = prev.findIndex(b => b.status === row.status);
+        if (idx >= 0) { const n = [...prev]; n[idx] = { ...prev[idx], ...row }; return n; }
+        return [...prev, row].sort((a, b) => (a.team + a.status).localeCompare(b.team + b.status));
+      });
+      setEditSlug(null); setEditRow(null);
+      setAdding(false); setNewRow(null);
+    } catch (e) { alert('Save failed: ' + e.message); }
+    setSaving(null);
+  };
+
+  const startEdit = (b) => {
+    setEditSlug(b.status);
+    setEditRow({ ...b });
+    setAdding(false); setNewRow(null);
+  };
+
+  const startAdd = () => {
+    setAdding(true);
+    setNewRow({ status: '', team: '', xphUnit: 'Orders', l0: null, l1: null, l2: null, l3: null, l4: null, l5: null });
+    setEditSlug(null); setEditRow(null);
+  };
+
+  const handleStatusSelect = (slug) => {
+    const found = statuses.find(s => s.slug === slug);
+    const name  = found?.name || slug;
+    setNewRow(r => ({ ...r, status: slug, team: detectTeam(name), _statusName: name }));
+  };
+
+  const upd = (setter, k, v) => setter(r => ({ ...r, [k]: v }));
+  const updNum = (setter, k, v) => setter(r => ({ ...r, [k]: v === '' ? null : Number(v) }));
+
+  // Statuses not yet in benchmarks, for the add dropdown
+  const usedSlugs = new Set(benchmarks.map(b => b.status));
+  const availableStatuses = statuses.filter(s => !usedSlugs.has(s.slug));
+
+  const displayed = benchmarks.filter(b =>
+    !filter || b.status.toLowerCase().includes(filter.toLowerCase()) ||
+    (b.team || '').toLowerCase().includes(filter.toLowerCase())
+  );
+
+  if (loading) return <Skel rows={8} cols={9} />;
+
+  return (
+    <div className="space-y-3">
+      <div className="card-surface p-4 flex items-start justify-between gap-4">
+        <div>
+          <Section title="Benchmarks" sub="XpH targets per level per status. L0–L5 = segments (or orders) per hour." />
+          <div className="mt-2">
+            <input type="text" value={filter} onChange={e => setFilter(e.target.value)}
+              placeholder="Filter by status or team…"
+              className="px-3 py-1.5 bg-white border border-surface-200 rounded-lg text-xs text-ink-800 placeholder-ink-400 focus:outline-none focus:border-brand-400 w-64" />
+            {filter && <button onClick={() => setFilter('')} className="ml-2 text-xs text-ink-400 hover:text-brand-600">Clear</button>}
+          </div>
+        </div>
+        {canEdit && !adding && !editSlug && (
+          <button onClick={startAdd} className="shrink-0 px-3 py-1.5 bg-brand-500 hover:bg-brand-600 text-ink-900 text-xs rounded-lg font-medium">
+            + Add Status
+          </button>
+        )}
+      </div>
+
+      {/* Add new row form */}
+      {adding && newRow && (
+        <div className="card-surface p-4 border-2 border-brand-200 space-y-3">
+          <div className="text-xs font-semibold text-ink-600 mb-2">Add Benchmark</div>
+          <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+            <div>
+              <label className="block text-[10px] font-semibold uppercase text-ink-400 mb-1">Status</label>
+              <select value={newRow.status} onChange={e => handleStatusSelect(e.target.value)}
+                className="w-full px-2.5 py-1.5 bg-white border border-surface-200 rounded text-xs text-ink-800 focus:outline-none focus:border-brand-400">
+                <option value="">Select status…</option>
+                {availableStatuses.map(s => <option key={s.slug} value={s.slug}>{s.name || s.slug}</option>)}
+              </select>
+            </div>
+            <div>
+              <label className="block text-[10px] font-semibold uppercase text-ink-400 mb-1">Team</label>
+              <input type="text" value={newRow.team || ''} onChange={e => upd(setNewRow, 'team', e.target.value)}
+                placeholder="Auto-detected…"
+                className="w-full px-2.5 py-1.5 bg-white border border-surface-200 rounded text-xs text-ink-800 focus:outline-none focus:border-brand-400" />
+            </div>
+            <div>
+              <label className="block text-[10px] font-semibold uppercase text-ink-400 mb-1">XpH Unit</label>
+              <select value={newRow.xphUnit || 'Orders'} onChange={e => upd(setNewRow, 'xphUnit', e.target.value)}
+                className="w-full px-2.5 py-1.5 bg-white border border-surface-200 rounded text-xs text-ink-800 focus:outline-none focus:border-brand-400">
+                <option value="Orders">Orders</option>
+                <option value="Segments">Segments</option>
+                <option value="Reports">Reports</option>
+              </select>
+            </div>
+          </div>
+          <div className="grid grid-cols-6 gap-2">
+            {lvls.map(l => (
+              <div key={l}>
+                <label className="block text-[10px] font-semibold uppercase text-ink-400 mb-1">{l.toUpperCase()}</label>
+                <input type="number" step="0.5" value={newRow[l] ?? ''} onChange={e => updNum(setNewRow, l, e.target.value)}
+                  className="w-full px-2 py-1.5 bg-white border border-surface-200 rounded text-xs text-right font-mono text-ink-800 focus:outline-none focus:border-brand-400" />
+              </div>
+            ))}
+          </div>
+          <div className="flex gap-2">
+            <button onClick={() => saveRow(newRow)} disabled={!newRow.status || saving}
+              className="px-3 py-1.5 bg-emerald-600 hover:bg-emerald-700 text-white text-xs rounded font-medium disabled:opacity-50">
+              {saving ? 'Saving…' : 'Save'}
+            </button>
+            <button onClick={() => { setAdding(false); setNewRow(null); }}
+              className="px-3 py-1.5 bg-surface-200 hover:bg-surface-300 text-ink-700 text-xs rounded">
+              Cancel
+            </button>
+          </div>
+        </div>
+      )}
+
+      <div className="card-surface overflow-hidden">
+        <div className="overflow-x-auto">
+          <table className="tbl w-full">
+            <thead>
+              <tr>
+                <th style={{minWidth:180}}>Status</th>
+                <th style={{minWidth:110}}>Team</th>
+                <th style={{minWidth:90}}>XpH Unit</th>
+                {lvls.map(l => <th key={l} className="text-right" style={{minWidth:60}}>{l.toUpperCase()}</th>)}
+                <th className="text-right text-ink-400" style={{minWidth:80}}>Updated By</th>
+                {canEdit && <th style={{minWidth:60}}></th>}
+              </tr>
+            </thead>
+            <tbody>
+              {displayed.map((b, i) => {
+                const isEditing = editSlug === b.status;
+                const row = isEditing ? editRow : b;
+                return (
+                  <tr key={i} className={isEditing ? 'bg-brand-50' : ''}>
+                    <td className="font-medium text-ink-900 text-xs">{b.status}</td>
+                    <td>
+                      {isEditing
+                        ? <input type="text" value={row.team || ''} onChange={e => upd(setEditRow, 'team', e.target.value)}
+                            className="w-full px-2 py-0.5 bg-white border border-surface-200 rounded text-xs text-ink-800 focus:outline-none focus:border-brand-400" />
+                        : <span className="text-xs text-ink-500">{b.team || '—'}</span>}
+                    </td>
+                    <td>
+                      {isEditing
+                        ? <select value={row.xphUnit || 'Orders'} onChange={e => upd(setEditRow, 'xphUnit', e.target.value)}
+                            className="w-full px-2 py-0.5 bg-white border border-surface-200 rounded text-xs text-ink-800 focus:outline-none focus:border-brand-400">
+                            <option value="Orders">Orders</option>
+                            <option value="Segments">Segments</option>
+                            <option value="Reports">Reports</option>
+                          </select>
+                        : <span className="text-xs text-ink-400">{b.xphUnit || 'Orders'}</span>}
+                    </td>
+                    {lvls.map(l => (
+                      <td key={l} className="text-right">
+                        {isEditing
+                          ? <input type="number" step="0.5" value={row[l] ?? ''}
+                              onChange={e => updNum(setEditRow, l, e.target.value)}
+                              className="w-16 px-1.5 py-0.5 bg-white border border-surface-200 rounded text-right text-xs font-mono text-ink-800 focus:outline-none focus:border-brand-400" />
+                          : <span className={b[l] != null ? 'text-xs font-mono text-ink-900' : 'text-xs font-mono text-ink-300'}>{b[l] ?? '—'}</span>}
+                      </td>
+                    ))}
+                    <td className="text-right text-[10px] text-ink-400">{b.updatedBy || '—'}</td>
+                    {canEdit && (
+                      <td className="text-right">
+                        {isEditing ? (
+                          <div className="flex gap-1 justify-end">
+                            <button onClick={() => saveRow(editRow)} disabled={saving === b.status}
+                              className="px-2 py-0.5 bg-emerald-600 text-white text-[10px] rounded font-medium">
+                              {saving === b.status ? '…' : 'Save'}
+                            </button>
+                            <button onClick={() => { setEditSlug(null); setEditRow(null); }}
+                              className="px-2 py-0.5 bg-surface-200 text-ink-600 text-[10px] rounded">×</button>
+                          </div>
+                        ) : !editSlug && !adding ? (
+                          <button onClick={() => startEdit(b)} className="text-[10px] text-brand-600 hover:text-brand-800">Edit</button>
+                        ) : null}
+                      </td>
+                    )}
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+        {!displayed.length && (
+          <div className="px-4 py-8 text-center text-ink-500 text-sm">
+            {filter ? `No benchmarks match "${filter}"` : 'No benchmarks yet. Click + Add Status to create the first one.'}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
