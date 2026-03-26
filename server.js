@@ -2342,29 +2342,44 @@ app.get('/ai/suggested-questions', (req, res) => {
   res.json({
     questions: [
       {
-        text: 'Which queues have the longest wait times right now?',
-        category: 'Queue Operations',
-        description: 'Shows live queue status with median wait and aging orders'
+        text: 'Give me a full operations briefing for today — volume, queue health, and any red flags.',
+        category: '📋 Daily Briefing',
+        description: 'Pulls live data across all sources for a morning standup summary'
       },
       {
-        text: 'What are the top QC issues this month and which departments are most affected?',
-        category: 'Quality Control',
-        description: 'Breaks down error types by department with accountability'
+        text: 'Which worker had the biggest XpH drop this week and what might explain it?',
+        category: '👤 Worker Intelligence',
+        description: 'Identifies performance drops and surfaces context automatically'
       },
       {
-        text: 'How is the Evaluation team performing on processing speed this month?',
-        category: 'KPI Performance',
-        description: 'Shows segment counts, avg durations, and worker breakdown for Evaluation'
+        text: 'How much staff does the Digital Records team need next Monday based on historical demand?',
+        category: '◑ Staffing Forecast',
+        description: 'Uses order arrival patterns and XpH to compute required concurrent staff'
       },
       {
-        text: 'Are there any statuses where orders are getting stuck for more than 48 hours?',
-        category: 'Queue Operations',
-        description: 'Identifies bottleneck statuses using aging bucket analysis'
+        text: 'What is our current SLA performance and which order types are most at risk?',
+        category: '⏱ SLA Health',
+        description: 'P50/P75/P90 turnaround vs recommended targets with late % breakdown'
       },
       {
-        text: 'Give me a daily operations summary — queues, processing volume, and QC issues.',
-        category: 'Daily Summary',
-        description: 'Comprehensive overview pulling from all data sources'
+        text: 'Which statuses are bottlenecks right now — where are orders waiting the longest?',
+        category: '🚧 Bottlenecks',
+        description: 'Combines live queue depth with historical wait time data'
+      },
+      {
+        text: 'Show me the top 5 workers by XpH this month and compare them to benchmark.',
+        category: '🏆 Performance Ranking',
+        description: 'Ranks workers by throughput and shows attainment vs configured benchmarks'
+      },
+      {
+        text: 'Which departments have the worst QC kick-back rate and what issues are driving it?',
+        category: '✅ QC Deep Dive',
+        description: 'Breaks down rework by department, issue type, and accountable worker'
+      },
+      {
+        text: 'Are there any orders that have been open for more than 48 hours? Show me the oldest ones.',
+        category: '⚠️ Stuck Orders',
+        description: 'Scans for aged open segments that may need urgent attention'
       }
     ]
   });
@@ -5257,25 +5272,19 @@ app.get('/data/forecast/arrivals', async (req, res) => {
 
       // SLA stats by processTimeSlug (standard/rush) over last 90 days
       db.collection('backfill_order_turnaround').aggregate([
-        { $match: { createdAt: { $gte: d90 }, isCompleted: true } },
+        { $match: { createdAt: { $gte: d90 }, isCompleted: true, turnaroundHrs:{ $gt:0, $lt:2000 } } },
         { $group: {
             _id: { processTimeSlug: '$processTimeSlug', orderType: '$orderType' },
-            count:         { $sum: 1 },
-            avgHrs:        { $avg: '$turnaroundHrs' },
-            p50:           { $percentile: { input:'$turnaroundHrs', p:[0.5], method:'approximate' } },
-            p75:           { $percentile: { input:'$turnaroundHrs', p:[0.75], method:'approximate' } },
-            p90:           { $percentile: { input:'$turnaroundHrs', p:[0.9], method:'approximate' } },
-            latePct:       { $avg: { $cond:['$isLate',1,0] } },
+            count: { $sum: 1 }, avgHrs: { $avg: '$turnaroundHrs' },
+            latePct: { $avg: { $cond:['$isLate',1,0] } }, hrs: { $push: '$turnaroundHrs' }
         }},
-        { $project: {
-            _id:0, processTimeSlug:'$_id.processTimeSlug', orderType:'$_id.orderType',
-            count:1, avgHrs:{ $round:['$avgHrs',1] },
-            p50Hrs:{ $round:[{ $arrayElemAt:['$p50',0] },1] },
-            p75Hrs:{ $round:[{ $arrayElemAt:['$p75',0] },1] },
-            p90Hrs:{ $round:[{ $arrayElemAt:['$p90',0] },1] },
-            latePct:{ $round:[{ $multiply:['$latePct',100] },1] },
-        }}
-      ]).toArray()
+        { $project: { _id:0, processTimeSlug:'$_id.processTimeSlug', orderType:'$_id.orderType',
+            count:1, avgHrs:{ $round:['$avgHrs',1] }, latePct:{ $round:[{ $multiply:['$latePct',100] },1] }, hrs:1 }}
+      ]).toArray().then(rows => rows.map(r => {
+        const s = (r.hrs||[]).sort((a,b)=>a-b);
+        const p = (pct) => s.length ? Math.round((s[Math.floor(s.length*pct)]||s[s.length-1])*10)/10 : null;
+        return { ...r, hrs:undefined, p50Hrs:p(0.5), p75Hrs:p(0.75), p90Hrs:p(0.9) };
+      }))
     ]);
 
     res.json({ slots, weeklyTrend, slaStats, departments: allDepts, activeDept: dept });
@@ -5370,33 +5379,27 @@ app.get('/data/forecast/sla-analysis', async (req, res) => {
     const dept = req.query.dept || '';
     const deptMatch = dept ? { departmentName: dept } : {};
 
-    const [byType, byStatus, bottlenecks, dailyTrend, departments] = await Promise.all([
+    const [byTypeRaw, byStatusRaw, bottlenecksRaw, dailyTrend, departments] = await Promise.all([
 
-      // Turnaround distribution by order type + process time
+      // Turnaround distribution by order type + process time (JS percentiles — avoids $percentile MongoDB 7+ req)
       db.collection('backfill_order_turnaround').aggregate([
         { $match: { isCompleted:true, createdAt:{ $gte:d180 }, turnaroundHrs:{ $gt:0, $lt:2000 }, ...deptMatch } },
         { $group: {
             _id: { orderType:'$orderType', processTimeSlug:'$processTimeSlug' },
-            count:    { $sum:1 },
-            avgHrs:   { $avg:'$turnaroundHrs' },
-            p50:      { $percentile:{ input:'$turnaroundHrs', p:[0.5], method:'approximate' } },
-            p75:      { $percentile:{ input:'$turnaroundHrs', p:[0.75], method:'approximate' } },
-            p90:      { $percentile:{ input:'$turnaroundHrs', p:[0.9], method:'approximate' } },
-            p95:      { $percentile:{ input:'$turnaroundHrs', p:[0.95], method:'approximate' } },
+            count:    { $sum:1 }, avgHrs:{ $avg:'$turnaroundHrs' },
             latePct:  { $avg:{ $cond:['$isLate',1,0] } },
             avgDaysLate: { $avg:{ $cond:['$isLate','$daysLate',null] } },
+            hrs:      { $push:'$turnaroundHrs' }
         }},
-        { $project: {
-            _id:0, orderType:'$_id.orderType', processTimeSlug:'$_id.processTimeSlug',
+        { $project: { _id:0, orderType:'$_id.orderType', processTimeSlug:'$_id.processTimeSlug',
             count:1, avgHrs:{ $round:['$avgHrs',1] },
-            p50Hrs:{ $round:[{ $arrayElemAt:['$p50',0] },1] },
-            p75Hrs:{ $round:[{ $arrayElemAt:['$p75',0] },1] },
-            p90Hrs:{ $round:[{ $arrayElemAt:['$p90',0] },1] },
-            p95Hrs:{ $round:[{ $arrayElemAt:['$p95',0] },1] },
             latePct:{ $round:[{ $multiply:['$latePct',100] },1] },
-            avgDaysLate:{ $round:['$avgDaysLate',1] },
-        }}
-      ]).toArray(),
+            avgDaysLate:{ $round:['$avgDaysLate',1] }, hrs:1 }}
+      ]).toArray().then(rows => rows.map(r => {
+        const s = (r.hrs||[]).sort((a,b)=>a-b);
+        const p = (pct) => s.length ? Math.round((s[Math.floor(s.length*pct)]||s[s.length-1])*10)/10 : null;
+        return { ...r, hrs:undefined, p50Hrs:p(0.5), p75Hrs:p(0.75), p90Hrs:p(0.9), p95Hrs:p(0.95) };
+      })),
 
       // Wait time per status (where is queue time being spent?)
       db.collection('backfill_order_turnaround').aggregate([
@@ -5405,14 +5408,12 @@ app.get('/data/forecast/sla-analysis', async (req, res) => {
         { $unwind:'$sw' },
         { $group:{ _id:'$sw.k',
             avgWaitMin:{ $avg:'$sw.v' }, maxWaitMin:{ $max:'$sw.v' },
-            p75:{ $percentile:{ input:'$sw.v', p:[0.75], method:'approximate' } },
-            count:{ $sum:1 }
+            count:{ $sum:1 }, vals:{ $push:'$sw.v' }
         }},
         { $project:{ _id:0, statusSlug:'$_id',
             avgWaitMin:{ $round:['$avgWaitMin',0] },
             maxWaitMin:{ $round:['$maxWaitMin',0] },
-            p75Min:{ $round:[{ $arrayElemAt:['$p75',0] },0] },
-            count:1
+            count:1, vals:1
         }},
         { $sort:{ avgWaitMin:-1 } }
       ]).toArray(),
@@ -5425,14 +5426,11 @@ app.get('/data/forecast/sla-analysis', async (req, res) => {
         { $match:{ 'sw.v':{ $gt:60 } } }, // >1 hour waits only
         { $group:{ _id:'$sw.k',
             avgWaitHrs:{ $avg:{ $divide:['$sw.v',60] } },
-            p75Hrs:{ $percentile:{ input:{ $divide:['$sw.v',60] }, p:[0.75], method:'approximate' } },
-            count:{ $sum:1 }
+            count:{ $sum:1 }, vals:{ $push:{ $divide:['$sw.v',60] } }
         }},
-        { $match:{ 'p75Hrs.0':{ $gt:4 } } }, // P75 > 4 hours = bottleneck
         { $project:{ _id:0, statusSlug:'$_id',
             avgWaitHrs:{ $round:['$avgWaitHrs',1] },
-            p75Hrs:{ $round:[{ $arrayElemAt:['$p75Hrs',0] },1] },
-            count:1,
+            count:1, vals:1
         }},
         { $sort:{ p75Hrs:-1 } }
       ]).toArray(),
@@ -5453,6 +5451,16 @@ app.get('/data/forecast/sla-analysis', async (req, res) => {
       ]).toArray()
     ]);
 
+    // Compute p75 for bottlenecks in JS and filter
+    const bottlenecks = (bottlenecksRaw||[]).map(r => {
+      const s = (r.vals||[]).sort((a,b)=>a-b);
+      const p75Hrs = s.length ? Math.round((s[Math.floor(s.length*0.75)]||s[s.length-1])*10)/10 : 0;
+      return { ...r, vals:undefined, p75Hrs };
+    }).filter(r => r.p75Hrs > 4).sort((a,b)=>b.p75Hrs-a.p75Hrs);
+
+    const byType = byTypeRaw;
+    const byStatus = byStatusRaw;
+
     // Compute SLA recommendations:
     // Recommend P75 turnaround + 20% buffer, rounded to nearest half-day
     const recommendations = byType.map(r => {
@@ -5469,7 +5477,14 @@ app.get('/data/forecast/sla-analysis', async (req, res) => {
       };
     });
 
-    res.json({ byType, byStatus, bottlenecks, dailyTrend, recommendations, departments: (departments||[]).filter(Boolean).sort(), activeDept: dept });
+    // Compute p75 for byStatus in JS (avoids $percentile MongoDB 7+ requirement)
+    const byStatusFinal = (byStatus||[]).map(r => {
+      const s = (r.vals||[]).sort((a,b)=>a-b);
+      const p75Min = s.length ? Math.round(s[Math.floor(s.length*0.75)]||s[s.length-1]) : null;
+      return { ...r, vals:undefined, p75Min };
+    });
+
+    res.json({ byType, byStatus:byStatusFinal, bottlenecks, dailyTrend, recommendations, departments: (departments||[]).filter(Boolean).sort(), activeDept: dept });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }

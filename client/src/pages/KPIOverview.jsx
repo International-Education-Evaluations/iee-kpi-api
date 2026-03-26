@@ -45,6 +45,7 @@ export default function KPIOverview() {
   const [fFrom, setFFrom] = useState(''); const [fTo, setFTo] = useState('');
   const [fWorker, setFWorker] = useState(''); const [fStatus, setFStatus] = useState('');
   const [drawer, setDrawer] = useState({ open:false, title:'', subtitle:'', rows:[] });
+  const [anomalyOpen, setAnomalyOpen] = useState(false); // collapsed by default
   const nav = useNavigate();
 
   // Defer heavy filter computations so filter inputs stay responsive even on 95k rows.
@@ -395,43 +396,39 @@ export default function KPIOverview() {
       </div>
 
       {/* ── Anomaly / Alert Feed — collapsed by default ───── */}
-      {anomalies.length > 0 && (() => {
-        const [open, setOpen] = React.useState(false);
-        const errors = anomalies.filter(a => a.severity === 'error');
-        return (
-          <div className="card-surface overflow-hidden">
-            <button onClick={() => setOpen(o => !o)}
-              className="w-full px-4 py-2.5 flex items-center justify-between hover:bg-surface-50 transition-colors">
-              <span className="text-xs font-semibold text-ink-600 flex items-center gap-1.5">
-                {errors.length > 0
-                  ? <span className="w-2 h-2 rounded-full bg-red-500 animate-pulse inline-block" />
-                  : <span className="w-2 h-2 rounded-full bg-amber-400 inline-block" />
-                }
-                Alerts &amp; Anomalies
-                <span className={`ml-1 px-1.5 py-0.5 rounded text-[10px] font-bold ${errors.length>0?'bg-red-100 text-red-700':'bg-amber-100 text-amber-700'}`}>
-                  {anomalies.length}
-                </span>
+      {anomalies.length > 0 && (
+        <div className="card-surface overflow-hidden">
+          <button onClick={() => setAnomalyOpen(o => !o)}
+            className="w-full px-4 py-2.5 flex items-center justify-between hover:bg-surface-50 transition-colors">
+            <span className="text-xs font-semibold text-ink-600 flex items-center gap-1.5">
+              {anomalies.some(a => a.severity === 'error')
+                ? <span className="w-2 h-2 rounded-full bg-red-500 animate-pulse inline-block" />
+                : <span className="w-2 h-2 rounded-full bg-amber-400 inline-block" />
+              }
+              Alerts &amp; Anomalies
+              <span className={`ml-1 px-1.5 py-0.5 rounded text-[10px] font-bold ${anomalies.some(a=>a.severity==='error')?'bg-red-100 text-red-700':'bg-amber-100 text-amber-700'}`}>
+                {anomalies.length}
               </span>
-              <span className="text-ink-400 text-xs">{open ? '▲ Hide' : '▼ Show'}</span>
-            </button>
-            {open && (
-              <div className="divide-y divide-surface-100 border-t border-surface-100">
-                {anomalies.map((a, i) => (
-                  <div key={i} className={`flex items-start gap-3 px-4 py-2.5 ${a.severity==='error'?'bg-red-50/40':'bg-amber-50/30'}`}>
-                    <span className={`text-sm mt-0.5 ${a.severity==='error'?'text-red-500':'text-amber-500'}`}>
-                      {a.severity==='error'?'⚠':'◉'}
-                    </span>
-                    <div className="flex-1 min-w-0">
-                      <div className="text-xs font-semibold text-ink-900">{a.title}</div>
-                      <div className="text-[11px] text-ink-500 mt-0.5">{a.detail}</div>
-                    </div>
+            </span>
+            <span className="text-ink-400 text-xs">{anomalyOpen ? '▲ Hide' : '▼ Show'}</span>
+          </button>
+          {anomalyOpen && (
+            <div className="divide-y divide-surface-100 border-t border-surface-100">
+              {anomalies.map((a, i) => (
+                <div key={i} className={`flex items-start gap-3 px-4 py-2.5 ${a.severity==='error'?'bg-red-50/40':'bg-amber-50/30'}`}>
+                  <span className={`text-sm mt-0.5 ${a.severity==='error'?'text-red-500':'text-amber-500'}`}>
+                    {a.severity==='error'?'⚠':'◉'}
+                  </span>
+                  <div className="flex-1 min-w-0">
+                    <div className="text-xs font-semibold text-ink-900">{a.title}</div>
+                    <div className="text-[11px] text-ink-500 mt-0.5">{a.detail}</div>
                   </div>
-                ))}
-              </div>
-            )}
-          </div>
-        );
-      })()}
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
 
       <div className="card-surface overflow-hidden" data-tour="breakdown-table">
         <div className="px-4 py-3 border-b border-surface-200 flex items-center justify-between">
