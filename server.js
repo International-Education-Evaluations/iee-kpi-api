@@ -3563,7 +3563,7 @@ async function runBackfill(options = {}) {
 
     push('Fetching users...');
     const userDb = await getDb('user');
-    const users = await userDb.collection('users').find(
+    const users = await userDb.collection('user').find(
       { deletedAt: null },
       { projection: { firstName: 1, middleName: 1, lastName: 1, email: 1, type: 1, active: 1, department: 1, v1Id: 1, legacyId: 1, foreignKeyId: 1 } }
     ).toArray();
