@@ -4136,7 +4136,64 @@ app.get('/data/queue-snapshot', async (req, res) => {
   }
 });
 
-// ── Backfill auto-scheduler ─────────────────────────────
+// —— GET /data/queue-status-orders — Orders currently in a given status ——
+// Used by QueueOps drilldown drawer. Returns order-level rows for a status slug
+// from backfill_kpi_segments (open segments only) so we never hit production.
+// Query params:
+//   statusSlug  (required) — the status slug to filter on
+//   orderType   (optional) — 'evaluation' | 'translation'
+//   agingBucket (optional) — 'lt24' | '24-48' | '48-72' | 'gt72'
+app.get('/data/queue-status-orders', async (req, res) => {
+  try {
+    const { statusSlug, orderType, agingBucket } = req.query;
+    if (!statusSlug) return res.status(400).json({ error: 'statusSlug is required' });
+
+    const db = await getConfigDb();
+    const col = db.collection('backfill_kpi_segments');
+
+    // Base filter: open segments in this status
+    const filter = { statusSlug, isOpen: true };
+    if (orderType) filter.orderType = orderType;
+
+    const segments = await col.find(filter)
+      .sort({ segmentStart: 1 }) // oldest first — most urgent at top
+      .limit(2000)
+      .toArray();
+
+    // Calculate wait hours and apply aging bucket filter
+    const now = Date.now();
+    const rows = segments.map(s => {
+      const startMs = s.segmentStart ? new Date(s.segmentStart).getTime() : null;
+      const waitHours = startMs ? Math.round((now - startMs) / 36000) / 100 : null;
+      return {
+        orderSerialNumber: s.orderSerialNumber,
+        orderId: s.orderId,
+        orderType: s.orderType,
+        workerName: s.workerName || null,
+        workerEmail: s.workerEmail || null,
+        departmentName: s.departmentName || null,
+        segmentStart: s.segmentStart,
+        waitHours,
+        statusName: s.statusName,
+        statusSlug: s.statusSlug,
+      };
+    }).filter(r => {
+      if (!agingBucket || r.waitHours === null) return true;
+      const h = r.waitHours;
+      if (agingBucket === 'lt24')  return h < 24;
+      if (agingBucket === '24-48') return h >= 24 && h < 48;
+      if (agingBucket === '48-72') return h >= 48 && h < 72;
+      if (agingBucket === 'gt72')  return h >= 72;
+      return true;
+    });
+
+    res.json({ count: rows.length, statusSlug, statusName: rows[0]?.statusName || statusSlug, rows });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+
 // Fires every 60s to check whether a run is due.
 // IMPORTANT: interval eligibility is anchored to backfillLastRunEnd (run completion),
 // not lastRunAt (run start). This guarantees a full cooldown period between runs
