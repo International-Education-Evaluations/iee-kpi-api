@@ -135,8 +135,8 @@ export function Table({ cols, rows, onRow, empty='No data', maxHeight='550px', s
 }
 
 // ── Filter Bar ───────────────────────────────────────────────
-export function FilterBar({ children }) {
-  return <div className="card-surface px-3 sm:px-4 py-3 flex flex-wrap items-end gap-2 sm:gap-3">{children}</div>;
+export function FilterBar({ children, ...rest }) {
+  return <div className="card-surface px-3 sm:px-4 py-3 flex flex-wrap items-end gap-2 sm:gap-3" {...rest}>{children}</div>;
 }
 export function FilterSelect({ label, value, onChange, options, allLabel='All' }) {
   return (
@@ -164,9 +164,9 @@ export function FilterReset({ onClick }) {
 }
 
 // ── Pills ─────────────────────────────────────────────────────
-export function Pills({ tabs, active, onChange }) {
+export function Pills({ tabs, active, onChange, ...rest }) {
   return (
-    <div className="flex gap-0.5 bg-surface-100 rounded-lg p-1 border border-surface-200 overflow-x-auto">
+    <div className="flex gap-0.5 bg-surface-100 rounded-lg p-1 border border-surface-200 overflow-x-auto" {...rest}>
       {tabs.map(t => <button key={t.key} onClick={() => onChange(t.key)}
         className={`px-2.5 sm:px-3.5 py-1.5 rounded-md text-[11px] sm:text-xs font-semibold transition-all whitespace-nowrap ${active===t.key?'bg-white text-brand-600 shadow-card border border-surface-200':'text-ink-500 hover:text-ink-700 border border-transparent'}`}>
         {t.label}

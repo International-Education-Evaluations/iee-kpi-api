@@ -5,6 +5,7 @@ import { Card, Table, FilterBar, FilterSelect, FilterInput, FilterReset,
          ChartLegend, DrilldownDrawer, OrderLink, Pills,
          TOOLTIP_STYLE, fmt, fmtI, fmtDur, fmtHrs, fmtDateTime } from '../components/UI';
 import { useData } from '../hooks/useData';
+import { userGet, userSet } from '../hooks/useApi';
 
 const BUCKET_COLORS = {
   'Exclude Short':'#94a3b8','Out-of-Range Short':'#F57F17','In-Range':'#16a34a',
@@ -52,12 +53,15 @@ const ORDER_COLS = [
 export default function KPIUsers() {
   const { kpiSegs: segs, kpiLoading: loading, loadKpi } = useData();
   const [sp] = useSearchParams();
-  const [sel, setSel]         = useState(sp.get('worker') || '');
+  // Persist selected worker per-user so navigation away and back restores the selection
+  const [sel, setSelRaw] = useState(() => sp.get('worker') || userGet('kpiusers_sel') || '');
+  const setSel = (v) => { setSelRaw(v); userSet('kpiusers_sel', v); };
   const [fFrom, setFFrom]     = useState('');
   const [fTo, setFTo]         = useState('');
   const [fStatus, setFStatus] = useState('');
   const [fType, setFType]     = useState('');
-  const [view, setView]       = useState('status'); // status | orders | segments
+  const [view, setViewRaw]    = useState(() => userGet('kpiusers_view') || 'status');
+  const setView = (v) => { setViewRaw(v); userSet('kpiusers_view', v); };
   const [drawer, setDrawer]   = useState({ open:false, title:'', subtitle:'', rows:[], cols: SEG_COLS });
 
   const dSel     = useDeferredValue(sel);

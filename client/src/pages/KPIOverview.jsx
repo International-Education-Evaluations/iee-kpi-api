@@ -198,8 +198,95 @@ export default function KPIOverview() {
     });
   }, [filtered, classifySegment]);
 
+  // Full segment detail rows — all filtered segments, newest first
+  const segDetail = useMemo(() =>
+    filtered.map(s => ({ ...s, _bucket: classifySegment(s) }))
+      .sort((a,b) => (b.segmentStart||'').localeCompare(a.segmentStart||'')),
+  [filtered, classifySegment]);
+
   const clearFilters = ()=>{setFType('');setFDept('');setFFrom('');setFTo('');setFWorker('');setFStatus('');};
+  // ── Anomaly / Alert feed ────────────────────────────────────
+  // Runs on raw segs (not filtered) so it surfaces real issues regardless of active filters.
+  const anomalies = useMemo(() => {
+    const flags = [];
+    if (!segs.length || !benchmarks.length) return flags;
+    const now = new Date();
+    const d7  = new Date(now - 7  * 86400000).toISOString();
+    const d14 = new Date(now - 14 * 86400000).toISOString();
+
+    // 1. Workers with XpH drop >30% week-over-week
+    const workerWeeks = {};
+    for (const s of segs) {
+      if (s.isOpen || !s._workerId || !s.durationMinutes || s.durationMinutes <= 0) continue;
+      const id = s._workerId;
+      if (!workerWeeks[id]) workerWeeks[id] = { tw:{ cnt:0, min:0 }, lw:{ cnt:0, min:0 }, name: s.displayName || s.workerName || id };
+      const wk = s.segmentStart >= d7 ? workerWeeks[id].tw : s.segmentStart >= d14 ? workerWeeks[id].lw : null;
+      if (wk) { wk.cnt++; wk.min += s.durationMinutes; }
+    }
+    for (const [id, { tw, lw, name }] of Object.entries(workerWeeks)) {
+      const twXph = tw.min > 0 ? tw.cnt / (tw.min / 60) : 0;
+      const lwXph = lw.min > 0 ? lw.cnt / (lw.min / 60) : 0;
+      if (lwXph > 0.5 && twXph < lwXph * 0.7) {
+        const drop = Math.round((1 - twXph / lwXph) * 100);
+        flags.push({ severity:'warn', type:'xph_drop', title:`XpH drop: ${name}`, detail:`${Math.round(lwXph*100)/100} → ${Math.round(twXph*100)/100} segs/hr (−${drop}% w/w)`, id });
+      }
+    }
+
+    // 2. Open segments stuck >48 hours
+    const cutoff48 = new Date(now - 48 * 3600000).toISOString();
+    const stuckOrders = {};
+    for (const s of segs) {
+      if (!s.isOpen || !s.segmentStart || s.segmentStart >= cutoff48) continue;
+      const key = s.orderSerialNumber || s.statusSlug || 'unknown';
+      if (!stuckOrders[key]) stuckOrders[key] = { serial: s.orderSerialNumber, status: s.statusName || s.statusSlug, since: s.segmentStart };
+    }
+    const stuck = Object.values(stuckOrders);
+    if (stuck.length > 0) {
+      const oldest = stuck.sort((a,b) => a.since.localeCompare(b.since))[0];
+      const hrsAgo = Math.round((now - new Date(oldest.since)) / 3600000);
+      flags.push({ severity:'error', type:'stuck_open', title:`${stuck.length} order${stuck.length>1?'s':''} stuck open >48h`, detail:`Oldest: ${oldest.serial || oldest.status} — ${hrsAgo}h ago`, serial: oldest.serial });
+    }
+
+    // 3. Statuses with In-Range rate below 50% this week (min 10 segments)
+    const statusWeek = {};
+    for (const s of segs) {
+      if (s.isOpen || !s.statusSlug || s.segmentStart < d7) continue;
+      if (!statusWeek[s.statusSlug]) statusWeek[s.statusSlug] = { name: s.statusName||s.statusSlug, total:0, inRange:0 };
+      statusWeek[s.statusSlug].total++;
+      const b = benchmarks.find(x=>x.status===s.statusSlug);
+      if (b && s.durationMinutes >= (b.inRangeMin??1) && s.durationMinutes <= (b.inRangeMax??120))
+        statusWeek[s.statusSlug].inRange++;
+    }
+    for (const [slug, { name, total, inRange }] of Object.entries(statusWeek)) {
+      if (total >= 10 && inRange / total < 0.5) {
+        const pct = Math.round(inRange / total * 100);
+        flags.push({ severity:'warn', type:'low_inrange', title:`Low In-Range: ${name}`, detail:`${pct}% this week (${total} segs)` });
+      }
+    }
+
+    return flags.slice(0, 10); // cap at 10
+  }, [segs, benchmarks]);
+
   const hasFilters = fType||fDept||fWorker||fStatus||fFrom||fTo;
+
+  const segmentCols = [
+    {key:'segmentStart',    label:'Date',       w:130, sortable:true, render:v=>fmtDateTime(v)},
+    {key:'orderSerialNumber',label:'Order',     w:110, sortable:true, render:v=><OrderLink serial={v} />},
+    {key:'workerName',      label:'Worker',     w:140, sortable:true, render:(v,r)=>r.displayName||v||'—'},
+    {key:'departmentName',  label:'Dept',       w:120, sortable:true, render:v=>v||<span className="text-ink-300">—</span>},
+    {key:'statusName',      label:'Status',     w:170, sortable:true},
+    {key:'orderType',       label:'Type',       w:80,  sortable:true, render:v=><span className="capitalize text-[11px] text-ink-500">{v||'—'}</span>},
+    {key:'durationMinutes', label:'Duration',   w:85,  right:true, sortable:true,
+      render:(v,r)=>r.isOpen?<span className="text-amber-600 text-[11px]">Open</span>:fmtDur(v)},
+    {key:'durationSeconds', label:'Sec',        w:65,  right:true, sortable:true,
+      render:v=>v!=null?<span className="font-mono text-[11px] text-ink-400">{Math.round(v)}</span>:'—'},
+    {key:'_bucket',         label:'Bucket',     w:120, sortable:true,
+      render:v=><span className={`text-[10px] font-semibold ${v==='In-Range'?'text-emerald-600':v?.includes('Out-of-Range')?'text-amber-600':v?.includes('Exclude')?'text-red-600':'text-ink-400'}`}>{v||'—'}</span>},
+    {key:'isOpen',          label:'State',      w:65,  sortable:true,
+      render:v=><span className={`badge ${v?'badge-warning':'badge-success'}`}>{v?'Open':'Closed'}</span>},
+    {key:'reportItemCount', label:'Reports',    w:70,  right:true, sortable:true,
+      render:v=>v>0?<span className="font-semibold">{v}</span>:<span className="text-ink-300">—</span>},
+  ];
 
   const statusCols = [
     {key:'status',label:'Status',w:180,sortable:true},
@@ -304,18 +391,58 @@ export default function KPIOverview() {
           </ResponsiveContainer>:<div className="h-48 loading rounded-lg" />}
       </div>
 
+      {/* ── Anomaly / Alert Feed ───────────────────────────── */}
+      {anomalies.length > 0 && (
+        <div className="card-surface overflow-hidden">
+          <div className="px-4 py-3 border-b border-surface-200 flex items-center justify-between">
+            <span className="text-xs font-semibold text-ink-600 flex items-center gap-1.5">
+              <span className="w-2 h-2 rounded-full bg-red-500 animate-pulse inline-block" />
+              Alerts &amp; Anomalies
+            </span>
+            <span className="text-[10px] text-ink-400">{anomalies.length} flag{anomalies.length>1?'s':''}</span>
+          </div>
+          <div className="divide-y divide-surface-100">
+            {anomalies.map((a, i) => (
+              <div key={i} className={`flex items-start gap-3 px-4 py-2.5 ${a.severity==='error'?'bg-red-50/40':a.severity==='warn'?'bg-amber-50/30':''}`}>
+                <span className={`text-sm mt-0.5 ${a.severity==='error'?'text-red-500':'text-amber-500'}`}>
+                  {a.severity==='error'?'⚠':'◉'}
+                </span>
+                <div className="flex-1 min-w-0">
+                  <div className="text-xs font-semibold text-ink-900">{a.title}</div>
+                  <div className="text-[11px] text-ink-500 mt-0.5">{a.detail}</div>
+                </div>
+                {a.serial && (
+                  <a href={`#`} className="text-[11px] text-brand-600 hover:underline shrink-0">View</a>
+                )}
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
       <div className="card-surface overflow-hidden" data-tour="breakdown-table">
         <div className="px-4 py-3 border-b border-surface-200 flex items-center justify-between">
           <span className="text-xs font-semibold text-ink-600">Breakdown</span>
-          <Pills tabs={[{key:'status',label:'By Status'},{key:'worker',label:'By Worker'}]} active={view} onChange={setView} />
+          <Pills tabs={[
+            {key:'status',   label:`By Status (${byStatus.length})`},
+            {key:'worker',   label:`By Worker (${byWorker.length})`},
+            {key:'segments', label:`Segments (${fmtI(filtered.length)})`},
+          ]} active={view} onChange={setView} />
         </div>
-        {view==='status'
-          ? <Table cols={statusCols} rows={byStatus} defaultSort="count" defaultSortDir="desc"
-              searchKey="status" searchPlaceholder="Search statuses…" onRow={openStatusDrawer} />
-          : <Table cols={workerCols} rows={byWorker} defaultSort="count" defaultSortDir="desc"
-              searchKey="worker" searchPlaceholder="Search workers…"
-              onRow={r => r.workerId!=='none' && openWorkerDrawer(r)} />
-        }
+        {view==='status' && (
+          <Table cols={statusCols} rows={byStatus} defaultSort="count" defaultSortDir="desc"
+            searchKey="status" searchPlaceholder="Search statuses…" onRow={openStatusDrawer} />
+        )}
+        {view==='worker' && (
+          <Table cols={workerCols} rows={byWorker} defaultSort="count" defaultSortDir="desc"
+            searchKey="worker" searchPlaceholder="Search workers…"
+            onRow={r => r.workerId!=='none' && openWorkerDrawer(r)} />
+        )}
+        {view==='segments' && (
+          <Table cols={segmentCols} rows={segDetail} defaultSort="segmentStart" defaultSortDir="desc"
+            searchKey="orderSerialNumber" searchPlaceholder="Search order, worker, status…"
+            maxHeight="600px" />
+        )}
       </div>
 
       <DrilldownDrawer

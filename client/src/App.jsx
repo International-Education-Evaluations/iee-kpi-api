@@ -9,6 +9,10 @@ import LoginPage from './pages/LoginPage';
 import InvitePage from './pages/InvitePage';
 import KPIOverview from './pages/KPIOverview';
 import KPIUsers from './pages/KPIUsers';
+import KPIScorecard from './pages/KPIScorecard';
+import OrderTracker from './pages/OrderTracker';
+import DeptComparison from './pages/DeptComparison';
+import ShiftHeatmap from './pages/ShiftHeatmap';
 import QCOverview from './pages/QCOverview';
 import QueueOps from './pages/QueueOps';
 import ChatPage from './pages/ChatPage';
@@ -73,6 +77,10 @@ export default function App() {
         <Route element={<AuthGuard />}>
           <Route path="/" element={<KPIOverview />} />
           <Route path="/kpi/users" element={<KPIUsers />} />
+          <Route path="/kpi/scorecard" element={<KPIScorecard />} />
+          <Route path="/kpi/departments" element={<DeptComparison />} />
+          <Route path="/kpi/heatmap" element={<ShiftHeatmap />} />
+          <Route path="/orders" element={<OrderTracker />} />
           <Route path="/qc" element={<QCOverview />} />
           <Route path="/queue" element={<QueueOps />} />
           <Route path="/chat" element={<ChatPage />} />

@@ -4439,6 +4439,95 @@ function startBackfillScheduler() {
 // REPORT BUILDER — Server-side aggregation against backfill data
 // ═══════════════════════════════════════════════════════════
 
+// —— GET /data/order/:serialNumber — Full order lifecycle ────
+// Returns all segments + QC events for a single order serial number.
+// Used by the Order Tracker page for root-cause investigation.
+app.get('/data/order/:serialNumber', async (req, res) => {
+  try {
+    const serial = (req.params.serialNumber || '').trim();
+    if (!serial) return res.status(400).json({ error: 'serialNumber required' });
+
+    const db = await getConfigDb();
+
+    const [segments, qcEvents] = await Promise.all([
+      db.collection('backfill_kpi_segments')
+        .find({ orderSerialNumber: serial })
+        .sort({ segmentStart: 1 })
+        .toArray(),
+      db.collection('backfill_qc_events')
+        .find({ orderSerialNumber: serial })
+        .sort({ qcCreatedAt: 1 })
+        .toArray(),
+    ]);
+
+    if (!segments.length && !qcEvents.length) {
+      return res.status(404).json({ error: `No data found for order ${serial}` });
+    }
+
+    // Build timeline: merge segments + QC events sorted chronologically
+    const timeline = [
+      ...segments.map(s => ({
+        type: 'segment',
+        at: s.segmentStart,
+        end: s.segmentEnd,
+        statusName: s.statusName,
+        statusSlug: s.statusSlug,
+        workerName: s.workerName,
+        workerEmail: s.workerEmail,
+        workerUserId: s.workerUserId,
+        durationMinutes: s.durationMinutes,
+        durationSeconds: s.durationSeconds,
+        isOpen: s.isOpen,
+        orderType: s.orderType,
+        departmentName: s.departmentName,
+        changedByName: s.changedByName,
+        isErrorReporting: s.isErrorReporting,
+        reportItemCount: s.reportItemCount,
+        reportItemName: s.reportItemName,
+      })),
+      ...qcEvents.map(e => ({
+        type: 'qc',
+        at: e.qcCreatedAt,
+        errorType: e.errorType,
+        isFixedIt: e.isFixedIt,
+        isKickItBack: e.isKickItBack,
+        reporterName: e.reporterName,
+        accountableName: e.accountableName,
+        issueName: e.issueName,
+        departmentName: e.departmentName,
+        statusAtQcName: e.statusAtQcName,
+      })),
+    ].sort((a, b) => (a.at || '').localeCompare(b.at || ''));
+
+    // Summary stats
+    const closedSegs = segments.filter(s => !s.isOpen && s.durationMinutes != null);
+    const totalMinutes = closedSegs.reduce((a, s) => a + (s.durationMinutes || 0), 0);
+    const uniqueStatuses = [...new Set(segments.map(s => s.statusName).filter(Boolean))];
+    const uniqueWorkers  = [...new Set(segments.map(s => s.workerEmail || s.workerName).filter(Boolean))];
+
+    res.json({
+      serialNumber: serial,
+      orderType: segments[0]?.orderType || null,
+      totalSegments: segments.length,
+      openSegments: segments.filter(s => s.isOpen).length,
+      totalQcEvents: qcEvents.length,
+      fixedItCount: qcEvents.filter(e => e.isFixedIt).length,
+      kickBackCount: qcEvents.filter(e => e.isKickItBack).length,
+      totalMinutes: Math.round(totalMinutes * 10) / 10,
+      uniqueStatuses,
+      uniqueWorkers: uniqueWorkers.length,
+      firstSeen: segments[0]?.segmentStart || null,
+      lastSeen: segments[segments.length - 1]?.segmentEnd || segments[segments.length - 1]?.segmentStart || null,
+      timeline,
+      segments,
+      qcEvents,
+    });
+  } catch (err) {
+    console.error('Order tracker error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // —— POST /reports/query — Execute a report ——————————————
 app.post('/reports/query', async (req, res) => {
   try {
@@ -4823,12 +4912,73 @@ app.post('/reports/export', async (req, res) => {
   }
 });
 
+// —— AI Conversation history (per-user) ──────────────────────
+app.get('/ai/conversations', async (req, res) => {
+  try {
+    const db = await getConfigDb();
+    const userId = req.user?.id || req.user?._id || req.user?.email;
+    if (!userId) return res.status(401).json({ error: 'Auth required' });
+    const convos = await db.collection('dashboard_ai_conversations')
+      .find({ userId }).sort({ updatedAt: -1 }).limit(50)
+      .project({ title:1, createdAt:1, updatedAt:1, messageCount:1, preview:1 }).toArray();
+    res.json({ count: convos.length, conversations: convos });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+app.get('/ai/conversations/:id', async (req, res) => {
+  try {
+    const db = await getConfigDb();
+    const userId = req.user?.id || req.user?._id || req.user?.email;
+    const convo = await db.collection('dashboard_ai_conversations').findOne({ _id: new ObjectId(req.params.id), userId });
+    if (!convo) return res.status(404).json({ error: 'Not found' });
+    res.json(convo);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+app.post('/ai/conversations', async (req, res) => {
+  try {
+    const { title, messages } = req.body;
+    if (!messages?.length) return res.status(400).json({ error: 'messages required' });
+    const db = await getConfigDb();
+    const userId = req.user?.id || req.user?._id || req.user?.email;
+    if (!userId) return res.status(401).json({ error: 'Auth required' });
+    const preview = messages.find(m=>m.role==='user')?.content?.substring(0,100)||'';
+    const doc = { userId, title:title||preview.substring(0,60)||'New conversation', messages, preview, messageCount:messages.length, createdAt:new Date(), updatedAt:new Date() };
+    const result = await db.collection('dashboard_ai_conversations').insertOne(doc);
+    res.json({ success:true, id:result.insertedId, conversation:doc });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+app.put('/ai/conversations/:id', async (req, res) => {
+  try {
+    const { title, messages } = req.body;
+    const db = await getConfigDb();
+    const userId = req.user?.id || req.user?._id || req.user?.email;
+    const preview = messages?.find(m=>m.role==='user')?.content?.substring(0,100)||'';
+    await db.collection('dashboard_ai_conversations').updateOne(
+      { _id:new ObjectId(req.params.id), userId },
+      { $set:{ ...(title&&{title}), ...(messages&&{messages,messageCount:messages.length,preview}), updatedAt:new Date() } }
+    );
+    res.json({ success:true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+app.delete('/ai/conversations/:id', async (req, res) => {
+  try {
+    const db = await getConfigDb();
+    const userId = req.user?.id || req.user?._id || req.user?.email;
+    await db.collection('dashboard_ai_conversations').deleteOne({ _id:new ObjectId(req.params.id), userId });
+    res.json({ success:true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 // —— Saved Reports CRUD ————————————————————————————————
 app.get('/reports/saved', async (req, res) => {
   try {
     const db = await getConfigDb();
+    const userId = req.user?.id || req.user?._id || req.user?.email || null;
+    // Return only this user's reports. Legacy reports without userId shown to all.
+    const filter = userId
+      ? { $or: [{ userId }, { userId: { $exists: false } }] }
+      : {};
     const reports = await db.collection('dashboard_saved_reports')
-      .find({}).sort({ updatedAt: -1 }).toArray();
+      .find(filter).sort({ updatedAt: -1 }).toArray();
     res.json({ count: reports.length, reports });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -4838,7 +4988,8 @@ app.post('/reports/saved', async (req, res) => {
     const { name, config } = req.body;
     if (!name || !config) return res.status(400).json({ error: 'name and config required' });
     const db = await getConfigDb();
-    const doc = { name, config, createdBy: req.user?.name || 'unknown', createdAt: new Date(), updatedAt: new Date() };
+    const userId = req.user?.id || req.user?._id || req.user?.email || null;
+    const doc = { name, config, userId, createdBy: req.user?.name || 'unknown', createdAt: new Date(), updatedAt: new Date() };
     const result = await db.collection('dashboard_saved_reports').insertOne(doc);
     res.json({ success: true, id: result.insertedId, report: doc });
   } catch (err) { res.status(500).json({ error: err.message }); }
@@ -4847,7 +4998,11 @@ app.post('/reports/saved', async (req, res) => {
 app.delete('/reports/saved/:id', async (req, res) => {
   try {
     const db = await getConfigDb();
-    await db.collection('dashboard_saved_reports').deleteOne({ _id: new ObjectId(req.params.id) });
+    const userId = req.user?.id || req.user?._id || req.user?.email || null;
+    // Only allow deleting own reports (or legacy reports without userId)
+    const filter = { _id: new ObjectId(req.params.id) };
+    if (userId) filter.$or = [{ userId }, { userId: { $exists: false } }];
+    await db.collection('dashboard_saved_reports').deleteOne(filter);
     res.json({ success: true });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -4908,6 +5063,8 @@ app.use((req, res) => {
       '/glossary', '/email/schedules', '/email/send-now',
       '/backfill/run', '/backfill/status', '/backfill/settings', '/backfill/history',
       '/data/kpi-segments', '/data/qc-events', '/data/users',
+      '/data/order',
+      '/ai/conversations',
       '/reports/query', '/reports/filters', '/reports/export', '/reports/saved',
       '/user/layout/:page',
       '/users', '/indexes'

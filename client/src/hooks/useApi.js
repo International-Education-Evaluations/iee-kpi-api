@@ -7,7 +7,31 @@ export const getToken = () => localStorage.getItem('iee_t') || '';
 export const setToken = t => localStorage.setItem('iee_t', t);
 export const getUser = () => JSON.parse(localStorage.getItem('iee_u') || 'null');
 export const setUser = u => localStorage.setItem('iee_u', JSON.stringify(u));
-export const clearAuth = () => { localStorage.removeItem('iee_t'); localStorage.removeItem('iee_u'); };
+export const clearAuth = () => {
+  // Remove auth but preserve user-scoped state keys so they survive re-login
+  const user = getUser();
+  localStorage.removeItem('iee_t');
+  localStorage.removeItem('iee_u');
+  // Keep user-scoped keys: they'll be unreachable until re-login anyway
+};
+
+// ── Per-user localStorage ────────────────────────────────────────────────────
+// All user-specific preferences (selected worker, chat history, etc.) are
+// scoped to the authenticated user's ID so 10 users on the same browser
+// profile don't share or overwrite each other's state.
+function getUserId() {
+  const u = getUser();
+  return u?.id || u?._id || u?.email || 'anon';
+}
+export function userGet(key) {
+  try { return JSON.parse(localStorage.getItem(`iee:${getUserId()}:${key}`) || 'null'); } catch { return null; }
+}
+export function userSet(key, value) {
+  try { localStorage.setItem(`iee:${getUserId()}:${key}`, JSON.stringify(value)); } catch {}
+}
+export function userDel(key) {
+  try { localStorage.removeItem(`iee:${getUserId()}:${key}`); } catch {}
+}
 export const isAuth = () => {
   const t = getToken();
   const u = getUser();

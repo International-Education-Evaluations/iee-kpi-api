@@ -1,163 +1,179 @@
-import React, { useState, useEffect, useCallback, useRef, useMemo } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { createPortal } from 'react-dom';
 import { useNavigate, useLocation } from 'react-router-dom';
 
-// ── Tour step definitions ────────────────────────────────────
-// selector: CSS selector for the highlighted element (null = centre-screen modal)
-// route: navigate here before showing this step
-// title / body: content
-// position: 'bottom' | 'top' | 'left' | 'right' | 'center'
+// ── Tour step definitions ────────────────────────────────────────────────────
+// Each step navigates to a route, waits for render, then highlights a selector.
+// selector: null = centred modal (no spotlight)
+// position: where the tooltip appears relative to the highlighted element
 const TOUR_STEPS = [
   {
     route: '/',
     selector: null,
     position: 'center',
-    title: '👋 Welcome to IEE Ops Dashboard',
-    body: "This quick tour will walk you through every section. You can exit at any time by pressing Escape or clicking outside. Let's go!",
+    title: '👋 Welcome to IEE Ops',
+    body: "This 2-minute tour walks through every section of the dashboard. Press Esc or click outside to exit at any time.",
   },
   {
     route: '/',
     selector: '[data-tour="kpi-overview-title"]',
     position: 'bottom',
     title: '📊 KPI Overview',
-    body: 'Your top-level performance view — segments processed, closed/open counts, average duration, In-Range rate, and unique orders. Covers the last 60 days.',
+    body: 'Your main performance view — 95k+ segments covering the last 60 days. Segments, closed/open counts, avg duration, In-Range rate, and unique orders.',
   },
   {
     route: '/',
     selector: '[data-tour="filter-bar"]',
     position: 'bottom',
     title: '🔍 Filters',
-    body: 'Narrow down by Department, Order Type, Status, Worker, or date range. All charts and tables update instantly. Use "Clear filters" to reset.',
+    body: 'Filter by Department, Order Type, Status, Worker, or date range. All charts and tables respond instantly. "Clear filters" resets everything.',
   },
   {
     route: '/',
     selector: '[data-tour="metric-cards"]',
     position: 'bottom',
     title: '📈 Metric Cards',
-    body: 'Key performance numbers at a glance. The ↑↓ arrow shows week-over-week volume change. Cards update to reflect your active filters.',
+    body: 'Live KPI numbers at a glance. The ↑↓ arrow shows week-over-week volume change. All cards reflect your active filters.',
   },
   {
     route: '/',
     selector: '[data-tour="bucket-chart"]',
     position: 'right',
     title: '🪣 5-Bucket Classification',
-    body: 'Every closed segment is classified against your benchmark thresholds: Exclude Short → OOR Short → In-Range → OOR Long → Exclude Long. The In-Range % is your primary quality KPI.',
+    body: 'Every closed segment is classified against your benchmark thresholds: Exclude Short → OOR Short → In-Range → OOR Long → Exclude Long. In-Range % is your primary quality KPI.',
   },
   {
     route: '/',
     selector: '[data-tour="breakdown-table"]',
     position: 'top',
-    title: '🖱️ Drilldown Tables',
-    body: 'Click any row in "By Status" or "By Worker" to open a slide-over drawer with individual order-level segments. All columns are sortable — click any header.',
+    title: '📋 Breakdown Tabs',
+    body: 'Three tabs: By Status, By Worker, and Segments. Click any status or worker row to open a detailed drilldown. The Segments tab shows every individual segment with full detail.',
   },
   {
     route: '/kpi/users',
     selector: '[data-tour="user-drilldown-title"]',
     position: 'bottom',
     title: '👤 User Drill-Down',
-    body: 'Select any worker to see their full performance breakdown — XpH trend, status breakdown, every order they worked, and individual segment detail with durations down to the second.',
+    body: 'Select any worker to see their XpH trend, daily volume, status breakdown, every order worked, and segment-level detail. Your last selected worker is remembered across navigation.',
+  },
+  {
+    route: '/kpi/scorecard',
+    selector: '[data-tour="scorecard-title"]',
+    position: 'bottom',
+    title: '🎯 Performance Scorecard',
+    body: 'Every worker side-by-side — XpH vs benchmark target, In-Range %, attainment badge (green/amber/red), level, and total hours. Default sort surfaces lowest attainment first.',
+  },
+  {
+    route: '/kpi/departments',
+    selector: '[data-tour="dept-comparison-title"]',
+    position: 'bottom',
+    title: '🏢 Department Comparison',
+    body: 'Side-by-side department performance — XpH, In-Range %, segment volume, avg duration, and QC kick-back rate. Switch the chart metric with the buttons above the chart.',
+  },
+  {
+    route: '/kpi/heatmap',
+    selector: '[data-tour="heatmap-title"]',
+    position: 'bottom',
+    title: '🌡️ Shift Heatmap',
+    body: 'Processing patterns by hour × day-of-week. See when your team is most active and whether quality or throughput shifts at certain times. Switch between Volume, Avg Duration, and XpH.',
   },
   {
     route: '/qc',
     selector: '[data-tour="qc-title"]',
     position: 'bottom',
     title: '✅ QC Overview',
-    body: 'All quality control events. Fixed It vs Kick Back rates by department, issue type, and individual user. Use the date range filter to scope to any period. Click any row to drill in.',
+    body: 'All quality control events — Fixed It vs Kick Back rates by department, issue type, and individual user. Filter by date range to scope to any period.',
   },
   {
     route: '/queue',
     selector: '[data-tour="queue-title"]',
     position: 'bottom',
     title: '⏳ Queue Operations',
-    body: 'Live snapshot of all active orders by status — waiting counts, aging buckets, oldest orders. Click any status row to see the individual orders currently sitting in it.',
+    body: 'Live snapshot of all open orders by status — waiting counts, aging buckets, oldest order. Click any row to see the individual orders currently sitting in that status.',
   },
   {
-    route: '/queue',
-    selector: '[data-tour="queue-tabs"]',
+    route: '/orders',
+    selector: '[data-tour="order-tracker-title"]',
     position: 'bottom',
-    title: '📜 Wait Summary',
-    body: '"Wait Summary (2024+)" shows historical throughput — median, avg, P75, P90 wait times per status over 90 days. Useful for identifying chronic bottleneck statuses.',
+    title: '🔍 Order Tracker',
+    body: 'Paste any order serial number and see its complete processing lifecycle — every status, who worked it, how long each step took, and any QC events attached.',
   },
   {
     route: '/reports',
     selector: '[data-tour="report-builder-title"]',
     position: 'bottom',
     title: '🛠️ Report Builder',
-    body: 'Build custom queries across KPI segments and QC events. Choose any metric, group-by dimension, and chart type. Export to CSV for offline analysis.',
+    body: 'Build custom reports across KPI and QC data. Choose any metric (XpH, In-Range %, kick-back rate…), group by dimension, pick a chart type, and export to CSV.',
   },
   {
     route: '/chat',
     selector: '[data-tour="chat-title"]',
     position: 'bottom',
     title: '🤖 AI Assistant',
-    body: 'Ask questions in plain English — "Who had the highest XpH last week?", "Are there any statuses with >48hr orders?", "Show me QC trends by department". Powered by Claude with live data access.',
+    body: 'Ask questions in plain English — "Who had the highest XpH last week?", "Show QC trends by department", "Are there any statuses with >48hr open orders?". Conversations are saved per user.',
   },
   {
     route: '/settings',
     selector: '[data-tour="settings-title"]',
     position: 'bottom',
     title: '⚙️ Configuration',
-    body: 'Set XpH benchmarks per status (L0–L5), configure 5-bucket classification thresholds, set production hours, and assign user levels. All changes are audited.',
-  },
-  {
-    route: '/admin/users',
-    selector: '[data-tour="admin-users-title"]',
-    position: 'bottom',
-    title: '👥 User Management',
-    body: 'Create users, send invite emails, assign roles (admin/manager/viewer), and manage API keys. Invite links expire after 7 days and can be resent.',
-  },
-  {
-    route: '/admin/backfill',
-    selector: '[data-tour="backfill-title"]',
-    position: 'bottom',
-    title: '🔄 Data Backfill',
-    body: 'Controls for the data sync engine. Trigger an immediate incremental backfill, run a full re-seed, or adjust the auto-refresh interval. All dashboard data reads from the backfill cache — never from production directly.',
+    body: 'Set XpH benchmarks per status (L0–L5), configure 5-bucket thresholds, set production hours, and assign user levels. All changes are immediately reflected in all views.',
   },
   {
     route: '/',
     selector: null,
     position: 'center',
     title: "🎉 You're all set!",
-    body: "That covers the full dashboard. Your data refreshes automatically every few minutes. If you ever want this tour again, click \"Take a tour\" in the sidebar. Happy analyzing!",
+    body: "That covers the full dashboard. Data refreshes automatically every few minutes. Click \"Take a tour\" in the sidebar any time to replay this. Happy analyzing!",
   },
 ];
 
-const STORAGE_KEY = 'iee_tour_completed';
+const STORAGE_KEY = 'iee_tour_v2_completed';
 
-// ── Spotlight overlay ────────────────────────────────────────
-function TourOverlay({ rect, children }) {
-  const pad = 8;
-  const hasRect = rect && rect.width > 0;
+// ── SVG spotlight overlay ────────────────────────────────────────────────────
+function TourOverlay({ rect, onBackdropClick, children }) {
+  const pad = 10;
+  const hasRect = rect && rect.width > 4;
 
   return createPortal(
-    <div className="fixed inset-0 z-[9000] pointer-events-none" style={{ isolation: 'isolate' }}>
-      {/* Dark backdrop with cutout */}
+    <div className="fixed inset-0 z-[9900] pointer-events-none" style={{ isolation: 'isolate' }}>
       {hasRect ? (
-        <svg className="absolute inset-0 w-full h-full pointer-events-auto" style={{ cursor:'default' }}>
+        <svg
+          className="absolute inset-0 w-full h-full pointer-events-auto"
+          style={{ cursor: 'default' }}
+          onClick={onBackdropClick}
+        >
           <defs>
-            <mask id="tour-mask">
+            <mask id="tour-spotlight-mask">
               <rect width="100%" height="100%" fill="white" />
               <rect
-                x={rect.left - pad} y={rect.top - pad}
-                width={rect.width + pad*2} height={rect.height + pad*2}
+                x={Math.max(0, rect.left - pad)}
+                y={Math.max(0, rect.top - pad)}
+                width={rect.width + pad * 2}
+                height={rect.height + pad * 2}
                 rx="8" fill="black"
               />
             </mask>
           </defs>
-          <rect width="100%" height="100%" fill="rgba(0,0,0,0.55)" mask="url(#tour-mask)" />
+          <rect width="100%" height="100%" fill="rgba(0,0,0,0.6)" mask="url(#tour-spotlight-mask)" />
           {/* Highlight ring */}
           <rect
-            x={rect.left - pad} y={rect.top - pad}
-            width={rect.width + pad*2} height={rect.height + pad*2}
-            rx="8" fill="none" stroke="#00aeef" strokeWidth="2.5"
+            x={Math.max(0, rect.left - pad)}
+            y={Math.max(0, rect.top - pad)}
+            width={rect.width + pad * 2}
+            height={rect.height + pad * 2}
+            rx="8" fill="none"
+            stroke="#00aeef" strokeWidth="2"
             className="pointer-events-none"
           />
         </svg>
       ) : (
-        <div className="absolute inset-0 bg-black/55 pointer-events-auto" />
+        <div
+          className="absolute inset-0 bg-black/60 pointer-events-auto"
+          onClick={onBackdropClick}
+        />
       )}
-      {/* Tooltip card — pointer-events on */}
-      <div className="pointer-events-auto">
+      <div className="pointer-events-auto absolute" style={{ zIndex: 9910 }}>
         {children}
       </div>
     </div>,
@@ -165,123 +181,156 @@ function TourOverlay({ rect, children }) {
   );
 }
 
-// ── Tooltip position calculator ───────────────────────────────
-function getTooltipStyle(rect, position, tooltipW = 360, tooltipH = 200) {
-  const pad = 16;
+// ── Tooltip position calculator ──────────────────────────────────────────────
+function getTooltipStyle(rect, position, w = 380) {
   const vw = window.innerWidth;
   const vh = window.innerHeight;
+  const h  = 220; // estimated tooltip height
+  const sp = 14;  // spacing from element
+  const pad = 12;
 
   if (!rect || position === 'center') {
     return {
       position: 'fixed',
       top: '50%', left: '50%',
       transform: 'translate(-50%, -50%)',
-      width: Math.min(tooltipW, vw - 32),
+      width: Math.min(w, vw - 32),
+      maxWidth: 420,
     };
   }
 
   let top, left;
-  const sp = 16; // spacing from element
+  const cx = rect.left + rect.width / 2;
+  const cy = rect.top  + rect.height / 2;
 
   if (position === 'bottom') {
-    top = rect.bottom + sp + 8;
-    left = rect.left + rect.width/2 - tooltipW/2;
+    top  = rect.bottom + sp;
+    left = cx - w / 2;
   } else if (position === 'top') {
-    top = rect.top - tooltipH - sp;
-    left = rect.left + rect.width/2 - tooltipW/2;
+    top  = rect.top - h - sp;
+    left = cx - w / 2;
   } else if (position === 'right') {
-    top = rect.top + rect.height/2 - tooltipH/2;
+    top  = cy - h / 2;
     left = rect.right + sp;
   } else if (position === 'left') {
-    top = rect.top + rect.height/2 - tooltipH/2;
-    left = rect.left - tooltipW - sp;
+    top  = cy - h / 2;
+    left = rect.left - w - sp;
+  } else {
+    top  = rect.bottom + sp;
+    left = cx - w / 2;
   }
 
-  // Clamp to viewport
-  left = Math.max(pad, Math.min(left, vw - tooltipW - pad));
-  top  = Math.max(pad, Math.min(top,  vh - tooltipH - pad));
+  // Flip if out of viewport
+  if (position === 'bottom' && top + h > vh - pad) top = rect.top - h - sp;
+  if (position === 'top'    && top < pad)           top = rect.bottom + sp;
+  if (position === 'right'  && left + w > vw - pad) left = rect.left - w - sp;
+  if (position === 'left'   && left < pad)           left = rect.right + sp;
 
-  return { position: 'fixed', top, left, width: tooltipW };
+  // Clamp to viewport
+  left = Math.max(pad, Math.min(left, vw - w - pad));
+  top  = Math.max(pad, Math.min(top, vh - h - pad));
+
+  return { position: 'fixed', top, left, width: w };
 }
 
-// ── Main Tour component ───────────────────────────────────────
+// ── Main Tour component ──────────────────────────────────────────────────────
 export default function Tour({ onClose }) {
-  const [step, setStep] = useState(0);
-  const [rect, setRect] = useState(null);
+  const [step, setStep]       = useState(0);
+  const [rect, setRect]       = useState(null);
   const [visible, setVisible] = useState(false);
-  const navigate = useNavigate();
-  const location = useLocation();
-  const timerRef = useRef(null);
-  const current = TOUR_STEPS[step];
+  const navigate   = useNavigate();
+  const location   = useLocation();
+  const timerRef   = useRef(null);
+  const current    = TOUR_STEPS[step];
 
-  const measureElement = useCallback(() => {
-    if (!current.selector) { setRect(null); setVisible(true); return; }
-    // Wait for navigation + render, then measure
-    const attempt = (tries = 0) => {
-      const el = document.querySelector(current.selector);
-      if (el) {
-        const r = el.getBoundingClientRect();
-        setRect(r);
-        setVisible(true);
+  // Measure target element, retrying until it appears
+  const measureElement = useCallback((selector, attempts = 0) => {
+    clearTimeout(timerRef.current);
+    if (!selector) { setRect(null); setVisible(true); return; }
+
+    const el = document.querySelector(selector);
+    if (el) {
+      const r = el.getBoundingClientRect();
+      // Confirm element is actually visible (not off-screen or zero-size)
+      if (r.width > 2 && r.height > 2 && r.top < window.innerHeight && r.bottom > 0) {
+        // Scroll element into view smoothly, then measure after scroll settles
         el.scrollIntoView({ behavior: 'smooth', block: 'center', inline: 'nearest' });
-      } else if (tries < 12) {
-        timerRef.current = setTimeout(() => attempt(tries + 1), 150);
-      } else {
-        setRect(null); setVisible(true); // fallback: show tooltip anyway
+        timerRef.current = setTimeout(() => {
+          const r2 = el.getBoundingClientRect();
+          setRect(r2);
+          setVisible(true);
+        }, 300);
+        return;
       }
-    };
-    setVisible(false);
-    timerRef.current = setTimeout(() => attempt(), 100);
-  }, [current]);
+    }
+
+    if (attempts < 15) {
+      timerRef.current = setTimeout(() => measureElement(selector, attempts + 1), 150);
+    } else {
+      // Give up — show tooltip in center without spotlight
+      setRect(null);
+      setVisible(true);
+    }
+  }, []);
 
   useEffect(() => {
     clearTimeout(timerRef.current);
-    if (current.route && location.pathname !== current.route) {
-      navigate(current.route);
-      timerRef.current = setTimeout(measureElement, 400);
-    } else {
-      measureElement();
-    }
-  }, [step]); // eslint-disable-line
+    setVisible(false);
+    setRect(null);
 
+    const targetRoute = current.route;
+    const onCorrectRoute = location.pathname === targetRoute;
+
+    if (!onCorrectRoute) {
+      navigate(targetRoute);
+      // Wait longer after navigation for React to render the new page
+      timerRef.current = setTimeout(() => measureElement(current.selector), 600);
+    } else {
+      timerRef.current = setTimeout(() => measureElement(current.selector), 120);
+    }
+  }, [step]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Keyboard nav
   useEffect(() => {
-    const handler = (e) => { if (e.key === 'Escape') onClose(); };
+    const handler = (e) => {
+      if (e.key === 'Escape') onClose();
+      if (e.key === 'ArrowRight' && step < TOUR_STEPS.length - 1) setStep(s => s + 1);
+      if (e.key === 'ArrowLeft'  && step > 0) setStep(s => s - 1);
+    };
     window.addEventListener('keydown', handler);
     return () => window.removeEventListener('keydown', handler);
-  }, [onClose]);
+  }, [onClose, step]);
 
   useEffect(() => () => clearTimeout(timerRef.current), []);
 
   const prev = () => setStep(s => Math.max(0, s - 1));
   const next = () => {
     if (step < TOUR_STEPS.length - 1) setStep(s => s + 1);
-    else { localStorage.setItem(STORAGE_KEY, '1'); onClose(); }
+    else finish();
   };
-  const skip = () => { localStorage.setItem(STORAGE_KEY, '1'); onClose(); };
+  const finish = () => { localStorage.setItem(STORAGE_KEY, '1'); onClose(); };
+  const skip   = () => { localStorage.setItem(STORAGE_KEY, '1'); onClose(); };
 
   const tooltipStyle = getTooltipStyle(rect, current.position);
   const isLast = step === TOUR_STEPS.length - 1;
+  const pct = Math.round((step + 1) / TOUR_STEPS.length * 100);
 
   if (!visible) return null;
 
   return (
-    <TourOverlay rect={rect}>
-      <div style={tooltipStyle} className="bg-white rounded-2xl shadow-2xl overflow-hidden border border-surface-200">
+    <TourOverlay rect={rect} onBackdropClick={skip}>
+      <div style={{ ...tooltipStyle }} className="bg-white rounded-2xl shadow-2xl overflow-hidden border border-surface-200">
         {/* Progress bar */}
         <div className="h-1 bg-surface-100">
-          <div
-            className="h-full bg-brand-500 transition-all duration-300"
-            style={{ width: `${((step + 1) / TOUR_STEPS.length) * 100}%` }}
-          />
+          <div className="h-full bg-brand-500 transition-all duration-400 ease-out" style={{ width: `${pct}%` }} />
         </div>
 
         {/* Header */}
         <div className="flex items-start justify-between px-5 pt-4 pb-2">
-          <div className="text-sm font-display font-bold text-ink-900 leading-snug pr-4">
+          <h3 className="text-sm font-display font-bold text-ink-900 leading-snug pr-4 flex-1">
             {current.title}
-          </div>
-          <button onClick={skip}
-            className="text-ink-300 hover:text-ink-600 text-lg leading-none mt-0.5 shrink-0 transition-colors">
+          </h3>
+          <button onClick={skip} className="text-ink-300 hover:text-ink-600 text-xl leading-none mt-[-2px] shrink-0 transition-colors">
             ×
           </button>
         </div>
@@ -292,13 +341,12 @@ export default function Tour({ onClose }) {
         </div>
 
         {/* Footer */}
-        <div className="px-5 py-3 border-t border-surface-100 flex items-center justify-between bg-surface-50">
+        <div className="px-5 py-3 border-t border-surface-100 flex items-center justify-between bg-surface-50/80">
           <span className="text-[11px] text-ink-400">
             {step + 1} / {TOUR_STEPS.length}
           </span>
           <div className="flex items-center gap-2">
-            <button onClick={skip}
-              className="px-3 py-1.5 text-xs text-ink-400 hover:text-ink-600 transition-colors">
+            <button onClick={skip} className="px-3 py-1.5 text-xs text-ink-400 hover:text-ink-600 transition-colors">
               Skip tour
             </button>
             {step > 0 && (
@@ -308,24 +356,28 @@ export default function Tour({ onClose }) {
               </button>
             )}
             <button onClick={next}
-              className="px-4 py-1.5 text-xs bg-brand-500 hover:bg-brand-600 text-ink-900 font-semibold rounded-lg transition-colors">
+              className="px-4 py-1.5 text-xs bg-brand-500 hover:bg-brand-600 text-white font-semibold rounded-lg transition-colors">
               {isLast ? 'Finish ✓' : 'Next →'}
             </button>
           </div>
+        </div>
+
+        {/* Keyboard hint */}
+        <div className="px-5 py-1.5 bg-surface-50/50 border-t border-surface-100">
+          <span className="text-[10px] text-ink-300">← → arrow keys to navigate · Esc to close</span>
         </div>
       </div>
     </TourOverlay>
   );
 }
 
-// ── Hook: auto-start tour for first-time users ────────────────
+// ── Auto-start hook ──────────────────────────────────────────────────────────
 export function useTourAutoStart() {
   const [show, setShow] = useState(false);
   useEffect(() => {
-    // Small delay so the dashboard finishes rendering first
     const t = setTimeout(() => {
       if (!localStorage.getItem(STORAGE_KEY)) setShow(true);
-    }, 2000);
+    }, 2500);
     return () => clearTimeout(t);
   }, []);
   return [show, setShow];
