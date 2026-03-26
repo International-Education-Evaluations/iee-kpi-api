@@ -2463,6 +2463,16 @@ app.post('/ai/chat', aiRateLimit, async (req, res) => {
             days: { type: 'number', description: 'Days to scan (max 30, default 7).' }
           }
         }
+      },
+      {
+        name: 'fetch_order_demand',
+        description: 'Fetch order arrival demand patterns and SLA analysis from the staffing forecast data. Returns: daily order volume trend, peak hours and peak days of the week, order counts by hour/day heatmap, SLA turnaround distributions (P50/P75/P90) by order type and process time, bottleneck statuses with high queue wait times, and recommended SLA targets. Use for questions about order volume, when orders arrive, how long orders take, SLA performance, bottlenecks, or staffing needs.',
+        input_schema: { type: 'object', properties: {} }
+      },
+      {
+        name: 'fetch_staffing_model',
+        description: 'Fetch the staffing model — how many concurrent staff are needed at each hour based on order arrival demand and team XpH throughput. Returns required staff per hour, XpH (throughput) per status, weighted team XpH, and per-status staffing calculations. Use for questions about how many people are needed, shift planning, peak staffing hours, or throughput by status.',
+        input_schema: { type: 'object', properties: {} }
       }
     ];
 
@@ -2646,6 +2656,62 @@ app.post('/ai/chat', aiRateLimit, async (req, res) => {
                   unattributedSegments: { count: unattributed, percentage: segments.length ? Math.round(unattributed / segments.length * 1000) / 10 : 0, description: 'Segments with no assigned worker' }
                 },
                 qcSummary: { totalEvents: qc.totalEvents || 0, topDepartments: (qc.byDepartment || []).slice(0, 5) }
+              };
+              break;
+            }
+            case 'fetch_order_demand': {
+              const db2 = await getConfigDb();
+              const [slaRes, trendRes] = await Promise.all([
+                fetch(`http://localhost:${CONFIG.PORT}/data/forecast/sla-analysis`, {
+                  headers: { 'Authorization': req.headers['authorization'] || '' }
+                }).then(r => r.json()).catch(() => ({})),
+                fetch(`http://localhost:${CONFIG.PORT}/data/forecast/arrivals`, {
+                  headers: { 'Authorization': req.headers['authorization'] || '' }
+                }).then(r => r.json()).catch(() => ({})),
+              ]);
+              const slots = trendRes.slots || [];
+              const totalByDow = [0,1,2,3,4,5,6].map(d =>
+                slots.filter(s => s.dow === d).reduce((a, s) => a + s.count, 0)
+              );
+              const totalByHour = Array(24).fill(0);
+              for (const s of slots) totalByHour[s.hour] = (totalByHour[s.hour]||0) + s.count;
+              const peakHour = totalByHour.indexOf(Math.max(...totalByHour));
+              const DAYS = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
+              const peakDow = totalByDow.indexOf(Math.max(...totalByDow));
+              result = {
+                summary: {
+                  totalOrders: slots.reduce((a,s) => a+s.count, 0),
+                  peakHour: `${peakHour === 0 ? '12am' : peakHour < 12 ? peakHour+'am' : peakHour === 12 ? '12pm' : (peakHour-12)+'pm'} UTC`,
+                  peakDay: DAYS[peakDow],
+                  volumeByDow: totalByDow.map((v,i) => ({ day: DAYS[i], orders: v })),
+                },
+                weeklyTrend: (trendRes.weeklyTrend || []).slice(-12),
+                slaRecommendations: slaRes.recommendations || [],
+                bottlenecks: (slaRes.bottlenecks || []).slice(0, 5),
+                topWaitStatuses: (slaRes.byStatus || []).slice(0, 8),
+              };
+              break;
+            }
+            case 'fetch_staffing_model': {
+              const staffRes = await fetch(`http://localhost:${CONFIG.PORT}/data/forecast/staffing`, {
+                headers: { 'Authorization': req.headers['authorization'] || '' }
+              }).then(r => r.json()).catch(e => ({ error: e.message }));
+              if (staffRes.error) { result = staffRes; break; }
+              const xphList = staffRes.xphByStatus || [];
+              const totalSegs = xphList.reduce((a,s) => a+s.segments, 0);
+              const weightedXph = totalSegs > 0
+                ? xphList.reduce((a,s) => a + s.xph * (s.segments/totalSegs), 0) : 0;
+              const staffByHour = (staffRes.totalByHour || []).map((arrivals, h) => ({
+                hour: h === 0 ? '12am' : h < 12 ? h+'am' : h === 12 ? '12pm' : (h-12)+'pm',
+                avgArrivals: Math.round(arrivals / 7 * 10) / 10,
+                requiredStaff: arrivals > 0 ? Math.ceil((arrivals/7) / (weightedXph||1)) : 0,
+              }));
+              result = {
+                weightedTeamXph: Math.round(weightedXph * 100) / 100,
+                note: 'Required staff = ceil(avg arrivals ÷ XpH). Add 20-30% for breaks and variance.',
+                staffByHour,
+                xphByStatus: xphList.slice(0, 10),
+                peakStaffingHour: staffByHour.reduce((a,b) => a.requiredStaff >= b.requiredStaff ? a : b),
               };
               break;
             }
@@ -3515,10 +3581,46 @@ async function runOrderArrivalBackfill(prodDb, configDb, push) {
     await processBatch(turnaroundOps.splice(0));
     push(`  Processed ${totalProcessed} orders`);
 
+    // Enrich turnaround records with departmentName from backfill_kpi_segments.
+    // Orders don't have a department field — we derive it from the most common
+    // departmentName seen in segments for that order (the team that worked it most).
+    push('  Enriching turnaround with department names...');
+    try {
+      const deptByOrder = await configDb.collection('backfill_kpi_segments').aggregate([
+        { $match: { orderSerialNumber: { $exists: true, $ne: null }, departmentName: { $exists: true, $ne: '' } } },
+        { $group: { _id: { order: '$orderSerialNumber', dept: '$departmentName' }, count: { $sum: 1 } } },
+        { $sort: { count: -1 } },
+        { $group: { _id: '$_id.order', departmentName: { $first: '$_id.dept' } } }
+      ]).toArray();
+
+      if (deptByOrder.length > 0) {
+        const deptOps = deptByOrder.map(r => ({
+          updateOne: {
+            filter: { orderSerialNumber: r._id },
+            update: { $set: { departmentName: r.departmentName } }
+          }
+        }));
+        for (let i = 0; i < deptOps.length; i += 2000) {
+          await turnCol.bulkWrite(deptOps.slice(i, i + 2000), { ordered: false });
+        }
+        push(`  Enriched ${deptByOrder.length} orders with department names`);
+        // Ensure index for dept filtering
+        await turnCol.createIndex({ departmentName: 1 }, { background: true }).catch(() => {});
+        await turnCol.createIndex({ departmentName: 1, createdAt: -1 }, { background: true }).catch(() => {});
+      }
+    } catch (dErr) {
+      push(`  Dept enrichment: SKIPPED (${dErr.message})`);
+    }
+
     // Rebuild arrival heatmap from turnaround collection
+    // Build heatmap: include departmentName in grouping so front-end can filter
     const aggResult = await turnCol.aggregate([
       { $match:{ createdAt:{ $exists:true } } },
-      { $group:{ _id:{ dow:{ $subtract:[{ $dayOfWeek:'$createdAt' },1] }, hour:{ $hour:'$createdAt' } },
+      { $group:{ _id:{
+            dow:{ $subtract:[{ $dayOfWeek:'$createdAt' },1] },
+            hour:{ $hour:'$createdAt' },
+            dept:{ $ifNull:['$departmentName',''] }
+          },
           count:{ $sum:1 }, evaluation:{ $sum:{ $cond:[{ $eq:['$orderType','evaluation'] },1,0] } },
           translation:{ $sum:{ $cond:[{ $eq:['$orderType','translation'] },1,0] } },
           urgent:{ $sum:{ $cond:['$isUrgent',1,0] } },
@@ -3526,17 +3628,22 @@ async function runOrderArrivalBackfill(prodDb, configDb, push) {
           avgTurnaroundHrs:{ $avg:{ $cond:['$isCompleted','$turnaroundHrs',null] } },
           latePct:{ $avg:{ $cond:['$isCompleted',{ $cond:['$isLate',1,0] },null] } }
       }},
-      { $project:{ _id:0, dow:'$_id.dow', hour:'$_id.hour', count:1, evaluation:1, translation:1,
-          urgent:1, completed:1,
+      { $project:{ _id:0, dow:'$_id.dow', hour:'$_id.hour', dept:'$_id.dept', count:1,
+          evaluation:1, translation:1, urgent:1, completed:1,
           avgTurnaroundHrs:{ $round:['$avgTurnaroundHrs',1] },
           latePct:{ $round:[{ $multiply:['$latePct',100] },1] } }}
     ]).toArray();
 
-    const arrOps = aggResult.map(r => ({ updateOne:{
-      filter:{ _id:`${r.dow}-${String(r.hour).padStart(2,'0')}` },
-      update:{ $set:{ ...r, _id:`${r.dow}-${String(r.hour).padStart(2,'0')}`, _backfilledAt:new Date() } },
-      upsert:true
-    }}));
+    // Key: dow-hour-dept (safe chars only — replace spaces with _)
+    const arrOps = aggResult.map(r => {
+      const deptKey = (r.dept||'').replace(/[^a-zA-Z0-9]/g,'_').substring(0,30);
+      const id = `${r.dow}-${String(r.hour).padStart(2,'0')}-${deptKey}`;
+      return { updateOne:{
+        filter:{ _id: id },
+        update:{ $set:{ ...r, _id: id, _backfilledAt:new Date() } },
+        upsert:true
+      }};
+    });
     if (arrOps.length) await arrCol.bulkWrite(arrOps, { ordered:false });
 
     await Promise.all([
@@ -5109,7 +5216,27 @@ app.post('/reports/export', async (req, res) => {
 app.get('/data/forecast/arrivals', async (req, res) => {
   try {
     const db = await getConfigDb();
-    const slots = await db.collection('backfill_order_arrivals').find({}).toArray();
+    const dept = req.query.dept || ''; // optional department filter
+
+    // Get distinct departments available in the data
+    const allDepts = await db.collection('backfill_order_arrivals')
+      .distinct('dept').then(d => d.filter(Boolean).sort());
+
+    const filter = dept ? { dept } : {};
+    // Aggregate across all dept slots for the selected dept (or all)
+    const rawSlots = await db.collection('backfill_order_arrivals').find(filter).toArray();
+
+    // Collapse to dow-hour (sum counts across matching dept slots)
+    const slotMap = {};
+    for (const s of rawSlots) {
+      const key = `${s.dow}-${s.hour}`;
+      if (!slotMap[key]) slotMap[key] = { dow:s.dow, hour:s.hour, count:0, evaluation:0, translation:0, urgent:0 };
+      slotMap[key].count       += s.count||0;
+      slotMap[key].evaluation  += s.evaluation||0;
+      slotMap[key].translation += s.translation||0;
+      slotMap[key].urgent      += s.urgent||0;
+    }
+    const slots = Object.values(slotMap);
 
     // Also return weekly totals and recent trend from turnaround collection
     const now = new Date();
@@ -5151,7 +5278,7 @@ app.get('/data/forecast/arrivals', async (req, res) => {
       ]).toArray()
     ]);
 
-    res.json({ slots, weeklyTrend, slaStats });
+    res.json({ slots, weeklyTrend, slaStats, departments: allDepts, activeDept: dept });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -5162,14 +5289,24 @@ app.get('/data/forecast/arrivals', async (req, res) => {
 app.get('/data/forecast/staffing', async (req, res) => {
   try {
     const db = await getConfigDb();
+    const dept = req.query.dept || ''; // optional department filter
 
-    // Arrival heatmap (orders/hour by dow-hour)
-    const arrivals = await db.collection('backfill_order_arrivals').find({}).toArray();
+    // Arrival heatmap — filter by dept if specified, collapse to dow-hour
+    const rawArrivals = await db.collection('backfill_order_arrivals').find(dept ? { dept } : {}).toArray();
+    const slotMap = {};
+    for (const s of rawArrivals) {
+      const key = `${s.dow}-${s.hour}`;
+      if (!slotMap[key]) slotMap[key] = { dow:s.dow, hour:s.hour, count:0 };
+      slotMap[key].count += s.count||0;
+    }
+    const arrivals = Object.values(slotMap);
 
-    // XpH per status from segments (last 60 days)
+    // XpH per status from segments (last 60 days) — filter by dept if specified
     const cutoff60 = new Date(Date.now() - 60 * 86400000);
+    const segMatch = { isOpen:false, segmentStart:{ $gte:cutoff60.toISOString() }, durationMinutes:{ $gt:0 } };
+    if (dept) segMatch.departmentName = dept;
     const xphByStatus = await db.collection('backfill_kpi_segments').aggregate([
-      { $match: { isOpen:false, segmentStart:{ $gte:cutoff60.toISOString() }, durationMinutes:{ $gt:0 } } },
+      { $match: segMatch },
       { $group: {
           _id: '$statusSlug',
           statusName: { $first:'$statusName' },
@@ -5200,9 +5337,14 @@ app.get('/data/forecast/staffing', async (req, res) => {
 
     // Overall demand stats
     const totalOrders = arrivals.reduce((a,s) => a + s.count, 0);
-    const avgPerDay   = arrivals.length > 0
-      ? Math.round(arrivals.reduce((a,s) => a + s.count, 0) / 7 * 10) / 10
-      : 0;
+
+    // avgPerDay: use last 30 actual calendar days for a meaningful recent average
+    // (dividing total by 7 gives lifetime total/week which is misleading for new systems)
+    const d30 = new Date(Date.now() - 30 * 86400000);
+    const deptFilter = dept ? { departmentName: dept } : {};
+    const recentCount = await db.collection('backfill_order_turnaround')
+      .countDocuments({ createdAt: { $gte: d30 }, ...deptFilter });
+    const avgPerDay = Math.round(recentCount / 30 * 10) / 10;
 
     res.json({
       arrivals,           // heatmap slots
@@ -5225,12 +5367,14 @@ app.get('/data/forecast/sla-analysis', async (req, res) => {
   try {
     const db = await getConfigDb();
     const d180 = new Date(Date.now() - 180 * 86400000);
+    const dept = req.query.dept || '';
+    const deptMatch = dept ? { departmentName: dept } : {};
 
-    const [byType, byStatus, bottlenecks, dailyTrend] = await Promise.all([
+    const [byType, byStatus, bottlenecks, dailyTrend, departments] = await Promise.all([
 
       // Turnaround distribution by order type + process time
       db.collection('backfill_order_turnaround').aggregate([
-        { $match: { isCompleted:true, createdAt:{ $gte:d180 }, turnaroundHrs:{ $gt:0, $lt:2000 } } },
+        { $match: { isCompleted:true, createdAt:{ $gte:d180 }, turnaroundHrs:{ $gt:0, $lt:2000 }, ...deptMatch } },
         { $group: {
             _id: { orderType:'$orderType', processTimeSlug:'$processTimeSlug' },
             count:    { $sum:1 },
@@ -5275,7 +5419,7 @@ app.get('/data/forecast/sla-analysis', async (req, res) => {
 
       // Bottleneck detection: statuses where P75 wait > 24h (1440 min)
       db.collection('backfill_order_turnaround').aggregate([
-        { $match:{ createdAt:{ $gte:d180 } } },
+        { $match:{ createdAt:{ $gte:d180 }, ...deptMatch } },
         { $project:{ sw:{ $objectToArray:'$statusWaits' } } },
         { $unwind:'$sw' },
         { $match:{ 'sw.v':{ $gt:60 } } }, // >1 hour waits only
@@ -5293,9 +5437,12 @@ app.get('/data/forecast/sla-analysis', async (req, res) => {
         { $sort:{ p75Hrs:-1 } }
       ]).toArray(),
 
+      // Available departments
+      db.collection('backfill_order_turnaround').distinct('departmentName'),
+
       // Daily order volume trend (last 90 days)
       db.collection('backfill_order_turnaround').aggregate([
-        { $match:{ createdAt:{ $gte: new Date(Date.now() - 90*86400000) } } },
+        { $match:{ createdAt:{ $gte: new Date(Date.now() - 90*86400000) }, ...deptMatch } },
         { $group:{
             _id:{ $dateToString:{ format:'%Y-%m-%d', date:'$createdAt' } },
             count:{ $sum:1 },
@@ -5322,7 +5469,7 @@ app.get('/data/forecast/sla-analysis', async (req, res) => {
       };
     });
 
-    res.json({ byType, byStatus, bottlenecks, dailyTrend, recommendations });
+    res.json({ byType, byStatus, bottlenecks, dailyTrend, recommendations, departments: (departments||[]).filter(Boolean).sort(), activeDept: dept });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }

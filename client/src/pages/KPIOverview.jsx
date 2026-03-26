@@ -1,7 +1,7 @@
 import React, { useEffect, useState, useMemo, useCallback, useDeferredValue, useTransition } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, Cell } from 'recharts';
-import { Card, Table, Pills, FilterBar, FilterSelect, FilterInput, FilterReset,
+import { Card, Table, Pills, FilterBar, FilterSelect, FilterInput, FilterReset, DatePresets,
          ChartLegend, DrilldownDrawer, OrderLink,
          TOOLTIP_STYLE, fmt, fmtI, fmtDur, fmtHrs, fmtDateTime } from '../components/UI';
 import { api } from '../hooks/useApi';
@@ -206,17 +206,19 @@ export default function KPIOverview() {
 
   const clearFilters = ()=>{setFType('');setFDept('');setFFrom('');setFTo('');setFWorker('');setFStatus('');};
   // ── Anomaly / Alert feed ────────────────────────────────────
-  // Runs on raw segs (not filtered) so it surfaces real issues regardless of active filters.
+  // Uses filtered segs when dept/worker/status filters are active so alerts
+  // are relevant to the current view. Falls back to all segs when no filters set.
   const anomalies = useMemo(() => {
     const flags = [];
-    if (!segs.length || !benchmarks.length) return flags;
+    const source = (deferredFDept || deferredFWorker || deferredFStatus) ? filtered : segs;
+    if (!source.length || !benchmarks.length) return flags;
     const now = new Date();
     const d7  = new Date(now - 7  * 86400000).toISOString();
     const d14 = new Date(now - 14 * 86400000).toISOString();
 
     // 1. Workers with XpH drop >30% week-over-week
     const workerWeeks = {};
-    for (const s of segs) {
+    for (const s of source) {
       if (s.isOpen || !s._workerId || !s.durationMinutes || s.durationMinutes <= 0) continue;
       const id = s._workerId;
       if (!workerWeeks[id]) workerWeeks[id] = { tw:{ cnt:0, min:0 }, lw:{ cnt:0, min:0 }, name: s.displayName || s.workerName || id };
@@ -235,7 +237,7 @@ export default function KPIOverview() {
     // 2. Open segments stuck >48 hours
     const cutoff48 = new Date(now - 48 * 3600000).toISOString();
     const stuckOrders = {};
-    for (const s of segs) {
+    for (const s of source) {
       if (!s.isOpen || !s.segmentStart || s.segmentStart >= cutoff48) continue;
       const key = s.orderSerialNumber || s.statusSlug || 'unknown';
       if (!stuckOrders[key]) stuckOrders[key] = { serial: s.orderSerialNumber, status: s.statusName || s.statusSlug, since: s.segmentStart };
@@ -249,7 +251,7 @@ export default function KPIOverview() {
 
     // 3. Statuses with In-Range rate below 50% this week (min 10 segments)
     const statusWeek = {};
-    for (const s of segs) {
+    for (const s of source) {
       if (s.isOpen || !s.statusSlug || s.segmentStart < d7) continue;
       if (!statusWeek[s.statusSlug]) statusWeek[s.statusSlug] = { name: s.statusName||s.statusSlug, total:0, inRange:0 };
       statusWeek[s.statusSlug].total++;
@@ -327,6 +329,7 @@ export default function KPIOverview() {
         <FilterSelect label="Worker" value={fWorker} onChange={setFWorker} options={workers} allLabel="All Workers" />
         <FilterInput label="From" value={fFrom} onChange={setFFrom} type="date" />
         <FilterInput label="To" value={fTo} onChange={setFTo} type="date" />
+        <DatePresets onSelect={(from,to)=>{ setFFrom(from); setFTo(to); }} />
         {hasFilters && <FilterReset onClick={clearFilters} />}
       </FilterBar>
 
@@ -391,34 +394,44 @@ export default function KPIOverview() {
           </ResponsiveContainer>:<div className="h-48 loading rounded-lg" />}
       </div>
 
-      {/* ── Anomaly / Alert Feed ───────────────────────────── */}
-      {anomalies.length > 0 && (
-        <div className="card-surface overflow-hidden">
-          <div className="px-4 py-3 border-b border-surface-200 flex items-center justify-between">
-            <span className="text-xs font-semibold text-ink-600 flex items-center gap-1.5">
-              <span className="w-2 h-2 rounded-full bg-red-500 animate-pulse inline-block" />
-              Alerts &amp; Anomalies
-            </span>
-            <span className="text-[10px] text-ink-400">{anomalies.length} flag{anomalies.length>1?'s':''}</span>
-          </div>
-          <div className="divide-y divide-surface-100">
-            {anomalies.map((a, i) => (
-              <div key={i} className={`flex items-start gap-3 px-4 py-2.5 ${a.severity==='error'?'bg-red-50/40':a.severity==='warn'?'bg-amber-50/30':''}`}>
-                <span className={`text-sm mt-0.5 ${a.severity==='error'?'text-red-500':'text-amber-500'}`}>
-                  {a.severity==='error'?'⚠':'◉'}
+      {/* ── Anomaly / Alert Feed — collapsed by default ───── */}
+      {anomalies.length > 0 && (() => {
+        const [open, setOpen] = React.useState(false);
+        const errors = anomalies.filter(a => a.severity === 'error');
+        return (
+          <div className="card-surface overflow-hidden">
+            <button onClick={() => setOpen(o => !o)}
+              className="w-full px-4 py-2.5 flex items-center justify-between hover:bg-surface-50 transition-colors">
+              <span className="text-xs font-semibold text-ink-600 flex items-center gap-1.5">
+                {errors.length > 0
+                  ? <span className="w-2 h-2 rounded-full bg-red-500 animate-pulse inline-block" />
+                  : <span className="w-2 h-2 rounded-full bg-amber-400 inline-block" />
+                }
+                Alerts &amp; Anomalies
+                <span className={`ml-1 px-1.5 py-0.5 rounded text-[10px] font-bold ${errors.length>0?'bg-red-100 text-red-700':'bg-amber-100 text-amber-700'}`}>
+                  {anomalies.length}
                 </span>
-                <div className="flex-1 min-w-0">
-                  <div className="text-xs font-semibold text-ink-900">{a.title}</div>
-                  <div className="text-[11px] text-ink-500 mt-0.5">{a.detail}</div>
-                </div>
-                {a.serial && (
-                  <a href={`#`} className="text-[11px] text-brand-600 hover:underline shrink-0">View</a>
-                )}
+              </span>
+              <span className="text-ink-400 text-xs">{open ? '▲ Hide' : '▼ Show'}</span>
+            </button>
+            {open && (
+              <div className="divide-y divide-surface-100 border-t border-surface-100">
+                {anomalies.map((a, i) => (
+                  <div key={i} className={`flex items-start gap-3 px-4 py-2.5 ${a.severity==='error'?'bg-red-50/40':'bg-amber-50/30'}`}>
+                    <span className={`text-sm mt-0.5 ${a.severity==='error'?'text-red-500':'text-amber-500'}`}>
+                      {a.severity==='error'?'⚠':'◉'}
+                    </span>
+                    <div className="flex-1 min-w-0">
+                      <div className="text-xs font-semibold text-ink-900">{a.title}</div>
+                      <div className="text-[11px] text-ink-500 mt-0.5">{a.detail}</div>
+                    </div>
+                  </div>
+                ))}
               </div>
-            ))}
+            )}
           </div>
-        </div>
-      )}
+        );
+      })()}
 
       <div className="card-surface overflow-hidden" data-tour="breakdown-table">
         <div className="px-4 py-3 border-b border-surface-200 flex items-center justify-between">

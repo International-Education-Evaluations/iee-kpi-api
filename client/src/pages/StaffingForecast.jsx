@@ -38,20 +38,32 @@ export default function StaffingForecast() {
   const [staffing, setStaffing]   = useState(null);
   const [sla,      setSla]        = useState(null);
   const [loading,  setLoading]    = useState(true);
-  const [tab,      setTab]        = useState('demand');    // demand | staffing | sla | bottlenecks
-  const [targetSlaHrs, setTargetSlaHrs] = useState(72);   // user-adjustable SLA target
+  const [tab,      setTab]        = useState('demand');
+  const [dept,     setDept]       = useState('');           // active department filter
+  const [departments, setDepartments] = useState([]);
 
-  useEffect(() => {
+  const loadData = (selectedDept = dept) => {
     setLoading(true);
+    const q = selectedDept ? `?dept=${encodeURIComponent(selectedDept)}` : '';
     Promise.all([
-      api('/data/forecast/staffing').catch(e => ({ error: e.message })),
-      api('/data/forecast/sla-analysis').catch(e => ({ error: e.message })),
+      api(`/data/forecast/staffing${q}`).catch(e => ({ error: e.message })),
+      api(`/data/forecast/sla-analysis${q}`).catch(e => ({ error: e.message })),
     ]).then(([s, sl]) => {
       setStaffing(s);
       setSla(sl);
+      // Collect departments from whichever endpoint returned them
+      const depts = sl?.departments || s?.departments || [];
+      if (depts.length > 0) setDepartments(depts);
       setLoading(false);
     });
-  }, []);
+  };
+
+  useEffect(() => { loadData(); }, []); // eslint-disable-line
+
+  const handleDeptChange = (d) => {
+    setDept(d);
+    loadData(d);
+  };
 
   // ── Demand heatmap (arrivals by dow × hour) ─────────────────────────────────
   const arrivalGrid = useMemo(() => {
@@ -117,16 +129,27 @@ export default function StaffingForecast() {
         <div>
           <h1 className="text-xl font-display font-bold text-ink-900">Staffing Forecast</h1>
           <p className="text-xs text-ink-400 mt-0.5">
-            Demand patterns from {fmtI(staffing?.totalOrders || 0)} orders · {fmtI(Math.round(staffing?.avgPerDay || 0))} avg orders/day
+            Demand patterns from {fmtI(staffing?.totalOrders || 0)} orders · {fmtI(Math.round(staffing?.avgPerDay || 0))} avg orders/day{dept && <span className="ml-2 px-1.5 py-0.5 bg-brand-100 text-brand-700 text-[10px] rounded font-semibold">{dept}</span>}
           </p>
         </div>
-        <div className="flex gap-1 bg-surface-100 p-1 rounded-lg border border-surface-200 flex-wrap">
+        <div className="flex items-center gap-3 flex-wrap">
+          {/* Department filter */}
+          <div className="flex items-center gap-2">
+            <label className="text-[10px] font-semibold uppercase tracking-wider text-ink-400">Dept</label>
+            <select value={dept} onChange={e => handleDeptChange(e.target.value)}
+              className="px-2.5 py-1.5 bg-white border border-surface-200 rounded-lg text-xs text-ink-800 focus:outline-none focus:border-brand-400">
+              <option value="">All Departments</option>
+              {departments.map(d => <option key={d} value={d}>{d}</option>)}
+            </select>
+          </div>
+          <div className="flex gap-1 bg-surface-100 p-1 rounded-lg border border-surface-200 flex-wrap">
           {[['demand','📈 Demand'],['staffing','👥 Staffing Model'],['sla','⏱ SLA Analysis'],['bottlenecks','🚧 Bottlenecks']].map(([k,l]) => (
             <button key={k} onClick={() => setTab(k)}
               className={`px-3 py-1.5 text-xs font-semibold rounded-md transition-all ${tab===k?'bg-white text-brand-600 shadow-sm border border-surface-200':'text-ink-500 hover:text-ink-700'}`}>
               {l}
             </button>
           ))}
+          </div>
         </div>
       </div>
 
@@ -215,6 +238,27 @@ export default function StaffingForecast() {
                     </div>
                   </div>
                 </div>
+                {/* Day-of-week volume summary */}
+                <div className="mt-4 pt-3 border-t border-surface-100">
+                  <div className="text-[10px] font-semibold text-ink-500 mb-2">Weekly volume by day</div>
+                  <div className="flex gap-2 items-end h-16">
+                    {DAYS.map((day, d) => {
+                      const total = HOURS.reduce((a, h) => a + (arrivalGrid.grid[d]?.[h] || 0), 0);
+                      const maxDay = Math.max(...DAYS.map((_, dd) => HOURS.reduce((a,h) => a+(arrivalGrid.grid[dd]?.[h]||0), 0)), 1);
+                      const pct = total / maxDay;
+                      const isWeekend = d === 0 || d === 6;
+                      return (
+                        <div key={day} className="flex-1 flex flex-col items-center gap-1">
+                          <div className="text-[9px] font-mono text-ink-500">{total}</div>
+                          <div className="w-full rounded-t-sm"
+                            style={{ height:`${Math.max(pct*44,2)}px`, background:isWeekend?'#94a3b8':'#00aeef', opacity:0.8 }} />
+                          <div className={`text-[10px] font-bold ${isWeekend?'text-ink-400':'text-ink-700'}`}>{day}</div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+
                 <div className="flex items-center gap-1 mt-3">
                   <span className="text-[10px] text-ink-400 mr-1">Low</span>
                   {[0.1,0.3,0.5,0.7,0.9].map(p=>(

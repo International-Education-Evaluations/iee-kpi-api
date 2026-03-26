@@ -1,7 +1,7 @@
 import React, { useEffect, useState, useMemo, useCallback, useDeferredValue } from 'react';
 import { useSearchParams } from 'react-router-dom';
 import { ComposedChart, Bar, Line, LineChart, XAxis, YAxis, Tooltip, ResponsiveContainer, Cell, BarChart } from 'recharts';
-import { Card, Table, FilterBar, FilterSelect, FilterInput, FilterReset,
+import { Card, Table, FilterBar, FilterSelect, FilterInput, FilterReset, DatePresets,
          ChartLegend, DrilldownDrawer, OrderLink, Pills,
          TOOLTIP_STYLE, fmt, fmtI, fmtDur, fmtHrs, fmtDateTime } from '../components/UI';
 import { useData } from '../hooks/useData';
@@ -289,6 +289,7 @@ export default function KPIUsers() {
           <FilterSelect label="Order Type" value={fType}   onChange={setFType}   options={['evaluation','translation']} />
           <FilterInput  label="From"       value={fFrom}   onChange={setFFrom}   type="date" />
           <FilterInput  label="To"         value={fTo}     onChange={setFTo}     type="date" />
+          <DatePresets onSelect={(from,to)=>{ setFFrom(from); setFTo(to); }} />
           {hasFilters && <FilterReset onClick={()=>{setFFrom('');setFTo('');setFStatus('');setFType('');}} />}
         </FilterBar>
 

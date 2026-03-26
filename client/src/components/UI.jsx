@@ -163,6 +163,39 @@ export function FilterReset({ onClick }) {
   return <button onClick={onClick} className="px-3 py-1.5 text-xs text-ink-400 hover:text-brand-600 font-medium transition-colors self-end">Clear filters</button>;
 }
 
+// ── DatePresets ───────────────────────────────────────────────
+// Quick-select preset date ranges. Outputs YYYY-MM-DD strings
+// compatible with HTML date inputs and the ISO string comparison in filters.
+export function DatePresets({ onSelect }) {
+  const presets = [
+    { label: 'Today',      getDates: () => { const d = toYMD(new Date()); return [d, d]; } },
+    { label: 'Yesterday',  getDates: () => { const d = toYMD(daysAgo(1)); return [d, d]; } },
+    { label: 'Last 7d',    getDates: () => [toYMD(daysAgo(6)), toYMD(new Date())] },
+    { label: 'Last 30d',   getDates: () => [toYMD(daysAgo(29)), toYMD(new Date())] },
+    { label: 'This week',  getDates: () => { const n = new Date(); const d = n.getDay(); return [toYMD(daysAgo(d)), toYMD(new Date())]; } },
+    { label: 'Last week',  getDates: () => { const n = new Date(); const d = n.getDay(); return [toYMD(daysAgo(d + 7)), toYMD(daysAgo(d + 1))]; } },
+    { label: 'This month', getDates: () => { const n = new Date(); return [`${n.getFullYear()}-${String(n.getMonth()+1).padStart(2,'0')}-01`, toYMD(new Date())]; } },
+    { label: 'Last month', getDates: () => { const n = new Date(); const y = n.getMonth() === 0 ? n.getFullYear()-1 : n.getFullYear(); const m = n.getMonth() === 0 ? 12 : n.getMonth(); const days = new Date(y, m, 0).getDate(); return [`${y}-${String(m).padStart(2,'0')}-01`, `${y}-${String(m).padStart(2,'0')}-${days}`]; } },
+    { label: 'This quarter', getDates: () => { const n = new Date(); const q = Math.floor(n.getMonth()/3); const qStart = new Date(n.getFullYear(), q*3, 1); return [toYMD(qStart), toYMD(new Date())]; } },
+    { label: 'Last quarter', getDates: () => { const n = new Date(); const q = Math.floor(n.getMonth()/3); const lqStart = new Date(n.getFullYear(), (q-1)*3, 1); const lqEnd = new Date(n.getFullYear(), q*3, 0); return [toYMD(lqStart), toYMD(lqEnd)]; } },
+  ];
+
+  function daysAgo(n) { const d = new Date(); d.setDate(d.getDate() - n); return d; }
+  function toYMD(d) { return d.toISOString().slice(0, 10); }
+
+  return (
+    <div className="flex flex-wrap gap-1">
+      {presets.map(p => (
+        <button key={p.label} type="button"
+          onClick={() => { const [from, to] = p.getDates(); onSelect(from, to); }}
+          className="px-2 py-1 text-[10px] font-medium text-ink-500 bg-white border border-surface-200 rounded-md hover:border-brand-400 hover:text-brand-600 hover:bg-brand-50 transition-all whitespace-nowrap">
+          {p.label}
+        </button>
+      ))}
+    </div>
+  );
+}
+
 // ── Pills ─────────────────────────────────────────────────────
 export function Pills({ tabs, active, onChange, ...rest }) {
   return (

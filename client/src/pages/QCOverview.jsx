@@ -1,6 +1,6 @@
 import React, { useEffect, useState, useMemo, useCallback, useDeferredValue } from 'react';
 import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, PieChart, Pie, Cell } from 'recharts';
-import { Card, Table, Pills, FilterBar, FilterSelect, FilterInput, FilterReset,
+import { Card, Table, Pills, FilterBar, FilterSelect, FilterInput, FilterReset, DatePresets,
          ChartLegend, DrilldownDrawer, OrderLink,
          TOOLTIP_STYLE, fmtI, fmtP, fmtDateTime } from '../components/UI';
 import { useData } from '../hooks/useData';
@@ -181,6 +181,7 @@ export default function QCOverview() {
         <FilterInput label="From" value={fFrom} onChange={setFFrom} type="date" />
         <FilterInput label="To" value={fTo} onChange={setFTo} type="date" />
         <FilterInput label="Search" value={fSearch} onChange={setFSearch} placeholder="Order, worker, issue…" />
+        <DatePresets onSelect={(from,to)=>{ setFFrom(from); setFTo(to); }} />
         {hasF && <FilterReset onClick={clearF} />}
       </FilterBar>
 
