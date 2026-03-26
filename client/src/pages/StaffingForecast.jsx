@@ -434,6 +434,13 @@ export default function StaffingForecast() {
                 </p>
               </div>
 
+              {/* ── Dept data warning if arrivals fell back to system-wide ── */}
+              {staffing?.arrivalsDeptNote && (
+                <div className="card-surface p-3 bg-red-50 border border-red-200 text-[11px] text-red-700">
+                  <strong>⚠ Data Warning:</strong> {staffing.arrivalsDeptNote}
+                </div>
+              )}
+
               {/* ── Model Transparency Panel ─────────────────────────── */}
               {staffing?.modelMeta && <ModelTransparency meta={staffing.modelMeta} dept={dept} />}
 

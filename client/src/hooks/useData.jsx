@@ -6,6 +6,7 @@ const DataContext = createContext(null);
 
 export function DataProvider({ children }) {
   const [kpiSegs, setKpiSegs]             = useState([]);
+  const [benchmarks, setBenchmarks]       = useState([]);
   const [classifiedSummary, setClassifiedSummary] = useState(null);
   const [qcEvents, setQcEvents]           = useState([]);
   const [queueSnap, setQueueSnap]         = useState(null);
@@ -31,8 +32,11 @@ export function DataProvider({ children }) {
       setUsers(userList);
 
       // Build xphUnit map from benchmarks: statusSlug → xphUnit (Orders|Credentials|Reports)
+      const benchList = benchData.benchmarks || [];
+      setBenchmarks(benchList);
+
       const xphUnitBySlug = {};
-      for (const b of (benchData.benchmarks || [])) {
+      for (const b of benchList) {
         if (b.status) xphUnitBySlug[b.status] = b.xphUnit || 'Orders';
       }
 
@@ -169,7 +173,7 @@ export function DataProvider({ children }) {
 
   return (
     <DataContext.Provider value={{
-      kpiSegs, classifiedSummary, qcEvents, queueSnap, queueWait, users,
+      kpiSegs, classifiedSummary, qcEvents, queueSnap, queueWait, users, benchmarks,
       kpiLoading, qcLoading, queueLoading,
       loadKpi, loadQc, loadQueue, forceRefreshQueue, refreshAll,
     }}>

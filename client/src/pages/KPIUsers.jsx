@@ -32,6 +32,7 @@ const SEG_COLS = [
   { key:'durationSeconds',   label:'Sec',       w:65,  right:true, sortable:true, render:v=>v!=null?<span className="font-mono text-ink-400 text-[11px]">{Math.round(v)}</span>:'—' },
   { key:'orderType',         label:'Type',      w:80,  sortable:true, render:v=><span className="capitalize text-[11px] text-ink-500">{v||'—'}</span> },
   { key:'reportItemCount',   label:'Reports',   w:70,  right:true, sortable:true, render:v=>v>0?<span className="font-semibold text-ink-700">{v}</span>:<span className="text-ink-300">—</span> },
+  { key:'credentialCount',  label:'Creds',     w:65,  right:true, sortable:true, render:v=>v>0?<span className="font-semibold text-purple-700">{v}</span>:<span className="text-ink-300">—</span> },
   { key:'changedByName',     label:'Changed By',w:130, sortable:true, render:v=>v||<span className="text-ink-300">—</span> },
   { key:'isErrorReporting',  label:'Error Rpt', w:75,  sortable:true, render:v=>v?<span className="badge badge-danger">Yes</span>:<span className="text-ink-300">—</span> },
   { key:'isOpen',            label:'State',     w:65,  sortable:true, render:v=><span className={`badge ${v?'badge-warning':'badge-success'}`}>{v?'Open':'Closed'}</span> },
@@ -44,6 +45,7 @@ const ORDER_COLS = [
   { key:'orderType',         label:'Type',     w:80,  sortable:true, render:v=><span className="capitalize text-[11px] text-ink-500">{v||'—'}</span> },
   { key:'segCount',          label:'Segments', w:80,  right:true, sortable:true, render:v=>fmtI(v) },
   { key:'reportItemCount',   label:'Reports',  w:75,  right:true, sortable:true, render:v=>v>0?<span className="font-semibold">{v}</span>:'—' },
+  { key:'credentialCount',  label:'Creds',    w:65,  right:true, sortable:true, render:v=>v>0?<span className="font-semibold text-purple-700">{v}</span>:'—' },
   { key:'totalMin',          label:'Total Time',w:90, right:true, sortable:true, render:v=>fmtDur(v) },
   { key:'firstSeg',          label:'First',    w:130, sortable:true, render:v=>fmtDateTime(v) },
   { key:'lastSeg',           label:'Last',     w:130, sortable:true, render:v=>fmtDateTime(v) },
@@ -131,6 +133,7 @@ export default function KPIUsers() {
       hrs:    totalMin/60,
       orders: orders.size,
       xph:    Math.round(xph*10)/10,
+      xphUnit: closed.length>0 ? (closed.find(s=>s.xphUnit&&s.xphUnit!=='Orders')?.xphUnit || closed[0]?.xphUnit || 'Orders') : 'Orders',
       totalReports,
       errorSegs,
       dept:   userSegs.find(s=>s.departmentName)?.departmentName || '',
@@ -153,7 +156,7 @@ export default function KPIUsers() {
       ...d,
       orders: d.orders.size,
       avg: d.closed ? Math.round(d.min/d.closed*10)/10 : 0,
-      xph: d.min>0 ? Math.round((d.unitSum||d.closed)/(d.min/60)*10)/10 : 0,
+      xph: d.min>0 ? Math.round((d.unitSum??0)/(d.min/60)*10)/10 : 0,
       label: fmtDate(d.date),
     }));
   }, [userSegs]);
@@ -163,9 +166,9 @@ export default function KPIUsers() {
     const d = {};
     userSegs.forEach(s => {
       const k = s.statusName||s.statusSlug;
-      if (!d[k]) d[k] = { status:k, count:0, totalMin:0, closed:0, open:0, orders:new Set(), durations:[] };
+      if (!d[k]) d[k] = { status:k, slug:s.statusSlug||'', xphUnit:s.xphUnit||'Orders', count:0, totalMin:0, closed:0, open:0, orders:new Set(), durations:[], unitSum:0 };
       d[k].count++;
-      if (!s.isOpen && s.durationMinutes>0) { d[k].totalMin+=s.durationMinutes; d[k].closed++; d[k].durations.push(s.durationMinutes); }
+      if (!s.isOpen && s.durationMinutes>0) { d[k].totalMin+=s.durationMinutes; d[k].closed++; d[k].unitSum+=(s.unitValue??1); d[k].durations.push(s.durationMinutes); }
       if (s.isOpen) d[k].open++;
       if (s.orderSerialNumber) d[k].orders.add(s.orderSerialNumber);
     });
@@ -175,7 +178,7 @@ export default function KPIUsers() {
       avg:    d.closed ? Math.round(d.totalMin/d.closed*10)/10 : null,
       median: getMedian(d.durations),
       hrs:    Math.round(d.totalMin/60*10)/10,
-      xph:    d.totalMin>0 ? Math.round((d.unitSum||d.closed)/(d.totalMin/60)*10)/10 : null,
+      xph:    d.totalMin>0 ? Math.round((d.unitSum??0)/(d.totalMin/60)*10)/10 : null,
       pct:    userSegs.length ? Math.round(d.count/userSegs.length*100) : 0,
     })).sort((a,b) => b.count-a.count);
   }, [userSegs]);
@@ -185,7 +188,7 @@ export default function KPIUsers() {
     const m = {};
     userSegs.forEach(s => {
       const k = s.orderSerialNumber; if (!k) return;
-      if (!m[k]) m[k] = { orderSerialNumber:k, orderType:s.orderType, segCount:0, totalMin:0, reportItemCount:s.reportItemCount||0, firstSeg:s.segmentStart, lastSeg:s.segmentStart, hasOpen:false };
+      if (!m[k]) m[k] = { orderSerialNumber:k, orderType:s.orderType, segCount:0, totalMin:0, reportItemCount:s.reportItemCount||0, credentialCount:s.credentialCount||0, firstSeg:s.segmentStart, lastSeg:s.segmentStart, hasOpen:false };
       m[k].segCount++;
       if (!s.isOpen && s.durationMinutes>0) m[k].totalMin += s.durationMinutes;
       if (s.isOpen) m[k].hasOpen = true;
@@ -211,7 +214,7 @@ export default function KPIUsers() {
       w[k].segs++; w[k].min += s.durationMinutes; w[k].unitSum = (w[k].unitSum||0) + (s.unitValue??1);
     });
     return Object.values(w).sort((a,b)=>a.week.localeCompare(b.week)).map(w=>({
-      ...w, xph: w.min>0 ? Math.round((w.unitSum||w.segs)/(w.min/60)*10)/10 : 0, label: fmtDate(w.week),
+      ...w, xph: w.min>0 ? Math.round((w.unitSum??0)/(w.min/60)*10)/10 : 0, label: fmtDate(w.week),
     }));
   }, [userSegs]);
 
@@ -249,6 +252,8 @@ export default function KPIUsers() {
     {key:'avg',     label:'Avg',       w:70,  right:true, sortable:true, render:v=>v!=null?fmtDur(v):'—'},
     {key:'median',  label:'Median',    w:70,  right:true, sortable:true, render:v=>v!=null?fmtDur(v):'—'},
     {key:'xph',     label:'XpH',       w:65,  right:true, sortable:true, render:v=>v!=null?<span className="font-semibold text-brand-600">{fmt(v)}</span>:'—'},
+    {key:'xphUnit', label:'Unit',      w:80,  sortable:true, render:v=><span className="text-[10px] text-ink-400 font-mono">{v||'Orders'}</span>},
+    {key:'unitSum', label:'Units',     w:65,  right:true, sortable:true, render:v=>v>0?<span className="font-semibold text-purple-700">{fmtI(v)}</span>:<span className="text-ink-300">—</span>},
     {key:'hrs',     label:'Total Hrs', w:80,  right:true, sortable:true, render:v=>fmtHrs(v)},
   ];
 
@@ -260,6 +265,7 @@ export default function KPIUsers() {
     {key:'durationSeconds',   label:'Sec',       w:65,  right:true, sortable:true, render:v=>v!=null?<span className="font-mono text-[11px] text-ink-400">{Math.round(v)}</span>:'—'},
     {key:'orderType',         label:'Type',      w:80,  sortable:true, render:v=><span className="capitalize text-[11px] text-ink-500">{v||'—'}</span>},
     {key:'reportItemCount',   label:'Reports',   w:70,  right:true, sortable:true, render:v=>v>0?<span className="font-semibold">{v}</span>:<span className="text-ink-300">—</span>},
+    {key:'credentialCount',  label:'Creds',     w:65,  right:true, sortable:true, render:v=>v>0?<span className="font-semibold text-purple-700">{v}</span>:<span className="text-ink-300">—</span>},
     {key:'changedByName',     label:'Changed By',w:130, sortable:true, render:v=>v||<span className="text-ink-300">—</span>},
     {key:'isErrorReporting',  label:'Err Rpt',   w:65,  sortable:true, render:v=>v?<span className="badge badge-danger">Yes</span>:'—'},
     {key:'isOpen',            label:'State',     w:65,  sortable:true, render:v=><span className={`badge ${v?'badge-warning':'badge-success'}`}>{v?'Open':'Closed'}</span>},
@@ -314,7 +320,7 @@ export default function KPIUsers() {
           <Card label="Avg Duration" value={fmtDur(m?.avg)}    color="brand"  loading={loading} />
           <Card label="Median"       value={fmtDur(m?.median)} color="slate"  loading={loading} />
           <Card label="Total Hours"  value={fmtHrs(m?.hrs)}    color="navy"   loading={loading} />
-          <Card label="XpH"          value={m?.xph?fmt(m.xph):'—'} sub="segs/hr" color="plum" loading={loading} />
+          <Card label="XpH"          value={m?.xph?fmt(m.xph):'—'} sub={m?.xphUnit||'units/hr'} color="plum" loading={loading} />
           <Card label="Orders"       value={fmtI(m?.orders)}   color="brand"  loading={loading} />
           <Card label="Reports"      value={fmtI(m?.totalReports)} color="slate" loading={loading} />
         </div>

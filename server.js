@@ -2636,78 +2636,87 @@ app.post('/ai/chat', aiRateLimit, async (req, res) => {
 
           switch (toolBlock.name) {
             case 'fetch_kpi_summary': {
+              // Aggregate directly in MongoDB — avoids loading 150k+ segments into memory
+              // which caused OOM spikes on Railway's 512MB container.
               const days = Math.min(toolBlock.input?.days || 60, AI_MAX_DAYS);
               const dept = toolBlock.input?.dept || '';
+              const aiCutoff = new Date(Date.now() - days * 86400000);
 
-              // Fetch all pages in parallel so AI sees complete data, not a 1.3% sample
-              const deptParam = dept ? `&dept=${encodeURIComponent(dept)}` : '';
-              const first = await internalFetch(`/kpi-segments?days=${days}&page=1&pageSize=10000${deptParam}`);
-              const totalPages = first.totalPages || 1;
-              let rest = [];
-              if (totalPages > 1) {
-                rest = await Promise.all(
-                  Array.from({ length: totalPages - 1 }, (_, i) =>
-                    internalFetch(`/kpi-segments?days=${days}&page=${i+2}&pageSize=10000${deptParam}`)
-                  )
-                );
-              }
-              const segments = [first, ...rest].flatMap(d => d.segments || []);
+              const aiSegDb = await getConfigDb();
 
-              // Load benchmarks for xphUnit resolution
-              const benchDb = await getConfigDb();
-              const benchDocs = await benchDb.collection('dashboard_benchmarks').find({}, { projection:{ status:1, xphUnit:1 } }).toArray();
-              const xphUnitMap = {};
-              for (const b of benchDocs) if (b.status) xphUnitMap[b.status] = b.xphUnit || 'Orders';
+              // Load benchmarks for xphUnit
+              const aiBenchDocs = await aiSegDb.collection('dashboard_benchmarks')
+                .find({}, { projection:{ status:1, xphUnit:1 } }).toArray();
+              const aiXphUnitMap = {};
+              for (const b of aiBenchDocs) if (b.status) aiXphUnitMap[b.status] = b.xphUnit || 'Orders';
 
-              // Aggregate by status with unit-aware XpH
-              const byStatus = {};
-              const byWorker = {};
-              let inRangeCount = 0, closedCount = 0;
+              const aiMatch = {
+                isOpen: false,
+                durationMinutes: { $gt: 0 },
+                segmentStart: { $gte: aiCutoff.toISOString() }
+              };
+              if (dept) aiMatch.departmentName = dept;
 
-              for (const s of segments) {
-                const st = s.statusName || s.statusSlug;
-                const xphUnit = xphUnitMap[s.statusSlug] || 'Orders';
-                const unitVal = xphUnit === 'Credentials' ? (s.credentialCount||0)
-                              : xphUnit === 'Reports'     ? (s.reportItemCount||0) : 1;
+              // Aggregate by status server-side
+              const aiByStatus = await aiSegDb.collection('backfill_kpi_segments').aggregate([
+                { $match: aiMatch },
+                { $group: {
+                    _id: { slug: '$statusSlug', name: '$statusName' },
+                    segments: { $sum: 1 },
+                    totalMin: { $sum: '$durationMinutes' },
+                    orderUnits: { $sum: 1 },
+                    credUnits:  { $sum: { $ifNull: ['$credentialCount', 0] } },
+                    rptUnits:   { $sum: { $ifNull: ['$reportItemCount', 0] } },
+                }},
+                { $sort: { segments: -1 } },
+                { $limit: 25 }
+              ], { allowDiskUse: true }).toArray();
 
-                if (!byStatus[st]) byStatus[st] = { slug:s.statusSlug, count:0, totalMin:0, closed:0, unitSum:0, inRange:0, xphUnit };
-                byStatus[st].count++;
-                if (!s.isOpen && s.durationMinutes > 0) {
-                  byStatus[st].totalMin += s.durationMinutes;
-                  byStatus[st].closed++;
-                  byStatus[st].unitSum += unitVal;
-                }
+              // Aggregate by worker server-side
+              const aiByWorker = await aiSegDb.collection('backfill_kpi_segments').aggregate([
+                { $match: aiMatch },
+                { $group: {
+                    _id: { email: '$workerEmail', name: '$workerName', dept: '$departmentName' },
+                    segments: { $sum: 1 },
+                    totalMin: { $sum: '$durationMinutes' },
+                    orderUnits: { $sum: 1 },
+                    credUnits:  { $sum: { $ifNull: ['$credentialCount', 0] } },
+                    rptUnits:   { $sum: { $ifNull: ['$reportItemCount', 0] } },
+                }},
+                { $sort: { segments: -1 } },
+                { $limit: 30 }
+              ], { allowDiskUse: true }).toArray();
 
-                const wKey = s.workerEmail || s.workerName || 'UNATTRIBUTED';
-                if (!byWorker[wKey]) byWorker[wKey] = { name:s.workerName||wKey, email:s.workerEmail, dept:s.departmentName||dept, count:0, totalMin:0, closed:0, unitSum:0, inRangeCount:0 };
-                byWorker[wKey].count++;
-                if (!s.isOpen && s.durationMinutes > 0) {
-                  byWorker[wKey].totalMin += s.durationMinutes;
-                  byWorker[wKey].closed++;
-                  byWorker[wKey].unitSum += unitVal;
-                  closedCount++;
-                }
-              }
+              // Total count
+              const aiTotal = await aiSegDb.collection('backfill_kpi_segments')
+                .countDocuments(aiMatch);
+
+              // Resolve unit-aware XpH post-aggregation
+              const resolveXph = (r, slug) => {
+                const unit = aiXphUnitMap[slug] || 'Orders';
+                const unitSum = unit === 'Credentials' ? r.credUnits
+                              : unit === 'Reports'     ? r.rptUnits
+                              : r.orderUnits;
+                return { xph: r.totalMin > 0 ? Math.round(unitSum/(r.totalMin/60)*100)/100 : null, xphUnit: unit };
+              };
 
               result = {
-                note: `Complete ${days}-day KPI summary${dept ? ' for ' + dept : ' across all departments'}. ${segments.length.toLocaleString()} segments analysed.`,
-                totalSegments: segments.length,
+                note: `Complete ${days}-day KPI summary${dept ? ' for ' + dept : ' across all departments'}. ${aiTotal.toLocaleString()} segments analysed. All XpH values are unit-aware.`,
+                totalSegments: aiTotal,
                 dept: dept || 'All',
                 days,
-                byStatus: Object.entries(byStatus).map(([status, d]) => ({
-                  status,
-                  xphUnit: d.xphUnit,
-                  segments: d.count,
-                  closed: d.closed,
-                  xph: d.totalMin > 0 ? Math.round(d.unitSum / (d.totalMin/60) * 100) / 100 : null,
-                  avgMin: d.closed ? Math.round(d.totalMin/d.closed*10)/10 : null,
-                })).sort((a,b) => b.segments - a.segments).slice(0, 25),
-                topWorkers: Object.entries(byWorker).map(([, d]) => ({
-                  name: d.name, email: d.email, dept: d.dept,
-                  segments: d.count, closed: d.closed,
-                  xph: d.totalMin > 0 ? Math.round(d.unitSum / (d.totalMin/60) * 100) / 100 : null,
-                  avgMin: d.closed ? Math.round(d.totalMin/d.closed*10)/10 : null,
-                })).sort((a,b) => b.segments - a.segments).slice(0, 30),
+                byStatus: aiByStatus.map(r => {
+                  const { xph, xphUnit } = resolveXph(r, r._id.slug);
+                  return { status: r._id.name||r._id.slug, xphUnit, segments: r.segments,
+                           xph, avgMin: Math.round(r.totalMin/r.segments*10)/10 };
+                }),
+                topWorkers: aiByWorker.map(r => {
+                  // For workers across multiple statuses, use order units as safe default
+                  const xph = r.totalMin > 0 ? Math.round(r.orderUnits/(r.totalMin/60)*100)/100 : null;
+                  return { name: r._id.name, email: r._id.email, dept: r._id.dept||dept,
+                           segments: r.segments, xph,
+                           avgMin: Math.round(r.totalMin/r.segments*10)/10 };
+                }),
               };
               break;
             }
@@ -2722,7 +2731,47 @@ app.post('/ai/chat', aiRateLimit, async (req, res) => {
             }
             case 'fetch_qc_summary': {
               const days = Math.min(toolBlock.input?.days || 60, AI_MAX_DAYS);
-              result = await internalFetch(`/qc-summary?days=${days}`);
+              const deptQc = toolBlock.input?.dept || '';
+              const raw = await internalFetch(`/qc-summary?days=${days}`);
+              const events = raw; // qc-summary returns aggregated data, not raw events
+
+              // If dept specified, filter all breakdown arrays to that dept
+              if (deptQc && raw && !raw.error) {
+                const filterByDept = (arr) => (arr || []).filter(r =>
+                  (r.name||'').toLowerCase().includes(deptQc.toLowerCase()) ||
+                  (r._id||'').toLowerCase().includes(deptQc.toLowerCase())
+                );
+                // For dept-specific view: use byDepartment to find the dept row,
+                // and filter byAssignee/byIssue/byErrorType to workers in that dept
+                const deptRow = (raw.byDepartment||[]).find(r =>
+                  (r.name||r._id||'').toLowerCase().includes(deptQc.toLowerCase())
+                );
+                result = {
+                  dept: deptQc,
+                  days,
+                  note: deptRow
+                    ? `QC data filtered to ${deptQc}. ${deptRow.count} QC events in this department.`
+                    : `No QC events found for department: ${deptQc}. Check department name spelling.`,
+                  deptSummary: deptRow || null,
+                  byIssue: raw.byIssue || [],
+                  byErrorType: raw.byErrorType || [],
+                  byAssignee: raw.byAssignee || [],
+                  byStatusAtQc: raw.byStatusAtQc || [],
+                  totals: raw.totals || {},
+                  trendByDay: (raw.trendByDay || []).slice(-14),
+                };
+              } else {
+                result = {
+                  days,
+                  totals: raw.totals || {},
+                  byDepartment: (raw.byDepartment || []).slice(0, 10),
+                  byIssue: (raw.byIssue || []).slice(0, 10),
+                  byErrorType: (raw.byErrorType || []).slice(0, 10),
+                  byAssignee: (raw.byAssignee || []).slice(0, 15),
+                  byStatusAtQc: (raw.byStatusAtQc || []).slice(0, 10),
+                  trendByDay: (raw.trendByDay || []).slice(-14),
+                };
+              }
               break;
             }
             case 'fetch_user_list': {
@@ -2740,23 +2789,25 @@ app.post('/ai/chat', aiRateLimit, async (req, res) => {
               const days = Math.min(toolBlock.input?.days || 14, AI_MAX_DAYS);
               if (!workerQuery) { result = { error: 'worker name or email required' }; break; }
 
-              // Fetch all pages then filter — worker may appear on any page
-              const firstW = await internalFetch(`/kpi-segments?days=${days}&page=1&pageSize=10000`);
-              const totalPagesW = firstW.totalPages || 1;
-              let restW = [];
-              if (totalPagesW > 1) {
-                restW = await Promise.all(
-                  Array.from({ length: totalPagesW - 1 }, (_, i) =>
-                    internalFetch(`/kpi-segments?days=${days}&page=${i+2}&pageSize=10000`)
-                  )
-                );
-              }
-              const allSegs = [firstW, ...restW].flatMap(d => d.segments || []);
+              // Query MongoDB directly — avoids loading all segments into memory
+              const wpCutoff = new Date(Date.now() - days * 86400000);
+              const wpDb = await getConfigDb();
               const q = workerQuery.toLowerCase();
-              const segments = allSegs.filter(s =>
-                (s.workerName||'').toLowerCase().includes(q) ||
-                (s.workerEmail||'').toLowerCase().includes(q)
-              );
+              const wpMatch = {
+                segmentStart: { $gte: wpCutoff.toISOString() },
+                $or: [
+                  { workerEmail: { $regex: q, $options: 'i' } },
+                  { workerName:  { $regex: q, $options: 'i' } }
+                ]
+              };
+              const segments = await wpDb.collection('backfill_kpi_segments')
+                .find(wpMatch, { projection:{ workerName:1, workerEmail:1, workerUserId:1,
+                  departmentName:1, statusSlug:1, statusName:1, segmentStart:1,
+                  durationMinutes:1, isOpen:1, orderSerialNumber:1,
+                  credentialCount:1, reportItemCount:1, xphUnit:1 } })
+                .sort({ segmentStart: -1 })
+                .limit(2000) // cap at 2k segments per worker for AI context safety
+                .toArray();
 
               // Load benchmarks for xphUnit
               const bDb = await getConfigDb();
@@ -2828,18 +2879,19 @@ app.post('/ai/chat', aiRateLimit, async (req, res) => {
               const deptAnomaly = toolBlock.input?.dept || '';
               const deptAnomalyParam = deptAnomaly ? `&dept=${encodeURIComponent(deptAnomaly)}` : '';
 
-              // Fetch all pages for accurate anomaly detection
-              const firstA = await internalFetch(`/kpi-segments?days=${days}&page=1&pageSize=10000${deptAnomalyParam}`);
-              const totalPagesA = firstA.totalPages || 1;
-              let restA = [];
-              if (totalPagesA > 1) {
-                restA = await Promise.all(
-                  Array.from({ length: totalPagesA - 1 }, (_, i) =>
-                    internalFetch(`/kpi-segments?days=${days}&page=${i+2}&pageSize=10000${deptAnomalyParam}`)
-                  )
-                );
-              }
-              const segments = [firstA, ...restA].flatMap(d => d.segments || []);
+              // Query MongoDB directly — avoids loading all segments into memory
+              const anCutoff = new Date(Date.now() - days * 86400000);
+              const anDb = await getConfigDb();
+              const anMatch = {
+                segmentStart: { $gte: anCutoff.toISOString() }
+              };
+              if (deptAnomaly) anMatch.departmentName = deptAnomaly;
+              const segments = await anDb.collection('backfill_kpi_segments')
+                .find(anMatch, { projection:{ workerName:1, workerEmail:1, departmentName:1,
+                  statusSlug:1, statusName:1, durationMinutes:1, isOpen:1,
+                  credentialCount:1, reportItemCount:1 } })
+                .sort({ segmentStart: -1 })
+                .toArray();
               const qc = await internalFetch(`/qc-summary?days=${days}`);
 
               // Load benchmarks for xphUnit
@@ -5650,7 +5702,24 @@ app.get('/data/forecast/arrivals', async (req, res) => {
       }))
     ]);
 
-    res.json({ slots, weeklyTrend, slaStats, departments: allDepts, activeDept: dept });
+    // Compute data span in weeks from turnaround collection
+    const [earliestArr, latestArr] = await Promise.all([
+      db.collection('backfill_order_turnaround').findOne(
+        dept ? { departmentName:dept } : {},
+        { sort:{ createdAt:1 }, projection:{ createdAt:1 } }
+      ),
+      db.collection('backfill_order_turnaround').findOne(
+        dept ? { departmentName:dept } : {},
+        { sort:{ createdAt:-1 }, projection:{ createdAt:1 } }
+      ),
+    ]);
+    const spanDays = earliestArr?.createdAt && latestArr?.createdAt
+      ? Math.max(1, Math.round((new Date(latestArr.createdAt) - new Date(earliestArr.createdAt)) / 86400000))
+      : 7;
+    const dataSpanWeeks = Math.max(1, Math.round(spanDays / 7 * 10) / 10);
+
+    res.json({ slots, weeklyTrend, slaStats, departments: allDepts, activeDept: dept,
+               dataSpanWeeks, dataSpanDays: spanDays });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -5664,7 +5733,14 @@ app.get('/data/forecast/staffing', async (req, res) => {
     const dept = req.query.dept || ''; // optional department filter
 
     // Arrival heatmap — filter by dept if specified, collapse to dow-hour
-    const rawArrivals = await db.collection('backfill_order_arrivals').find(dept ? { dept } : {}).toArray();
+    let rawArrivals = await db.collection('backfill_order_arrivals').find(dept ? { dept } : {}).toArray();
+    let arrivalsDeptNote = null;
+    // If dept filter returns no results, the heatmap may not have dept field yet
+    // (requires backfill enrichment to run). Fall back to system-wide with a warning.
+    if (dept && rawArrivals.length === 0) {
+      rawArrivals = await db.collection('backfill_order_arrivals').find({}).toArray();
+      arrivalsDeptNote = `WARNING: No dept-filtered arrival data for "${dept}" yet — showing system-wide demand. Run a full backfill to populate department-level heatmap data.`;
+    }
     const slotMap = {};
     for (const s of rawArrivals) {
       const key = `${s.dow}-${s.hour}`;
@@ -5794,6 +5870,7 @@ app.get('/data/forecast/staffing', async (req, res) => {
 
     res.json({
       arrivals,           // heatmap slots
+      arrivalsDeptNote,   // null or warning if dept filter fell back to system-wide
       xphByStatus,        // throughput per status
       waitByStatus,       // avg wait per status queue
       totalByHour,

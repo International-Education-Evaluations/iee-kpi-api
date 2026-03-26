@@ -153,14 +153,20 @@ export default function KPIScorecard() {
           return (uid && levelMap[uid]) || (em && levelMap[em]) || s.userLevel || null;
         })(),
         segs: 0, closed: 0, inRange: 0, totalMin: 0, xphNumer: 0, xphDenom: 0,
-        xphTargets: [], orders: new Set(),
+        xphTargets: [], orders: new Set(), xphUnits: new Set(),
       };
       const r = m[id];
       r.segs++;
-      r.closed++;
+      // Only count closed segments — open segments don't have a valid duration
+      if (!s.isOpen && s.durationMinutes > 0) {
+        r.closed++;
+        r.totalMin += s.durationMinutes;
+        r.xphNumer += (s.unitValue ?? 1);
+        r.xphDenom += s.durationMinutes / 60;
+      }
+      if (s.xphUnit) r.xphUnits.add(s.xphUnit);
       const bucket = classify(s);
       if (bucket === 'In-Range') r.inRange++;
-      if (s.durationMinutes > 0) { r.totalMin += s.durationMinutes; r.xphNumer += (s.unitValue ?? 1); r.xphDenom += s.durationMinutes / 60; }
       const t = getXphTarget(s);
       if (t != null) r.xphTargets.push(t);
       if (s.orderSerialNumber) r.orders.add(s.orderSerialNumber);
@@ -170,8 +176,9 @@ export default function KPIScorecard() {
       const xphTarget = r.xphTargets.length ? r.xphTargets.reduce((a,b)=>a+b,0)/r.xphTargets.length : null;
       const inRangePct = r.closed > 0 ? r.inRange / r.closed * 100 : 0;
       const xph_pct = xphTarget > 0 ? xph / xphTarget * 100 : null;
+      const xphUnit = r.xphUnits.size===1 ? [...r.xphUnits][0] : r.xphUnits.size>1 ? 'Mixed' : 'Orders';
       return { ...r, xph: Math.round(xph*100)/100, xphTarget: xphTarget ? Math.round(xphTarget*100)/100 : null,
-               inRangePct: Math.round(inRangePct*10)/10, xph_pct, orders: r.orders.size,
+               inRangePct: Math.round(inRangePct*10)/10, xph_pct, xphUnit, orders: r.orders.size,
                totalHrs: Math.round(r.totalMin/60*10)/10 };
     });
   }, [filtered, classify, getXphTarget, levelMap]);
@@ -181,7 +188,7 @@ export default function KPIScorecard() {
     const m = {};
     for (const s of filtered) {
       const key = s.statusSlug || 'unknown';
-      if (!m[key]) m[key] = { slug:key, name:s.statusName||key, segs:0, inRange:0, totalMin:0, cnt:0, workers:new Set(), orders:new Set() };
+      if (!m[key]) m[key] = { slug:key, name:s.statusName||key, segs:0, inRange:0, totalMin:0, cnt:0, workers:new Set(), orders:new Set(), xphUnit:s.xphUnit||'Orders' };
       const r = m[key];
       r.segs++; r.cnt++;
       if (classify(s) === 'In-Range') r.inRange++;
@@ -193,7 +200,8 @@ export default function KPIScorecard() {
       ...r, workers: r.workers.size, orders: r.orders.size,
       inRangePct: r.segs > 0 ? Math.round(r.inRange/r.segs*1000)/10 : 0,
       avgDuration: r.cnt > 0 ? Math.round(r.totalMin/r.cnt*10)/10 : 0,
-      xph: r.totalMin > 0 ? Math.round((r.unitSum||r.cnt)/(r.totalMin/60)*100)/100 : 0,
+      xph: r.totalMin > 0 ? Math.round((r.unitSum??0)/(r.totalMin/60)*100)/100 : 0,
+      xphUnit: r.xphUnit || 'Orders',
     }));
   }, [filtered, classify]);
 
@@ -282,6 +290,7 @@ export default function KPIScorecard() {
                   <SortTh col="segs"       label="Segs"     right />
                   <SortTh col="orders"     label="Orders"   right />
                   <SortTh col="xph"        label="XpH"      right />
+                  <SortTh col="xphUnit"    label="Unit" />
                   <SortTh col="xphTarget"  label="Target"   right />
                   <SortTh col="xph_pct"    label="Attain."  right />
                   <SortTh col="inRangePct" label="In-Range" right />
@@ -334,6 +343,7 @@ export default function KPIScorecard() {
                   <SortTh col="inRangePct"  label="In-Range"  right />
                   <SortTh col="avgDuration" label="Avg Dur"   right />
                   <SortTh col="xph"         label="XpH"       right />
+                  <SortTh col="xphUnit"     label="Unit" />
                 </tr>
               </thead>
               <tbody>
@@ -348,9 +358,10 @@ export default function KPIScorecard() {
                     <td className="px-3 py-2.5 min-w-[130px]"><MiniBar pct={r.inRangePct} color={r.inRangePct>=80?'#16a34a':r.inRangePct>=60?'#d97706':'#dc2626'} /></td>
                     <td className="px-3 py-2.5 text-right font-mono text-xs">{fmtDur(r.avgDuration)}</td>
                     <td className="px-3 py-2.5 text-right font-mono text-xs font-semibold">{fmt(r.xph)}</td>
+                    <td className="px-3 py-2.5 text-[10px] font-mono text-ink-400">{r.xphUnit||'Orders'}</td>
                   </tr>
                 ))}
-                {!sortedStatuses.length && <tr><td colSpan={7} className="px-3 py-8 text-center text-ink-400 text-sm">No data for current filters</td></tr>}
+                {!sortedStatuses.length && <tr><td colSpan={8} className="px-3 py-8 text-center text-ink-400 text-sm">No data for current filters</td></tr>}
               </tbody>
             </table>
           </div>

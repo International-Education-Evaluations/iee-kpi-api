@@ -38,8 +38,8 @@ const SEG_COLS = [
 ];
 
 export default function KPIOverview() {
-  const { kpiSegs: segs, kpiLoading: loading, loadKpi } = useData();
-  const [benchmarks, setBenchmarks] = useState([]);
+  const { kpiSegs: segs, kpiLoading: loading, loadKpi , benchmarks } = useData();
+  // benchmarks now come from DataProvider context — no local state needed
   const [view, setView] = useState('status');
   const [fType, setFType] = useState(''); const [fDept, setFDept] = useState('');
   const [fFrom, setFFrom] = useState(''); const [fTo, setFTo] = useState('');
@@ -58,7 +58,7 @@ export default function KPIOverview() {
   const deferredFTo      = useDeferredValue(fTo);
 
   useEffect(() => { loadKpi(); }, [loadKpi]);
-  useEffect(() => { api('/config/benchmarks').then(d=>setBenchmarks(d.benchmarks||[])).catch(()=>{}); }, []);
+  // benchmarks loaded by DataProvider — no local effect needed
 
   const classifySegment = useMemo(() => {
     const benchMap = {};
@@ -146,7 +146,7 @@ export default function KPIOverview() {
       if(s._workerId)m[k].workers.add(s._workerId);
     });
     return Object.values(m).map(d=>({...d,avg:d.closed?Math.round(d.totalMin/d.closed*10)/10:null,
-      xph:d.totalMin>0?Math.round((d.unitSum||d.closed)/(d.totalMin/60)*10)/10:null,
+      xph:d.totalMin>0?Math.round((d.unitSum??0)/(d.totalMin/60)*10)/10:null,
       median:getMedian(d.durations),hrs:Math.round(d.totalMin/60*10)/10,
       pct:filtered.length?Math.round(d.count/filtered.length*100):0,workers:d.workers.size})).sort((a,b)=>b.count-a.count);
   },[filtered]);
@@ -163,7 +163,7 @@ export default function KPIOverview() {
       if(s.orderSerialNumber)b.orders.add(s.orderSerialNumber);
     });
     return Object.values(m).map(d=>({...d,orders:d.orders.size,avg:d.closed?Math.round(d.totalMin/d.closed*10)/10:null,
-      hrs:Math.round(d.totalMin/60*10)/10,xph:d.totalMin>0?Math.round(d.unitSum/(d.totalMin/60)*10)/10:null})).sort((a,b)=>b.count-a.count);
+      hrs:Math.round(d.totalMin/60*10)/10,xph:d.totalMin>0?Math.round((d.unitSum??0)/(d.totalMin/60)*10)/10:null})).sort((a,b)=>b.count-a.count);
   },[filtered]);
 
   const daily = useMemo(()=>{
@@ -290,6 +290,8 @@ export default function KPIOverview() {
       render:v=><span className={`badge ${v?'badge-warning':'badge-success'}`}>{v?'Open':'Closed'}</span>},
     {key:'reportItemCount', label:'Reports',    w:70,  right:true, sortable:true,
       render:v=>v>0?<span className="font-semibold">{v}</span>:<span className="text-ink-300">—</span>},
+    {key:'credentialCount', label:'Creds',      w:65,  right:true, sortable:true,
+      render:v=>v>0?<span className="font-semibold text-purple-700">{v}</span>:<span className="text-ink-300">—</span>},
   ];
 
   const statusCols = [
@@ -303,6 +305,7 @@ export default function KPIOverview() {
     {key:'median',label:'Median',w:70,right:true,sortable:true,render:v=>v!=null?fmtDur(v):'—'},
     {key:'hrs',label:'Total Hrs',w:80,right:true,sortable:true,render:v=>fmtHrs(v)},
     {key:'workers',label:'Workers',w:70,right:true,sortable:true,render:v=>fmtI(v)},
+    {key:'xph',   label:'XpH',    w:65,right:true,sortable:true,render:v=>v!=null?<span className="font-semibold text-brand-600">{fmt(v)}</span>:'—'},
   ];
 
   const workerCols = [
@@ -313,6 +316,7 @@ export default function KPIOverview() {
     {key:'closed',label:'Closed',w:65,right:true,sortable:true,render:v=>fmtI(v)},
     {key:'open',label:'Open',w:60,right:true,sortable:true,render:v=>v>0?<span className="text-amber-600 font-semibold">{fmtI(v)}</span>:'0'},
     {key:'avg',label:'Avg',w:70,right:true,sortable:true,render:v=>v!=null?fmtDur(v):'—'},
+    {key:'xph',label:'XpH',      w:65,right:true,sortable:true,render:v=>v!=null?<span className="font-semibold text-brand-600">{fmt(v)}</span>:'—'},
     {key:'hrs',label:'Total Hrs',w:80,right:true,sortable:true,render:v=>fmtHrs(v)},
     {key:'xph',label:'XpH',w:70,right:true,sortable:true,render:v=>v!=null?<span className="font-semibold text-brand-600">{fmt(v)}</span>:'—'},
   ];
