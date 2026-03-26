@@ -39,7 +39,7 @@ export default function DashboardGrid({ pageId, defaultLayout, children }) {
   }, [pageId, editing]);
 
   const onLayoutChange = (currentLayout, allLayouts) => {
-    if (!editing) return; // Don't update state when locked
+    if (!editing) return;
     setLayouts(allLayouts);
     saveLayout(allLayouts);
   };
@@ -61,7 +61,7 @@ export default function DashboardGrid({ pageId, defaultLayout, children }) {
           {editing ? '✓ Done Editing' : '⚙ Customize Layout'}
         </button>
         {editing && <button onClick={resetLayout} className="text-[11px] text-ink-400 hover:text-ink-700 px-3 py-1.5 border border-surface-200 rounded-lg bg-white font-medium">Reset Default</button>}
-        {editing && <span className="text-[11px] text-ink-400">Drag title bars · Resize corners · Auto-saves</span>}
+        {editing && <span className="hidden sm:inline text-[11px] text-ink-400">Drag title bars · Resize corners · Auto-saves</span>}
       </div>
       <ResponsiveGridLayout className="layout" layouts={layouts}
         breakpoints={{ lg: 1200, md: 996, sm: 768, xs: 480 }}
@@ -70,20 +70,22 @@ export default function DashboardGrid({ pageId, defaultLayout, children }) {
         isDraggable={editing} isResizable={editing}
         onLayoutChange={onLayoutChange}
         draggableHandle=".widget-handle"
-        compactType="vertical" margin={[12, 12]}>
+        compactType="vertical" margin={[10, 10]}>
         {children}
       </ResponsiveGridLayout>
     </div>
   );
 }
 
-export function Widget({ children, title, className = '' }) {
+export function Widget({ children, title, className = '', noPad = false }) {
   return (
     <div className={`card-surface overflow-hidden h-full flex flex-col ${className}`}>
-      {title && <div className="widget-handle px-4 py-2.5 text-xs font-semibold text-ink-500 border-b border-surface-200 select-none shrink-0 bg-surface-50">
-        {typeof title === 'string' ? title : title}
-      </div>}
-      <div className="flex-1 p-4 overflow-auto min-h-0">{children}</div>
+      {title && (
+        <div className="widget-handle px-3 sm:px-4 py-2 text-xs font-semibold text-ink-600 border-b border-surface-200 select-none shrink-0 bg-surface-50/80 flex items-center justify-between">
+          {typeof title === 'string' ? <span>{title}</span> : title}
+        </div>
+      )}
+      <div className={`flex-1 overflow-auto min-h-0 ${noPad ? '' : 'p-3 sm:p-4'}`}>{children}</div>
     </div>
   );
 }

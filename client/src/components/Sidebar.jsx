@@ -17,10 +17,12 @@ const NAV = [
   { to:'/admin/backfill', icon:'↻', label:'Data Backfill', section:'ADMIN', adminOnly:true },
 ];
 
-export default function Sidebar() {
+export default function Sidebar({ onNavigate }) {
   const user = getUser();
   const nav = useNavigate();
   const sections = [...new Set(NAV.map(n => n.section))];
+
+  const handleNav = () => { if (onNavigate) onNavigate(); };
 
   return (
     <aside className="w-56 bg-white border-r border-surface-200 flex flex-col h-screen fixed left-0 top-0 z-30">
@@ -47,6 +49,7 @@ export default function Sidebar() {
               <div className="text-[9px] font-bold uppercase tracking-[0.1em] text-ink-400 px-2 pt-4 pb-1.5">{sec}</div>
               {items.map(n => (
                 <NavLink key={n.to} to={n.to} end={n.to==='/'}
+                  onClick={handleNav}
                   className={({ isActive }) =>
                     `flex items-center gap-2.5 px-3 py-2 rounded-lg text-[13px] font-medium transition-all ${
                       isActive

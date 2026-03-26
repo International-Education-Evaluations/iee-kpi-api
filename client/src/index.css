@@ -34,7 +34,7 @@ body {
 ::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 10px; }
 ::-webkit-scrollbar-thumb:hover { background: #94a3b8; }
 
-/* Surface cards */
+/* ── Surface cards ────────────────────────────────────── */
 .card-surface {
   background: white;
   border: 1px solid var(--border);
@@ -47,13 +47,14 @@ body {
   border-color: var(--border-hover);
 }
 
-/* Tables */
+/* ── Tables — responsive ─────────────────────────────── */
 .tbl { border-collapse: collapse; width: 100%; }
 .tbl th {
   font-size: 11px; font-weight: 600; text-transform: uppercase;
   letter-spacing: 0.05em; color: #64748b;
   padding: 10px 14px; text-align: left;
   background: #f8fafc; border-bottom: 2px solid #e2e8f0;
+  white-space: nowrap;
 }
 .tbl td {
   padding: 10px 14px; font-size: 13px; color: #334155;
@@ -61,8 +62,11 @@ body {
 }
 .tbl tbody tr:hover td { background: #f8fafc; }
 .tbl tbody tr.cursor-pointer:hover td { background: #e8f7fd; }
+@media (max-width: 768px) {
+  .tbl th, .tbl td { padding: 8px 10px; font-size: 11px; }
+}
 
-/* Loading shimmer */
+/* ── Loading shimmer ─────────────────────────────────── */
 @keyframes shimmer {
   0% { background-position: -400px 0; }
   100% { background-position: 400px 0; }
@@ -73,7 +77,7 @@ body {
   animation: shimmer 1.5s ease-in-out infinite;
 }
 
-/* Chat bubbles */
+/* ── Chat bubbles ────────────────────────────────────── */
 .chat-user {
   background: var(--brand-light);
   border: 1px solid #b8e8f8;
@@ -94,7 +98,7 @@ body {
   color: #008bbf;
 }
 
-/* react-grid-layout light theme */
+/* ── react-grid-layout light theme ───────────────────── */
 .react-grid-item.react-grid-placeholder {
   background: rgba(0, 174, 239, 0.08) !important;
   border: 2px dashed rgba(0, 174, 239, 0.3) !important;
@@ -109,7 +113,7 @@ body {
   box-shadow: 0 20px 40px rgba(0,0,0,0.12), 0 8px 16px rgba(0,0,0,0.06);
 }
 
-/* Status badges */
+/* ── Status badges ───────────────────────────────────── */
 .badge {
   display: inline-flex; align-items: center; gap: 4px;
   font-size: 11px; font-weight: 600; padding: 2px 8px;
@@ -120,3 +124,55 @@ body {
 .badge-danger { background: #fee2e2; color: #b91c1c; }
 .badge-info { background: #e0f2fe; color: #0369a1; }
 .badge-neutral { background: #f1f5f9; color: #475569; }
+
+/* ── Trend indicator ─────────────────────────────────── */
+.trend-up { color: #16a34a; }
+.trend-down { color: #dc2626; }
+.trend-flat { color: #64748b; }
+
+/* ── Chart containers ────────────────────────────────── */
+.recharts-wrapper { font-family: 'DM Sans', system-ui, sans-serif !important; }
+.recharts-cartesian-axis-tick-value { fill: #64748b !important; font-size: 11px !important; }
+.recharts-tooltip-wrapper { z-index: 50 !important; }
+
+/* ── Responsive sidebar collapse ─────────────────────── */
+@media (max-width: 1024px) {
+  .sidebar-desktop { display: none; }
+  .main-content { margin-left: 0 !important; }
+}
+@media (min-width: 1025px) {
+  .sidebar-mobile-toggle { display: none; }
+}
+
+/* ── Responsive card grids ───────────────────────────── */
+.metric-grid {
+  display: grid;
+  gap: 0.5rem;
+  grid-template-columns: repeat(2, 1fr);
+}
+@media (min-width: 640px) { .metric-grid { grid-template-columns: repeat(3, 1fr); } }
+@media (min-width: 768px) { .metric-grid { grid-template-columns: repeat(4, 1fr); } }
+@media (min-width: 1280px) { .metric-grid { grid-template-columns: repeat(7, 1fr); } }
+
+.metric-grid-5 {
+  display: grid; gap: 0.5rem;
+  grid-template-columns: repeat(2, 1fr);
+}
+@media (min-width: 640px) { .metric-grid-5 { grid-template-columns: repeat(3, 1fr); } }
+@media (min-width: 1024px) { .metric-grid-5 { grid-template-columns: repeat(5, 1fr); } }
+
+.metric-grid-6 {
+  display: grid; gap: 0.5rem;
+  grid-template-columns: repeat(2, 1fr);
+}
+@media (min-width: 640px) { .metric-grid-6 { grid-template-columns: repeat(3, 1fr); } }
+@media (min-width: 1024px) { .metric-grid-6 { grid-template-columns: repeat(6, 1fr); } }
+
+/* ── Fade-in animation ───────────────────────────────── */
+@keyframes fadeUp {
+  from { opacity: 0; transform: translateY(8px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+.animate-fade-up {
+  animation: fadeUp 0.3s ease-out both;
+}

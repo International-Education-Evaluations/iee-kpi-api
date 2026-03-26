@@ -23,6 +23,10 @@ export default function InvitePage() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ token, password })
       });
+      const contentType = r.headers.get('content-type') || '';
+      if (!contentType.includes('application/json')) {
+        throw new Error(r.status === 503 ? 'Server is temporarily unavailable. Try again in 30 seconds.' : `Server error ${r.status}`);
+      }
       const d = await r.json();
       if (!r.ok) throw new Error(d.error || 'Failed');
       setToken(d.token); setUser(d.user);

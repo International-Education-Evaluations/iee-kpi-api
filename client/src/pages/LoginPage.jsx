@@ -1,6 +1,6 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { doLogin, doSetup } from '../hooks/useApi';
+import { doLogin, doSetup, isAuth } from '../hooks/useApi';
 
 export default function LoginPage() {
   const [mode, setMode] = useState('login');
@@ -10,7 +10,25 @@ export default function LoginPage() {
   const [setupSecret, setSetupSecret] = useState('');
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
+  const [serverUp, setServerUp] = useState(null); // null=checking, true=up, false=down
   const nav = useNavigate();
+
+  // If already authenticated, redirect to dashboard
+  useEffect(() => { if (isAuth()) nav('/'); }, [nav]);
+
+  // Check server health on mount
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const r = await fetch('/health');
+        if (!cancelled) setServerUp(r.ok);
+      } catch {
+        if (!cancelled) setServerUp(false);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, []);
 
   const submit = async e => {
     e.preventDefault(); setError(''); setLoading(true);
@@ -31,11 +49,22 @@ export default function LoginPage() {
         {/* Logo */}
         <div className="text-center mb-8">
           <div className="inline-flex items-center justify-center w-14 h-14 rounded-2xl bg-brand-500 shadow-lg shadow-brand-200 mb-4">
-            <span className="text-ink-900 font-display font-bold text-xl">IEE</span>
+            <span className="text-white font-display font-bold text-xl">IEE</span>
           </div>
           <h1 className="font-display text-2xl font-bold text-ink-900 tracking-tight">Operations Dashboard</h1>
           <p className="text-ink-400 text-sm mt-1.5">KPI · QC · Queue · Reports</p>
         </div>
+
+        {/* Server status indicator */}
+        {serverUp === false && (
+          <div className="mb-4 px-4 py-3 bg-red-50 border border-red-200 rounded-lg">
+            <div className="flex items-center gap-2">
+              <span className="w-2 h-2 rounded-full bg-red-500 animate-pulse" />
+              <span className="text-sm font-medium text-red-700">Server Unavailable</span>
+            </div>
+            <p className="text-xs text-red-600 mt-1">The API server is not responding. Check your Railway deployment and MongoDB Atlas cluster status.</p>
+          </div>
+        )}
 
         {/* Card */}
         <div className="card-surface p-7">
@@ -67,9 +96,16 @@ export default function LoginPage() {
               <input type="password" value={password} onChange={e => setPassword(e.target.value)} placeholder="••••••••"
                 className="w-full px-3.5 py-2.5 bg-white border border-surface-200 rounded-lg text-ink-900 placeholder-ink-400 text-sm focus:outline-none focus:border-brand-400 focus:ring-2 focus:ring-brand-100" />
             </div>
-            {error && <div className="text-red-700 text-sm bg-red-50 border border-red-200 rounded-lg px-3 py-2.5 font-medium">{error}</div>}
-            <button type="submit" disabled={loading}
-              className="w-full py-2.5 bg-brand-500 hover:bg-brand-600 disabled:bg-surface-200 disabled:text-ink-400 text-ink-900 rounded-lg font-semibold text-sm transition-all shadow-lg shadow-brand-200">
+            {error && (
+              <div className="text-red-700 text-sm bg-red-50 border border-red-200 rounded-lg px-3 py-2.5">
+                <div className="font-medium">{error}</div>
+                {error.includes('503') || error.includes('502') || error.includes('unavailable') || error.includes('Cannot reach') ? (
+                  <div className="text-xs text-red-600 mt-1">This usually means the server ran out of resources. Check Railway deployment logs and MongoDB Atlas cluster status.</div>
+                ) : null}
+              </div>
+            )}
+            <button type="submit" disabled={loading || serverUp === false}
+              className="w-full py-2.5 bg-brand-500 hover:bg-brand-600 disabled:bg-surface-200 disabled:text-ink-400 text-white rounded-lg font-semibold text-sm transition-all shadow-lg shadow-brand-200">
               {loading ? 'Connecting...' : mode === 'setup' ? 'Create Admin Account' : 'Sign In'}
             </button>
           </form>

@@ -1,15 +1,50 @@
 import { useState, useCallback } from 'react';
 
-export const getToken = () => sessionStorage.getItem('iee_t') || '';
-export const setToken = t => sessionStorage.setItem('iee_t', t);
-export const getUser = () => JSON.parse(sessionStorage.getItem('iee_u') || 'null');
-export const setUser = u => sessionStorage.setItem('iee_u', JSON.stringify(u));
-export const clearAuth = () => { sessionStorage.removeItem('iee_t'); sessionStorage.removeItem('iee_u'); };
-export const isAuth = () => !!getToken() && !!getUser();
+// ── Auth helpers ────────────────────────────────────────────
+// Uses localStorage so login persists across tabs and browser restarts.
+// JWT expiration is checked client-side before API calls.
+export const getToken = () => localStorage.getItem('iee_t') || '';
+export const setToken = t => localStorage.setItem('iee_t', t);
+export const getUser = () => JSON.parse(localStorage.getItem('iee_u') || 'null');
+export const setUser = u => localStorage.setItem('iee_u', JSON.stringify(u));
+export const clearAuth = () => { localStorage.removeItem('iee_t'); localStorage.removeItem('iee_u'); };
+export const isAuth = () => {
+  const t = getToken();
+  const u = getUser();
+  if (!t || !u) return false;
+  // Check JWT expiration client-side (avoids surprise 401 on first API call)
+  try {
+    const payload = JSON.parse(atob(t.split('.')[1]));
+    if (payload.exp && payload.exp * 1000 < Date.now()) {
+      clearAuth();
+      return false;
+    }
+  } catch { clearAuth(); return false; }
+  return true;
+};
 export const isAdmin = () => getUser()?.role === 'admin';
 export const isManagerPlus = () => ['admin','manager'].includes(getUser()?.role);
 
+// ── Token remaining time (for UI display) ──────────────────
+export function getTokenExpiresIn() {
+  const t = getToken();
+  if (!t) return null;
+  try {
+    const payload = JSON.parse(atob(t.split('.')[1]));
+    if (!payload.exp) return null;
+    const ms = payload.exp * 1000 - Date.now();
+    return ms > 0 ? ms : null;
+  } catch { return null; }
+}
+
+// ── API fetch wrapper ──────────────────────────────────────
 export async function api(path, opts = {}) {
+  // Pre-check token expiration before making the call
+  if (!isAuth()) {
+    clearAuth();
+    window.location.href = '/login';
+    throw new Error('Session expired');
+  }
   const token = getToken();
   const h = { 'Content-Type': 'application/json', ...opts.headers };
   if (token) h['Authorization'] = `Bearer ${token}`;
@@ -19,6 +54,7 @@ export async function api(path, opts = {}) {
   return r.json();
 }
 
+// ── Login / Setup ──────────────────────────────────────────
 export async function doLogin(email, password) {
   const r = await fetch('/auth/login', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ email, password }) });
   const d = await r.json();
@@ -35,6 +71,7 @@ export async function doSetup(email, password, name, setupSecret) {
   return d.user;
 }
 
+// ── Generic data hook (kept for backward compat) ───────────
 export function useData(init = null) {
   const [data, setData] = useState(init);
   const [loading, setLoading] = useState(false);

@@ -3798,6 +3798,32 @@ app.get('/backfill/settings', async (req, res) => {
   }
 });
 
+// —— GET /backfill/next — Lightweight status for dashboard widget ——
+// Returns: isRunning, lastRunAt, nextRunAt, enabled, intervalMin
+app.get('/backfill/next', async (req, res) => {
+  try {
+    const db = await getConfigDb();
+    const [settings, status] = await Promise.all([
+      db.collection('backfill_metadata').findOne({ _id: 'settings' }),
+      db.collection('backfill_metadata').findOne({ _id: 'status' })
+    ]);
+    const enabled = settings?.enabled !== false;
+    const intervalMin = settings?.autoRefreshMinutes || 5;
+    const lastRunAt = status?.lastRunAt || null;
+    const lastRunDurationSec = status?.lastRunDurationSec || null;
+    const isRunning = backfillRunning;
+
+    let nextRunAt = null;
+    if (enabled && lastRunAt && !isRunning) {
+      nextRunAt = new Date(new Date(lastRunAt).getTime() + intervalMin * 60 * 1000).toISOString();
+    }
+
+    res.json({ enabled, intervalMin, isRunning, lastRunAt, lastRunDurationSec, nextRunAt });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ═══════════════════════════════════════════════════════════
 // FAST READ ENDPOINTS — Read from backfill collections
 // These replace the slow live queries for the dashboard.
@@ -3917,28 +3943,33 @@ app.get('/data/queue-snapshot', async (req, res) => {
 
 // ── Backfill auto-scheduler ─────────────────────────────
 function startBackfillScheduler() {
-  let lastCheckMs = 0;
-
   setInterval(async () => {
     try {
       const db = await getConfigDb();
       const settings = await db.collection('backfill_metadata').findOne({ _id: 'settings' });
-      if (!settings?.enabled) return;
+      if (!settings?.enabled) return; // disabled by default — must be explicitly enabled
 
       const intervalMs = (settings.autoRefreshMinutes || 5) * 60 * 1000;
       const status = await db.collection('backfill_metadata').findOne({ _id: 'status' });
       const lastRun = status?.lastRunAt ? new Date(status.lastRunAt).getTime() : 0;
 
+      // Memory safety: skip if RSS > 400MB (Railway hobby = 512MB)
+      const memMB = Math.round(process.memoryUsage().rss / 1024 / 1024);
+      if (memMB > 400) {
+        console.log(`[BACKFILL-CRON] Skipped — memory too high (${memMB}MB RSS). Waiting for GC.`);
+        return;
+      }
+
       if (Date.now() - lastRun >= intervalMs && !backfillRunning) {
-        console.log(`[BACKFILL-CRON] Auto-backfill triggered (interval: ${settings.autoRefreshMinutes}min)`);
+        console.log(`[BACKFILL-CRON] Auto-backfill triggered (interval: ${settings.autoRefreshMinutes}min, mem: ${memMB}MB)`);
         runBackfill({ days: settings.days || 90, triggeredBy: 'auto-scheduler' });
       }
     } catch (err) {
       console.error('[BACKFILL-CRON] Error:', err.message);
     }
-  }, 15000); // Check every 15 seconds
+  }, 60000); // Check every 60 seconds (was 15s — no need to poll MongoDB that aggressively)
 
-  console.log('Backfill auto-scheduler started (checks every 15s)');
+  console.log('Backfill auto-scheduler started (checks every 60s, disabled by default)');
 }
 
 
