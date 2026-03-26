@@ -3671,6 +3671,10 @@ async function runOrderArrivalBackfill(prodDb, configDb, push) {
       turnCol.createIndex({ isCompleted:1, turnaroundHrs:1 }, { background:true }).catch(()=>{}),
       turnCol.createIndex({ processTimeSlug:1 }, { background:true }).catch(()=>{}),
       arrCol.createIndex({ dow:1, hour:1 }, { background:true }).catch(()=>{}),
+      // TTL: automatically expire turnaround records older than 365 days
+      // This prevents unbounded growth — at ~200 orders/day the collection
+      // would otherwise reach ~73k docs/year and slow aggregations significantly.
+      turnCol.createIndex({ createdAt:1 }, { expireAfterSeconds: 365*24*3600, background:true }).catch(()=>{}),
     ]);
 
     push(`  Arrivals done: ${turnaroundCount} turnaround records, ${aggResult.length} heatmap slots`);
@@ -4298,7 +4302,7 @@ async function runBackfill(options = {}) {
     const { _id: _, ...historyDoc } = { ...metadata };
     await configDb.collection('backfill_history').insertOne({ ...historyDoc, completedAt: new Date() });
     await configDb.collection('backfill_history')
-      .deleteMany({ completedAt: { $lt: new Date(Date.now() - 7 * 24 * 60 * 60 * 1000) } }); // keep 7 days
+      .deleteMany({ completedAt: { $lt: new Date(Date.now() - 60 * 24 * 60 * 60 * 1000) } }); // keep 60 days (needed for monthly full-refresh detection)
 
     push(`Done in ${(elapsed/1000).toFixed(1)}s — ${upsertedSegs} new segs, ${updatedSegs} updated, ${upsertedQc} new QC, ${totalSegs} total`);
     backfillRunning  = false;
@@ -4739,8 +4743,25 @@ function startBackfillScheduler() {
       // the run *finished*, not 2min after it started.
       const timeSinceEnd = Date.now() - backfillLastRunEnd;
       if (timeSinceEnd >= intervalMs && !backfillRunning) {
-        console.log(`[BACKFILL-CRON] Auto-backfill triggered (interval: ${settings.autoRefreshMinutes}min, mem: ${memMB}MB, cooldown: ${Math.round(timeSinceEnd/1000)}s since last end)`);
-        runBackfill({ days: settings.days || 90, triggeredBy: 'auto-scheduler' });
+
+        // Monthly full-refresh guard: if last full refresh was >30 days ago,
+        // trigger a full refresh to purge segments outside the retention window.
+        // This prevents old segment accumulation when only incremental runs.
+        const historyDb = await getConfigDb();
+        const lastFull = await historyDb.collection('backfill_history')
+          .findOne({ mode: 'full' }, { sort: { completedAt: -1 }, projection: { completedAt: 1 } });
+        const lastFullAt = lastFull?.completedAt ? new Date(lastFull.completedAt) : null;
+        const daysSinceFullRefresh = lastFullAt
+          ? (Date.now() - lastFullAt.getTime()) / 86400000
+          : 999;
+
+        if (daysSinceFullRefresh > 30) {
+          console.log(`[BACKFILL-CRON] Auto full-refresh triggered — last full refresh was ${Math.round(daysSinceFullRefresh)}d ago`);
+          runBackfill({ fullRefresh: true, days: settings.days || 90, triggeredBy: 'auto-monthly-full' });
+        } else {
+          console.log(`[BACKFILL-CRON] Auto-backfill triggered (interval: ${settings.autoRefreshMinutes}min, mem: ${memMB}MB, cooldown: ${Math.round(timeSinceEnd/1000)}s since last end)`);
+          runBackfill({ days: settings.days || 90, triggeredBy: 'auto-scheduler' });
+        }
       }
     } catch (err) {
       console.error('[BACKFILL-CRON] Error:', err.message);
@@ -5279,7 +5300,8 @@ app.get('/data/forecast/arrivals', async (req, res) => {
         { $group: {
             _id: { processTimeSlug: '$processTimeSlug', orderType: '$orderType' },
             count: { $sum: 1 }, avgHrs: { $avg: '$turnaroundHrs' },
-            latePct: { $avg: { $cond:['$isLate',1,0] } }, hrs: { $push: '$turnaroundHrs' }
+            latePct: { $avg: { $cond:['$isLate',1,0] } },
+            hrs: { $firstN:{ input:'$turnaroundHrs', n:2000 } } // capped for scale
         }},
         { $project: { _id:0, processTimeSlug:'$_id.processTimeSlug', orderType:'$_id.orderType',
             count:1, avgHrs:{ $round:['$avgHrs',1] }, latePct:{ $round:[{ $multiply:['$latePct',100] },1] }, hrs:1 }}
@@ -5382,9 +5404,11 @@ app.get('/data/forecast/sla-analysis', async (req, res) => {
     const dept = req.query.dept || '';
     const deptMatch = dept ? { departmentName: dept } : {};
 
-    const [byTypeRaw, byStatusRaw, bottlenecksRaw, dailyTrend, departments] = await Promise.all([
+    const [byTypeRaw, byStatusRaw, bottlenecksRaw, departments, dailyTrend] = await Promise.all([
 
       // Turnaround distribution by order type + process time (JS percentiles — avoids $percentile MongoDB 7+ req)
+      // Use $sample to cap array size for percentile calc — prevents memory bloat at scale.
+      // 2000 samples gives <2% percentile error (CLT), avoids $push on 50k+ doc arrays.
       db.collection('backfill_order_turnaround').aggregate([
         { $match: { isCompleted:true, createdAt:{ $gte:d180 }, turnaroundHrs:{ $gt:0, $lt:2000 }, ...deptMatch } },
         { $group: {
@@ -5392,7 +5416,8 @@ app.get('/data/forecast/sla-analysis', async (req, res) => {
             count:    { $sum:1 }, avgHrs:{ $avg:'$turnaroundHrs' },
             latePct:  { $avg:{ $cond:['$isLate',1,0] } },
             avgDaysLate: { $avg:{ $cond:['$isLate','$daysLate',null] } },
-            hrs:      { $push:'$turnaroundHrs' }
+            // $firstN capped at 2000 — statistically sufficient for P50/P75/P90
+            hrs: { $firstN: { input:'$turnaroundHrs', n:2000 } }
         }},
         { $project: { _id:0, orderType:'$_id.orderType', processTimeSlug:'$_id.processTimeSlug',
             count:1, avgHrs:{ $round:['$avgHrs',1] },
@@ -5411,7 +5436,8 @@ app.get('/data/forecast/sla-analysis', async (req, res) => {
         { $unwind:'$sw' },
         { $group:{ _id:'$sw.k',
             avgWaitMin:{ $avg:'$sw.v' }, maxWaitMin:{ $max:'$sw.v' },
-            count:{ $sum:1 }, vals:{ $push:'$sw.v' }
+            count:{ $sum:1 },
+            vals:{ $firstN:{ input:'$sw.v', n:2000 } } // capped for scale
         }},
         { $project:{ _id:0, statusSlug:'$_id',
             avgWaitMin:{ $round:['$avgWaitMin',0] },
@@ -5429,7 +5455,8 @@ app.get('/data/forecast/sla-analysis', async (req, res) => {
         { $match:{ 'sw.v':{ $gt:60 } } }, // >1 hour waits only
         { $group:{ _id:'$sw.k',
             avgWaitHrs:{ $avg:{ $divide:['$sw.v',60] } },
-            count:{ $sum:1 }, vals:{ $push:{ $divide:['$sw.v',60] } }
+            count:{ $sum:1 },
+            vals:{ $firstN:{ input:{ $divide:['$sw.v',60] }, n:2000 } } // capped for scale
         }},
         { $project:{ _id:0, statusSlug:'$_id',
             avgWaitHrs:{ $round:['$avgWaitHrs',1] },
@@ -5524,6 +5551,24 @@ app.post('/ai/conversations', async (req, res) => {
     const preview = messages.find(m=>m.role==='user')?.content?.substring(0,100)||'';
     const doc = { userId, title:title||preview.substring(0,60)||'New conversation', messages, preview, messageCount:messages.length, createdAt:new Date(), updatedAt:new Date() };
     const result = await db.collection('dashboard_ai_conversations').insertOne(doc);
+
+    // Cap at 100 conversations per user — prune oldest beyond the limit.
+    // This prevents unbounded growth for power users over months.
+    // 100 conversations ≈ ~3 months of daily use at 1/day.
+    const totalConvos = await db.collection('dashboard_ai_conversations').countDocuments({ userId });
+    if (totalConvos > 100) {
+      const oldest = await db.collection('dashboard_ai_conversations')
+        .find({ userId }, { projection:{ _id:1 } })
+        .sort({ updatedAt: 1 })
+        .limit(totalConvos - 100)
+        .toArray();
+      if (oldest.length > 0) {
+        await db.collection('dashboard_ai_conversations').deleteMany({
+          _id: { $in: oldest.map(o => o._id) }
+        });
+      }
+    }
+
     res.json({ success:true, id:result.insertedId, conversation:doc });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });

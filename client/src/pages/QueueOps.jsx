@@ -140,6 +140,59 @@ export default function QueueOps() {
         <Card label="Entered Today" value={fmtI(sm?.today)} color="brand" loading={loading} />
       </div>
 
+      {/* ── Compact status order count strip ──────────────────────────── */}
+      {view==='snapshot' && snap?.snapshot && (
+        <div className="card-surface p-3">
+          <div className="text-[10px] font-semibold uppercase tracking-wider text-ink-400 mb-2 px-1">
+            Orders by Status
+          </div>
+          <div className="flex flex-wrap gap-1.5">
+            {(snap.snapshot||[])
+              .filter(s => s.orderCount > 0)
+              .sort((a,b) => b.orderCount - a.orderCount)
+              .map(s => {
+                const isHold   = s.statusType === 'On-Hold' || s.statusType === 'Holding';
+                const isProc   = s.statusType === 'Processing';
+                const isWait   = s.isWaitingStatus;
+                const hasAged  = s.over72h > 0;
+                const bgClass  = hasAged
+                  ? 'bg-red-50 border-red-200 hover:bg-red-100'
+                  : isProc
+                    ? 'bg-brand-50 border-brand-200 hover:bg-brand-100'
+                    : isHold
+                      ? 'bg-amber-50 border-amber-200 hover:bg-amber-100'
+                      : 'bg-surface-50 border-surface-200 hover:bg-surface-100';
+                const countColor = hasAged
+                  ? 'text-red-700'
+                  : isProc ? 'text-brand-700'
+                  : isHold ? 'text-amber-700'
+                  : 'text-ink-700';
+                const shortName = (s.statusName||'')
+                  .replace('Awaiting ','Aw. ')
+                  .replace('Digital Records ','DR ')
+                  .replace('Processing','Proc.')
+                  .replace('Verification','Verif.')
+                  .replace('Evaluation','Eval.')
+                  .replace('Fulfillment','Fulfill.');
+                return (
+                  <button key={s.statusSlug}
+                    onClick={() => openDrawer(s)}
+                    title={`${s.statusName} — ${fmtI(s.orderCount)} orders${s.over72h>0?' · '+fmtI(s.over72h)+' aged >72h':''}`}
+                    className={`inline-flex items-center gap-1.5 px-2 py-1 rounded-lg border text-[11px] transition-colors cursor-pointer ${bgClass}`}>
+                    <span className={`font-bold ${countColor}`}>{fmtI(s.orderCount)}</span>
+                    <span className="text-ink-500 font-medium max-w-[100px] truncate">{shortName}</span>
+                    {s.over72h > 0 && (
+                      <span className="text-[9px] bg-red-200 text-red-700 rounded px-1 font-bold shrink-0">
+                        {fmtI(s.over72h)}+72h
+                      </span>
+                    )}
+                  </button>
+                );
+              })}
+          </div>
+        </div>
+      )}
+
       {view==='snapshot' && (
         <div className="card-surface p-4">
           <div className="flex items-center justify-between mb-3">
