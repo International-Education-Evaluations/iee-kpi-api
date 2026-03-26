@@ -13,6 +13,7 @@ import KPIScorecard from './pages/KPIScorecard';
 import OrderTracker from './pages/OrderTracker';
 import DeptComparison from './pages/DeptComparison';
 import ShiftHeatmap from './pages/ShiftHeatmap';
+import StaffingForecast from './pages/StaffingForecast';
 import QCOverview from './pages/QCOverview';
 import QueueOps from './pages/QueueOps';
 import ChatPage from './pages/ChatPage';
@@ -81,6 +82,7 @@ export default function App() {
           <Route path="/kpi/departments" element={<DeptComparison />} />
           <Route path="/kpi/heatmap" element={<ShiftHeatmap />} />
           <Route path="/orders" element={<OrderTracker />} />
+          <Route path="/kpi/forecast" element={<StaffingForecast />} />
           <Route path="/qc" element={<QCOverview />} />
           <Route path="/queue" element={<QueueOps />} />
           <Route path="/chat" element={<ChatPage />} />

@@ -8,6 +8,7 @@ const NAV = [
   { to:'/kpi/scorecard', icon:'◐', label:'Scorecard', section:'KPI' },
   { to:'/kpi/departments', icon:'⬡', label:'Dept Comparison', section:'KPI' },
   { to:'/kpi/heatmap', icon:'▦', label:'Shift Heatmap', section:'KPI' },
+  { to:'/kpi/forecast', icon:'◑', label:'Staffing Forecast', section:'KPI' },
   { to:'/orders', icon:'⬢', label:'Order Tracker', section:'OPS' },
   { to:'/qc', icon:'◆', label:'QC Overview', section:'QC' },
   { to:'/queue', icon:'▣', label:'Queue Ops', section:'OPS' },

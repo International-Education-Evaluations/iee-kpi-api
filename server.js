@@ -3287,7 +3287,22 @@ app.post('/email/send-now', requireRole('admin', 'manager'), async (req, res) =>
 // ═══════════════════════════════════════════════════════════
 
 let backfillRunning = false;
-let backfillLastRunEnd = 0; // epoch ms — anchors next-run calculation to run completion, not wall clock
+let backfillLastRunEnd = 0;
+let backfillStartedAt  = 0; // timestamp when current run started — for watchdog
+
+// Watchdog: if a backfill run has been active for more than 10 minutes, it's
+// stuck (likely a hung MongoDB cursor on production). Reset the flag so the
+// next cron cycle can start a fresh incremental run.
+setInterval(() => {
+  if (!backfillRunning || !backfillStartedAt) return;
+  const elapsedMin = (Date.now() - backfillStartedAt) / 60000;
+  if (elapsedMin > 10) {
+    console.error(`[WATCHDOG] Backfill stuck for ${Math.round(elapsedMin)}min — forcing reset`);
+    backfillRunning  = false;
+    backfillStartedAt = 0;
+    // Don't update lastRunEnd so the scheduler fires again promptly
+  }
+}, 30000); // check every 30s // epoch ms — anchors next-run calculation to run completion, not wall clock
 
 // ── User sync state — decoupled from main backfill cycle ──
 // Users change infrequently (HR ops, not order ops). Syncing 150k docs every
@@ -3380,9 +3395,165 @@ async function runUserSync(configDb, push) {
   }
 }
 
+// ── Order Arrival & Turnaround Backfill ─────────────────────────────────────
+async function runOrderArrivalBackfill(prodDb, configDb, push) {
+  try {
+    push('Backfilling order arrivals + turnaround...');
+    const ordersCol = prodDb.collection('orders');
+    const arrCol    = configDb.collection('backfill_order_arrivals');
+    const turnCol   = configDb.collection('backfill_order_turnaround');
+
+    // Go-live date: 2026-02-06 — orders before this date are V1 historical imports
+    // with original createdAt dates that don't represent real post-launch demand.
+    // We never look further back than go-live regardless of what's in the collection.
+    const GO_LIVE = new Date('2026-02-06T00:00:00.000Z');
+
+    const latest   = await turnCol.findOne({}, { sort:{ createdAt:-1 }, projection:{ createdAt:1 } });
+    const bufferMs = 30 * 60 * 1000;
+    const rawCutoff = latest?.createdAt
+      ? new Date(new Date(latest.createdAt).getTime() - bufferMs)
+      : new Date(Date.now() - 180 * 24 * 60 * 60 * 1000);
+    // Enforce go-live floor — never pull pre-launch V1 historical orders
+    const cutoff = rawCutoff < GO_LIVE ? GO_LIVE : rawCutoff;
+
+    // One-time cleanup: remove any records that were inserted before the isImport filter
+    // was added. These are V1 bulk-import orders that artificially spike the heatmap.
+    // Safe to run every time — it only deletes records that match isImport:true in prod.
+    // We identify them by cross-referencing with production: easier to just purge and
+    // rebuild by resetting the cutoff when we detect the collection has suspect data.
+    const totalExisting = await turnCol.countDocuments();
+    // Purge stale data: if the collection contains pre-go-live records from
+    // the old V1 historical import backfill, wipe and reseed with correct filter.
+    const hasPreLaunchData = totalExisting > 0 &&
+      await turnCol.countDocuments({ createdAt: { $lt: GO_LIVE } }) > 0;
+
+    if (hasPreLaunchData) {
+      const preCount = await turnCol.countDocuments({ createdAt: { $lt: GO_LIVE } });
+      push(`  Found ${preCount} pre-launch records — purging and re-seeding`);
+      await turnCol.deleteMany({});
+      await arrCol.deleteMany({});
+      cutoff = GO_LIVE; // reseed from go-live date only
+    }
+
+    push(`  Arrivals: fetching since ${cutoff.toISOString().slice(0,10)}`);
+
+    const cursor = ordersCol.find(
+      { paymentStatus:'paid', orderType:{ $in:['evaluation','translation'] }, deletedAt:null,
+        // Hard floor: only orders created on or after go-live date (2026-02-06).
+        // This excludes all 52,000 V1 historical orders that were imported with
+        // their original pre-launch createdAt dates during the V1→V2 migration.
+        createdAt: { $gte: GO_LIVE },
+        $or:[{ createdAt:{ $gte:cutoff } },{ orderPlaced:{ $gte:cutoff } }] },
+      { projection:{ orderSerialNumber:1, orderType:1, createdAt:1, orderPlaced:1, paidAt:1,
+          orderCompletedAt:1, orderDueDate:1, isUrgent:1, processTime:1,
+          orderStatus:1, institution:1, orderStatusHistory:1 },
+        maxTimeMS: 120000 } // 2-minute hard limit — prevents hanging the backfill engine
+    ).batchSize(500); // stream 500 at a time — avoids loading all 180 days into memory at once
+
+    // Process in streaming batches to keep memory bounded
+    let totalProcessed = 0;
+    let turnaroundCount = 0;
+    let batch = [];
+
+    const processBatch = async (ops) => {
+      if (!ops.length) return;
+      for (let i = 0; i < ops.length; i += 2000) {
+        const r = await turnCol.bulkWrite(ops.slice(i, i+2000), { ordered:false });
+        turnaroundCount += (r.upsertedCount||0) + (r.modifiedCount||0);
+      }
+    };
+
+    const turnaroundOps = []; // kept for compatibility — flushed per batch below
+    for await (const order of cursor) {
+      totalProcessed++;
+      const arrivedAt = toDate(order.createdAt || order.orderPlaced || order.paidAt);
+      if (!arrivedAt) continue;
+      const serial      = order.orderSerialNumber;
+      const oType       = order.orderType;
+      const processSlug = order.processTime?.slug || 'standard';
+      const isUrgent    = !!order.isUrgent;
+      const completedAt = toDate(order.orderCompletedAt);
+      const dueAt       = toDate(order.orderDueDate);
+      const turnaroundHrs = completedAt ? Math.round((completedAt - arrivedAt) / 360000) / 10 : null;
+      const isLate        = completedAt && dueAt ? completedAt > dueAt : null;
+      const daysLate      = (isLate && completedAt && dueAt) ? Math.round((completedAt - dueAt) / 86400000 * 10) / 10 : null;
+
+      // Walk history for Waiting-status wait times
+      const history    = Array.isArray(order.orderStatusHistory) ? order.orderStatusHistory : [];
+      const statusWaits = {};
+      for (let i = 0; i < history.length; i++) {
+        const entry = history[i]; const next = history[i+1];
+        const entryAt = toDate(entry?.createdAt); const nextAt = next ? toDate(next?.createdAt) : null;
+        const sType = entry?.updatedStatus?.statusType; const slug = entry?.updatedStatus?.slug;
+        if (!entryAt || !slug || sType !== 'Waiting' || !nextAt || nextAt <= entryAt) continue;
+        const waitMin = Math.round((nextAt - entryAt) / 60000 * 10) / 10;
+        statusWaits[slug] = (statusWaits[slug] || 0) + waitMin;
+      }
+
+      turnaroundOps.push({ updateOne: { filter:{ orderSerialNumber:serial }, update:{ $set:{
+        orderSerialNumber:serial, orderType:oType, processTimeSlug:processSlug,
+        isUrgent, institutionName:order.institution?.name||null,
+        createdAt:arrivedAt, completedAt:completedAt||null, dueAt:dueAt||null,
+        turnaroundHrs, isLate, daysLate, isCompleted:!!completedAt,
+        currentStatusType:order.orderStatus?.statusType||null, statusWaits,
+        _backfilledAt:new Date()
+      }}, upsert:true }});
+
+      // Flush every 1000 orders to keep memory bounded
+      if (turnaroundOps.length >= 1000) {
+        await processBatch(turnaroundOps.splice(0));
+        if (totalProcessed % 5000 === 0) push(`  Arrivals: ${totalProcessed} processed...`);
+      }
+    }
+    // Flush remainder
+    await processBatch(turnaroundOps.splice(0));
+    push(`  Processed ${totalProcessed} orders`);
+
+    // Rebuild arrival heatmap from turnaround collection
+    const aggResult = await turnCol.aggregate([
+      { $match:{ createdAt:{ $exists:true } } },
+      { $group:{ _id:{ dow:{ $subtract:[{ $dayOfWeek:'$createdAt' },1] }, hour:{ $hour:'$createdAt' } },
+          count:{ $sum:1 }, evaluation:{ $sum:{ $cond:[{ $eq:['$orderType','evaluation'] },1,0] } },
+          translation:{ $sum:{ $cond:[{ $eq:['$orderType','translation'] },1,0] } },
+          urgent:{ $sum:{ $cond:['$isUrgent',1,0] } },
+          completed:{ $sum:{ $cond:['$isCompleted',1,0] } },
+          avgTurnaroundHrs:{ $avg:{ $cond:['$isCompleted','$turnaroundHrs',null] } },
+          latePct:{ $avg:{ $cond:['$isCompleted',{ $cond:['$isLate',1,0] },null] } }
+      }},
+      { $project:{ _id:0, dow:'$_id.dow', hour:'$_id.hour', count:1, evaluation:1, translation:1,
+          urgent:1, completed:1,
+          avgTurnaroundHrs:{ $round:['$avgTurnaroundHrs',1] },
+          latePct:{ $round:[{ $multiply:['$latePct',100] },1] } }}
+    ]).toArray();
+
+    const arrOps = aggResult.map(r => ({ updateOne:{
+      filter:{ _id:`${r.dow}-${String(r.hour).padStart(2,'0')}` },
+      update:{ $set:{ ...r, _id:`${r.dow}-${String(r.hour).padStart(2,'0')}`, _backfilledAt:new Date() } },
+      upsert:true
+    }}));
+    if (arrOps.length) await arrCol.bulkWrite(arrOps, { ordered:false });
+
+    await Promise.all([
+      turnCol.createIndex({ createdAt:-1 }, { background:true }).catch(()=>{}),
+      turnCol.createIndex({ orderSerialNumber:1 }, { unique:true, background:true }).catch(()=>{}),
+      turnCol.createIndex({ orderType:1, createdAt:-1 }, { background:true }).catch(()=>{}),
+      turnCol.createIndex({ isCompleted:1, turnaroundHrs:1 }, { background:true }).catch(()=>{}),
+      turnCol.createIndex({ processTimeSlug:1 }, { background:true }).catch(()=>{}),
+      arrCol.createIndex({ dow:1, hour:1 }, { background:true }).catch(()=>{}),
+    ]);
+
+    push(`  Arrivals done: ${turnaroundCount} turnaround records, ${aggResult.length} heatmap slots`);
+    return { arrivalCount:aggResult.length, turnaroundCount };
+  } catch (err) {
+    push(`  Arrivals: SKIPPED (${err.message})`);
+    return { error:err.message };
+  }
+}
+
 async function runBackfill(options = {}) {
   if (backfillRunning) return { error: 'Backfill already in progress' };
-  backfillRunning = true;
+  backfillRunning  = true;
+  backfillStartedAt = Date.now();
   const startTime = Date.now();
   const log = [];
   const push = (msg) => { log.push(`[${((Date.now()-startTime)/1000).toFixed(1)}s] ${msg}`); console.log(`[BACKFILL] ${msg}`); };
@@ -3937,6 +4108,15 @@ async function runBackfill(options = {}) {
     }
 
     // ═════════════════════════════════════════════════════════
+    // 3c. ORDER ARRIVALS + TURNAROUND — staffing forecast data
+    // ═════════════════════════════════════════════════════════
+    try {
+      await runOrderArrivalBackfill(prodDb, configDb, push);
+    } catch (aErr) {
+      push(`Order arrivals: SKIPPED (${aErr.message})`);
+    }
+
+    // ═════════════════════════════════════════════════════════
     // 4. USERS — decoupled sync (60-minute cadence, staging swap)
     // ═════════════════════════════════════════════════════════
     // Users don't change at KPI frequency. Running a 150k-doc full replace
@@ -3990,14 +4170,16 @@ async function runBackfill(options = {}) {
       .deleteMany({ completedAt: { $lt: new Date(Date.now() - 7 * 24 * 60 * 60 * 1000) } }); // keep 7 days
 
     push(`Done in ${(elapsed/1000).toFixed(1)}s — ${upsertedSegs} new segs, ${updatedSegs} updated, ${upsertedQc} new QC, ${totalSegs} total`);
-    backfillRunning = false;
+    backfillRunning  = false;
+    backfillStartedAt = 0;
     backfillLastRunEnd = Date.now(); // anchor next-run window to completion, not wall clock
     invalidateBackfillMeta(); // flush cached meta so next request sees fresh lastRunAt
     return metadata;
 
   } catch (err) {
     push(`ERROR: ${err.message}`);
-    backfillRunning = false;
+    backfillRunning  = false;
+    backfillStartedAt = 0;
     backfillLastRunEnd = Date.now(); // record end even on error so scheduler doesn't tight-loop
     try {
       const configDb = await getConfigDb();
@@ -4409,10 +4591,13 @@ function startBackfillScheduler() {
 
       const intervalMs = (settings.autoRefreshMinutes || 5) * 60 * 1000;
 
-      // Memory guard: lowered to 300MB (was 400MB) to leave more headroom on 512MB Railway.
-      // After a skip, enforce a 90s cooldown so GC has time to run before next check.
+      // Memory guard: skip auto-cron if a run is already consuming memory.
+      // Threshold is 450MB — leaves 62MB headroom on Railway's 512MB container.
+      // The order arrival step (180-day seed) can spike to ~460MB so this was
+      // raised from 300MB to avoid false-positive skips during initial seeding.
+      // After a skip, enforce a 90s cooldown so GC has time to run.
       const memMB = Math.round(process.memoryUsage().rss / 1024 / 1024);
-      if (memMB > 300) {
+      if (memMB > 450) {
         _schedulerSkipUntil = Date.now() + 90_000; // 90s mandatory cooldown
         console.log(`[BACKFILL-CRON] Skipped — memory too high (${memMB}MB RSS). Cooldown 90s.`);
         return;
@@ -4907,6 +5092,231 @@ app.post('/reports/export', async (req, res) => {
     res.setHeader('Content-Type', 'text/csv');
     res.setHeader('Content-Disposition', `attachment; filename="iee-report-${source}-${new Date().toISOString().slice(0,10)}.csv"`);
     res.send([headers.join(','), ...csvRows].join('\n'));
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// —— GET /data/forecast/arrivals — Arrival heatmap ───────────
+// Returns hourly order arrival counts by day-of-week.
+// Powers the demand curve in the staffing forecast page.
+app.get('/data/forecast/arrivals', async (req, res) => {
+  try {
+    const db = await getConfigDb();
+    const slots = await db.collection('backfill_order_arrivals').find({}).toArray();
+
+    // Also return weekly totals and recent trend from turnaround collection
+    const now = new Date();
+    const d30 = new Date(now - 30 * 86400000);
+    const d90 = new Date(now - 90 * 86400000);
+
+    const [weeklyTrend, slaStats] = await Promise.all([
+      // Weekly order count for last 12 weeks
+      db.collection('backfill_order_turnaround').aggregate([
+        { $match: { createdAt: { $gte: d90 } } },
+        { $group: {
+            _id: { $dateToString: { format:'%G-W%V', date:'$createdAt' } },
+            count: { $sum: 1 }, evaluation: { $sum: { $cond:[{ $eq:['$orderType','evaluation'] },1,0] } },
+            translation: { $sum: { $cond:[{ $eq:['$orderType','translation'] },1,0] } },
+        }},
+        { $sort: { _id: 1 } }
+      ]).toArray(),
+
+      // SLA stats by processTimeSlug (standard/rush) over last 90 days
+      db.collection('backfill_order_turnaround').aggregate([
+        { $match: { createdAt: { $gte: d90 }, isCompleted: true } },
+        { $group: {
+            _id: { processTimeSlug: '$processTimeSlug', orderType: '$orderType' },
+            count:         { $sum: 1 },
+            avgHrs:        { $avg: '$turnaroundHrs' },
+            p50:           { $percentile: { input:'$turnaroundHrs', p:[0.5], method:'approximate' } },
+            p75:           { $percentile: { input:'$turnaroundHrs', p:[0.75], method:'approximate' } },
+            p90:           { $percentile: { input:'$turnaroundHrs', p:[0.9], method:'approximate' } },
+            latePct:       { $avg: { $cond:['$isLate',1,0] } },
+        }},
+        { $project: {
+            _id:0, processTimeSlug:'$_id.processTimeSlug', orderType:'$_id.orderType',
+            count:1, avgHrs:{ $round:['$avgHrs',1] },
+            p50Hrs:{ $round:[{ $arrayElemAt:['$p50',0] },1] },
+            p75Hrs:{ $round:[{ $arrayElemAt:['$p75',0] },1] },
+            p90Hrs:{ $round:[{ $arrayElemAt:['$p90',0] },1] },
+            latePct:{ $round:[{ $multiply:['$latePct',100] },1] },
+        }}
+      ]).toArray()
+    ]);
+
+    res.json({ slots, weeklyTrend, slaStats });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// —— GET /data/forecast/staffing — Staffing model ─────────────
+// Combines arrival demand + XpH from segments to recommend staff per hour/day.
+app.get('/data/forecast/staffing', async (req, res) => {
+  try {
+    const db = await getConfigDb();
+
+    // Arrival heatmap (orders/hour by dow-hour)
+    const arrivals = await db.collection('backfill_order_arrivals').find({}).toArray();
+
+    // XpH per status from segments (last 60 days)
+    const cutoff60 = new Date(Date.now() - 60 * 86400000);
+    const xphByStatus = await db.collection('backfill_kpi_segments').aggregate([
+      { $match: { isOpen:false, segmentStart:{ $gte:cutoff60.toISOString() }, durationMinutes:{ $gt:0 } } },
+      { $group: {
+          _id: '$statusSlug',
+          statusName: { $first:'$statusName' },
+          segments: { $sum:1 },
+          totalMin: { $sum:'$durationMinutes' },
+      }},
+      { $project: {
+          _id:0, statusSlug:'$_id', statusName:1, segments:1,
+          xph: { $round:[{ $divide:['$segments',{ $divide:['$totalMin',60] }] },2] },
+          avgDurMin: { $round:[{ $divide:['$totalMin','$segments'] },1] }
+      }},
+      { $sort: { segments:-1 } }
+    ]).toArray();
+
+    // Status wait times (avg minutes waiting per status)
+    const waitByStatus = await db.collection('backfill_order_turnaround').aggregate([
+      { $match: { createdAt:{ $gte:cutoff60 } } },
+      { $project: { sw:{ $objectToArray:'$statusWaits' } } },
+      { $unwind:'$sw' },
+      { $group: { _id:'$sw.k', avgWaitMin:{ $avg:'$sw.v' }, count:{ $sum:1 } } },
+      { $project: { _id:0, statusSlug:'$_id', avgWaitMin:{ $round:['$avgWaitMin',0] }, count:1 } }
+    ]).toArray();
+
+    // Peak hours: find top 3 hour windows
+    const totalByHour = Array(24).fill(0);
+    for (const s of arrivals) totalByHour[s.hour] = (totalByHour[s.hour]||0) + s.count;
+    const maxHourVol = Math.max(...totalByHour, 1);
+
+    // Overall demand stats
+    const totalOrders = arrivals.reduce((a,s) => a + s.count, 0);
+    const avgPerDay   = arrivals.length > 0
+      ? Math.round(arrivals.reduce((a,s) => a + s.count, 0) / 7 * 10) / 10
+      : 0;
+
+    res.json({
+      arrivals,           // heatmap slots
+      xphByStatus,        // throughput per status
+      waitByStatus,       // avg wait per status queue
+      totalByHour,
+      totalByDow: [0,1,2,3,4,5,6].map(d => arrivals.filter(s=>s.dow===d).reduce((a,s)=>a+s.count,0)),
+      totalOrders,
+      avgPerDay,
+      maxHourVol,
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// —— GET /data/forecast/sla-analysis — SLA recommendations ────
+// Analyses actual turnaround distributions and recommends SLA targets.
+app.get('/data/forecast/sla-analysis', async (req, res) => {
+  try {
+    const db = await getConfigDb();
+    const d180 = new Date(Date.now() - 180 * 86400000);
+
+    const [byType, byStatus, bottlenecks, dailyTrend] = await Promise.all([
+
+      // Turnaround distribution by order type + process time
+      db.collection('backfill_order_turnaround').aggregate([
+        { $match: { isCompleted:true, createdAt:{ $gte:d180 }, turnaroundHrs:{ $gt:0, $lt:2000 } } },
+        { $group: {
+            _id: { orderType:'$orderType', processTimeSlug:'$processTimeSlug' },
+            count:    { $sum:1 },
+            avgHrs:   { $avg:'$turnaroundHrs' },
+            p50:      { $percentile:{ input:'$turnaroundHrs', p:[0.5], method:'approximate' } },
+            p75:      { $percentile:{ input:'$turnaroundHrs', p:[0.75], method:'approximate' } },
+            p90:      { $percentile:{ input:'$turnaroundHrs', p:[0.9], method:'approximate' } },
+            p95:      { $percentile:{ input:'$turnaroundHrs', p:[0.95], method:'approximate' } },
+            latePct:  { $avg:{ $cond:['$isLate',1,0] } },
+            avgDaysLate: { $avg:{ $cond:['$isLate','$daysLate',null] } },
+        }},
+        { $project: {
+            _id:0, orderType:'$_id.orderType', processTimeSlug:'$_id.processTimeSlug',
+            count:1, avgHrs:{ $round:['$avgHrs',1] },
+            p50Hrs:{ $round:[{ $arrayElemAt:['$p50',0] },1] },
+            p75Hrs:{ $round:[{ $arrayElemAt:['$p75',0] },1] },
+            p90Hrs:{ $round:[{ $arrayElemAt:['$p90',0] },1] },
+            p95Hrs:{ $round:[{ $arrayElemAt:['$p95',0] },1] },
+            latePct:{ $round:[{ $multiply:['$latePct',100] },1] },
+            avgDaysLate:{ $round:['$avgDaysLate',1] },
+        }}
+      ]).toArray(),
+
+      // Wait time per status (where is queue time being spent?)
+      db.collection('backfill_order_turnaround').aggregate([
+        { $match: { createdAt:{ $gte:d180 } } },
+        { $project:{ sw:{ $objectToArray:'$statusWaits' }, orderType:1 } },
+        { $unwind:'$sw' },
+        { $group:{ _id:'$sw.k',
+            avgWaitMin:{ $avg:'$sw.v' }, maxWaitMin:{ $max:'$sw.v' },
+            p75:{ $percentile:{ input:'$sw.v', p:[0.75], method:'approximate' } },
+            count:{ $sum:1 }
+        }},
+        { $project:{ _id:0, statusSlug:'$_id',
+            avgWaitMin:{ $round:['$avgWaitMin',0] },
+            maxWaitMin:{ $round:['$maxWaitMin',0] },
+            p75Min:{ $round:[{ $arrayElemAt:['$p75',0] },0] },
+            count:1
+        }},
+        { $sort:{ avgWaitMin:-1 } }
+      ]).toArray(),
+
+      // Bottleneck detection: statuses where P75 wait > 24h (1440 min)
+      db.collection('backfill_order_turnaround').aggregate([
+        { $match:{ createdAt:{ $gte:d180 } } },
+        { $project:{ sw:{ $objectToArray:'$statusWaits' } } },
+        { $unwind:'$sw' },
+        { $match:{ 'sw.v':{ $gt:60 } } }, // >1 hour waits only
+        { $group:{ _id:'$sw.k',
+            avgWaitHrs:{ $avg:{ $divide:['$sw.v',60] } },
+            p75Hrs:{ $percentile:{ input:{ $divide:['$sw.v',60] }, p:[0.75], method:'approximate' } },
+            count:{ $sum:1 }
+        }},
+        { $match:{ 'p75Hrs.0':{ $gt:4 } } }, // P75 > 4 hours = bottleneck
+        { $project:{ _id:0, statusSlug:'$_id',
+            avgWaitHrs:{ $round:['$avgWaitHrs',1] },
+            p75Hrs:{ $round:[{ $arrayElemAt:['$p75Hrs',0] },1] },
+            count:1,
+        }},
+        { $sort:{ p75Hrs:-1 } }
+      ]).toArray(),
+
+      // Daily order volume trend (last 90 days)
+      db.collection('backfill_order_turnaround').aggregate([
+        { $match:{ createdAt:{ $gte: new Date(Date.now() - 90*86400000) } } },
+        { $group:{
+            _id:{ $dateToString:{ format:'%Y-%m-%d', date:'$createdAt' } },
+            count:{ $sum:1 },
+            evaluation:{ $sum:{ $cond:[{ $eq:['$orderType','evaluation'] },1,0] } },
+            translation:{ $sum:{ $cond:[{ $eq:['$orderType','translation'] },1,0] } },
+        }},
+        { $sort:{ _id:1 } }
+      ]).toArray()
+    ]);
+
+    // Compute SLA recommendations:
+    // Recommend P75 turnaround + 20% buffer, rounded to nearest half-day
+    const recommendations = byType.map(r => {
+      const baseHrs   = r.p75Hrs || r.avgHrs || 72;
+      const targetHrs = Math.ceil(baseHrs * 1.2 / 12) * 12; // round up to nearest 12h
+      const targetDays= Math.round(targetHrs / 24 * 2) / 2;  // nearest 0.5 day
+      return {
+        ...r,
+        recommendedSlaHrs:  targetHrs,
+        recommendedSlaDays: targetDays,
+        currentLatePct:     r.latePct,
+        // "on track" if latePct < 10% at P90
+        status: r.latePct < 10 ? 'on-track' : r.latePct < 25 ? 'at-risk' : 'breaching',
+      };
+    });
+
+    res.json({ byType, byStatus, bottlenecks, dailyTrend, recommendations });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
