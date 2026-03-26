@@ -93,8 +93,19 @@ export function DataProvider({ children }) {
     if (loadedRef.current.qc && !force) return;
     setQcLoading(true);
     try {
-      const d = await api('/data/qc-events?includeHtml=false&includeText=false');
-      setQcEvents(d.events || []);
+      // Paginate like KPI segments: fetch p1, then remaining pages in parallel.
+      // QC is small now (1,100 events) but this future-proofs growth to 50k+.
+      const first = await api('/data/qc-events?page=1&pageSize=5000');
+      const totalPages = first.totalPages || 1;
+      let rest = [];
+      if (totalPages > 1) {
+        rest = await Promise.all(
+          Array.from({ length: totalPages - 1 }, (_, i) =>
+            api(`/data/qc-events?page=${i + 2}&pageSize=5000`)
+          )
+        );
+      }
+      setQcEvents([first, ...rest].flatMap(d => d.events || []));
       loadedRef.current.qc = true;
     } catch (e) { console.error('QC load failed:', e); }
     setQcLoading(false);

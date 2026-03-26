@@ -1,4 +1,4 @@
-import React, { useEffect, useState, useMemo, useCallback } from 'react';
+import React, { useEffect, useState, useMemo, useCallback, useDeferredValue } from 'react';
 import { useSearchParams } from 'react-router-dom';
 import { ComposedChart, Bar, Line, LineChart, XAxis, YAxis, Tooltip, ResponsiveContainer, Cell, BarChart } from 'recharts';
 import { Card, Table, FilterBar, FilterSelect, FilterInput, FilterReset,
@@ -60,26 +60,46 @@ export default function KPIUsers() {
   const [view, setView]       = useState('status'); // status | orders | segments
   const [drawer, setDrawer]   = useState({ open:false, title:'', subtitle:'', rows:[], cols: SEG_COLS });
 
+  const dSel     = useDeferredValue(sel);
+  const dFFrom   = useDeferredValue(fFrom);
+  const dFTo     = useDeferredValue(fTo);
+  const dFStatus = useDeferredValue(fStatus);
+  const dFType   = useDeferredValue(fType);
+
   useEffect(() => { loadKpi(); }, [loadKpi]);
   useEffect(() => { if (sp.get('worker')) setSel(sp.get('worker')); }, [sp]);
 
   const workers = useMemo(() => {
     const m = {};
-    segs.forEach(s => { if (s._workerId) m[s._workerId] = s.displayName || s.workerName; });
-    return Object.entries(m).map(([v,l]) => ({value:v,label:l})).sort((a,b) => a.label.localeCompare(b.label));
+    const counts = {};
+    segs.forEach(s => {
+      if (!s._workerId) return;
+      const n = s.displayName || s.workerName || '';
+      if (!n) return;
+      if (!counts[s._workerId]) counts[s._workerId] = {};
+      counts[s._workerId][n] = (counts[s._workerId][n] || 0) + 1;
+    });
+    for (const [id, nc] of Object.entries(counts)) {
+      m[id] = Object.entries(nc).sort((a,b)=>b[1]-a[1])[0][0];
+    }
+    const labelCount = {};
+    for (const label of Object.values(m)) labelCount[label] = (labelCount[label]||0)+1;
+    return Object.entries(m)
+      .map(([v,l]) => ({ value:v, label: labelCount[l]>1 ? `${l} [${v.slice(-4)}]` : l }))
+      .sort((a,b) => a.label.localeCompare(b.label));
   }, [segs]);
 
   const userSegs = useMemo(() => {
-    if (!sel) return [];
+    if (!dSel) return [];
     return segs.filter(s => {
-      if (s._workerId !== sel) return false;
-      if (fFrom && s.segmentStart && s.segmentStart < fFrom) return false;
-      if (fTo   && s.segmentStart && s.segmentStart > fTo + 'T23:59:59') return false;
-      if (fStatus && (s.statusName||s.statusSlug) !== fStatus) return false;
-      if (fType && s.orderType !== fType) return false;
+      if (s._workerId !== dSel) return false;
+      if (dFFrom && s.segmentStart && s.segmentStart < dFFrom) return false;
+      if (dFTo   && s.segmentStart && s.segmentStart > dFTo + 'T23:59:59') return false;
+      if (dFStatus && (s.statusName||s.statusSlug) !== dFStatus) return false;
+      if (dFType && s.orderType !== dFType) return false;
       return true;
     });
-  }, [segs, sel, fFrom, fTo, fStatus, fType]);
+  }, [segs, dSel, dFFrom, dFTo, dFStatus, dFType]);
 
   // ── Summary metrics ──────────────────────────────────────
   const m = useMemo(() => {

@@ -1,4 +1,4 @@
-import React, { useEffect, useState, useMemo, useCallback } from 'react';
+import React, { useEffect, useState, useMemo, useCallback, useDeferredValue } from 'react';
 import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, PieChart, Pie, Cell } from 'recharts';
 import { Card, Table, Pills, FilterBar, FilterSelect, FilterInput, FilterReset,
          ChartLegend, DrilldownDrawer, OrderLink,
@@ -30,24 +30,31 @@ export default function QCOverview() {
   const [fTo, setFTo] = useState(''); const [fSearch, setFSearch] = useState('');
   const [drawer, setDrawer] = useState({ open:false, title:'', subtitle:'', rows:[] });
 
+  const dFDept   = useDeferredValue(fDept);
+  const dFType   = useDeferredValue(fType);
+  const dFErr    = useDeferredValue(fErr);
+  const dFFrom   = useDeferredValue(fFrom);
+  const dFTo     = useDeferredValue(fTo);
+  const dFSearch = useDeferredValue(fSearch);
+
   useEffect(() => { loadQc(); }, [loadQc]);
 
   const filtered = useMemo(() => events.filter(e => {
-    if (fDept && e.departmentName!==fDept) return false;
-    if (fType && e.orderType!==fType) return false;
-    if (fErr==='i_fixed_it' && !e.isFixedIt) return false;
-    if (fErr==='kick_it_back' && !e.isKickItBack) return false;
-    if (fFrom && e.qcCreatedAt && e.qcCreatedAt<fFrom) return false;
-    if (fTo && e.qcCreatedAt && e.qcCreatedAt>fTo+'T23:59:59') return false;
-    if (fSearch) {
-      const q = fSearch.toLowerCase();
+    if (dFDept && e.departmentName!==dFDept) return false;
+    if (dFType && e.orderType!==dFType) return false;
+    if (dFErr==='i_fixed_it' && !e.isFixedIt) return false;
+    if (dFErr==='kick_it_back' && !e.isKickItBack) return false;
+    if (dFFrom && e.qcCreatedAt && e.qcCreatedAt<dFFrom) return false;
+    if (dFTo && e.qcCreatedAt && e.qcCreatedAt>dFTo+'T23:59:59') return false;
+    if (dFSearch) {
+      const q = dFSearch.toLowerCase();
       return (e.accountableName||'').toLowerCase().includes(q) ||
              (e.orderSerialNumber||'').toLowerCase().includes(q) ||
              (e.issueName||'').toLowerCase().includes(q) ||
              (e.departmentName||'').toLowerCase().includes(q);
     }
     return true;
-  }), [events, fDept, fType, fErr, fFrom, fTo, fSearch]);
+  }), [events, dFDept, dFType, dFErr, dFFrom, dFTo, dFSearch]);
 
   const depts = useMemo(()=>[...new Set(events.map(e=>e.departmentName).filter(Boolean))].sort(),[events]);
 

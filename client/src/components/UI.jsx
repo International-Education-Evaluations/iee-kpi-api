@@ -345,24 +345,91 @@ export function DrilldownDrawer({ open, onClose, title, subtitle, rows=[], loadi
 }
 
 // ── Worker identity resolver ──────────────────────────────────
+// ── disambiguateWorkers ──────────────────────────────────────────────────────
+// Resolves a stable _workerId and display name for every segment.
+//
+// Root causes of duplicate workers in the dropdown:
+//  1. Email case inconsistency: "Camelo@myiee.org" vs "camelo@myiee.org" when
+//     workerUserId is null → two different string keys → two dropdown entries.
+//  2. Mixed workerUserId presence: older segments have workerUserId=null with
+//     email="deana@iee.com", newer segments have workerUserId="12345" with
+//     same email → two separate ids → Deana appears twice, March data "missing".
+//
+// Fix: three-tier canonical id with email normalization + cross-tier merge.
+//  Tier 1 (preferred): workerUserId (integer string) — most stable
+//  Tier 2: email.toLowerCase() — stable across case variants
+//  Tier 3: workerName.toLowerCase() — last resort for unattributed segments
+//
+// Cross-tier merge: if a Tier-1 id and a Tier-2 id share the same lowercased email,
+// all Tier-2 segments are promoted to the Tier-1 id. This merges Deana's old + new
+// segments under a single id so she appears once in the dropdown.
 export function disambiguateWorkers(items) {
-  const idNames = {};
-  for (const item of items) {
-    const id = item.workerUserId || item.workerEmail || item.workerName || null;
-    if (!id) continue;
-    if (!idNames[id]) idNames[id] = {};
-    const name = item.workerName || 'UNATTRIBUTED';
-    idNames[id][name] = (idNames[id][name] || 0) + 1;
+  // ── Pass 1: compute raw ids, normalize email ──────────────────────────────
+  const processed = items.map(item => {
+    const rawEmail = (item.workerEmail || '').toLowerCase().trim();
+    const uid  = item.workerUserId ? String(item.workerUserId).trim() : null;
+    const rawId = uid || rawEmail || (item.workerName || '').trim() || null;
+    return { ...item, _rawId: rawId, _normEmail: rawEmail, _uid: uid };
+  });
+
+  // ── Pass 2: build email → uid map for cross-tier merging ─────────────────
+  // If any segment with an email also has a workerUserId, that uid is the
+  // canonical id for ALL segments sharing that email (including uid-less ones).
+  const emailToUid = {}; // normEmail → best uid seen
+  for (const item of processed) {
+    if (item._uid && item._normEmail) {
+      // Prefer the uid that appears most — break ties by string sort
+      if (!emailToUid[item._normEmail] || item._uid < emailToUid[item._normEmail]) {
+        emailToUid[item._normEmail] = item._uid;
+      }
+    }
   }
-  const canonical = {};
-  for (const [id, names] of Object.entries(idNames)) canonical[id] = Object.entries(names).sort((a,b)=>b[1]-a[1])[0][0];
-  const nameToIds = {};
-  for (const [id, name] of Object.entries(canonical)) { if (!nameToIds[name]) nameToIds[name]=[]; nameToIds[name].push(id); }
-  return items.map(item => {
-    const id = item.workerUserId || item.workerEmail || item.workerName || null;
-    const name = id ? (canonical[id] || item.workerName || 'UNATTRIBUTED') : (item.workerName || 'UNATTRIBUTED');
-    const isDuplicate = nameToIds[name] && nameToIds[name].length > 1;
-    const displayName = isDuplicate && item.workerEmail ? `${name} (${item.workerEmail})` : name;
-    return { ...item, _workerId: id, displayName };
+
+  // ── Pass 3: assign canonical id ───────────────────────────────────────────
+  const withId = processed.map(item => {
+    let cid;
+    if (item._uid) {
+      cid = item._uid;
+    } else if (item._normEmail && emailToUid[item._normEmail]) {
+      // Promote: this email is known to belong to a workerUserId — use it
+      cid = emailToUid[item._normEmail];
+    } else if (item._normEmail) {
+      cid = item._normEmail;
+    } else {
+      cid = (item.workerName || '').trim().toLowerCase() || null;
+    }
+    return { ...item, _cid: cid };
+  });
+
+  // ── Pass 4: build canonical name per id (most-frequent wins) ─────────────
+  const idNameCounts = {}; // cid → { name → count }
+  for (const item of withId) {
+    if (!item._cid) continue;
+    const name = item.workerName?.trim() || 'UNATTRIBUTED';
+    if (!idNameCounts[item._cid]) idNameCounts[item._cid] = {};
+    idNameCounts[item._cid][name] = (idNameCounts[item._cid][name] || 0) + 1;
+  }
+  const canonicalName = {}; // cid → best name
+  for (const [cid, counts] of Object.entries(idNameCounts)) {
+    canonicalName[cid] = Object.entries(counts).sort((a, b) => b[1] - a[1])[0][0];
+  }
+
+  // ── Pass 5: detect true name collisions (different people, same name) ─────
+  // Two cids with the same canonical name → disambiguation needed → append email
+  const nameCount = {}; // canonicalName → count of distinct cids
+  for (const name of Object.values(canonicalName)) {
+    nameCount[name] = (nameCount[name] || 0) + 1;
+  }
+
+  // ── Pass 6: emit final _workerId and displayName ──────────────────────────
+  return withId.map(item => {
+    const cid  = item._cid;
+    const name = cid ? (canonicalName[cid] || item.workerName?.trim() || 'UNATTRIBUTED') : (item.workerName?.trim() || 'UNATTRIBUTED');
+    const isNameCollision = nameCount[name] > 1;
+    // Only append email for true collisions (different people with same full name)
+    const displayName = isNameCollision && item._normEmail ? `${name} (${item._normEmail})` : name;
+    // Strip internal pass fields from returned item
+    const { _rawId, _normEmail, _uid, _cid, ...rest } = item;
+    return { ...rest, _workerId: cid, displayName };
   });
 }

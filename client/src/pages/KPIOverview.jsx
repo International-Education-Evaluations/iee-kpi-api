@@ -76,7 +76,27 @@ export default function KPIOverview() {
     };
   }, [benchmarks]);
 
-  const workers = useMemo(()=>{const m={};segs.forEach(s=>{if(s._workerId)m[s._workerId]=s.displayName||s.workerName;});return Object.entries(m).map(([v,l])=>({value:v,label:l})).sort((a,b)=>a.label.localeCompare(b.label));},[segs]);
+  const workers = useMemo(()=>{
+    const m = {};
+    // Count how often each displayName appears per workerId — use most frequent
+    const counts = {};
+    segs.forEach(s => {
+      if (!s._workerId) return;
+      const n = s.displayName || s.workerName || '';
+      if (!n) return;
+      if (!counts[s._workerId]) counts[s._workerId] = {};
+      counts[s._workerId][n] = (counts[s._workerId][n] || 0) + 1;
+    });
+    for (const [id, nc] of Object.entries(counts)) {
+      m[id] = Object.entries(nc).sort((a,b)=>b[1]-a[1])[0][0];
+    }
+    // Deduplicate labels: if same display name appears for two ids, append id suffix
+    const labelCount = {};
+    for (const label of Object.values(m)) labelCount[label] = (labelCount[label]||0)+1;
+    return Object.entries(m)
+      .map(([v,l]) => ({ value:v, label: labelCount[l]>1 ? `${l} [${v.slice(-4)}]` : l }))
+      .sort((a,b)=>a.label.localeCompare(b.label));
+  },[segs]);
   const statuses = useMemo(()=>[...new Set(segs.map(s=>s.statusName||s.statusSlug).filter(Boolean))].sort(),[segs]);
   const depts = useMemo(()=>[...new Set(segs.map(s=>s.departmentName).filter(Boolean))].sort(),[segs]);
 

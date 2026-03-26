@@ -34,6 +34,7 @@ const path = require('path');
 const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
 const cors = require('cors');
+const zlib = require('zlib');
 const { MongoClient, ObjectId } = require('mongodb');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
@@ -91,6 +92,26 @@ app.use(cors({
   allowedHeaders: ['x-api-key', 'Content-Type', 'Authorization']
 }));
 app.set('trust proxy', 1);
+// Gzip compression — reduces /data/kpi-segments from ~5.5MB to ~800KB per page.
+// Applied before rate limit so compressed size counts toward content-length.
+app.use((req, res, next) => {
+  const accept = req.headers['accept-encoding'] || '';
+  if (!accept.includes('gzip')) return next();
+  const _json = res.json.bind(res);
+  res.json = (body) => {
+    const str = JSON.stringify(body);
+    if (str.length < 1024) return _json(body); // skip small responses
+    zlib.gzip(Buffer.from(str), { level: 6 }, (err, compressed) => {
+      if (err) return _json(body);
+      res.set('Content-Encoding', 'gzip');
+      res.set('Content-Type', 'application/json');
+      res.set('Content-Length', compressed.length);
+      res.send(compressed);
+    });
+  };
+  next();
+});
+
 app.use(rateLimit({ windowMs: 60000, max: 60, standardHeaders: true, legacyHeaders: false }));
 app.use(express.json({ limit: '1mb' }));
 
@@ -324,6 +345,106 @@ async function getConfigDb() {
     console.log(`Connected to MongoDB Atlas (config - readWrite)${CONFIG.MONGO_CONFIG_URI ? ' [separate cluster]' : ' [same cluster]'}`);
   }
   return configClient.db('iee_dashboard');
+}
+
+// ── Server-side in-memory config cache ─────────────────────────────────────
+// /config/benchmarks, /config/user-levels, /config/production-hours are read on
+// every dashboard load but only change when an admin explicitly edits them.
+// This cache eliminates repeated MongoDB round trips for static config data.
+// TTL: 5 minutes (safety net). Invalidated immediately on any PUT to the collection.
+const CONFIG_CACHE = new Map(); // key → { data, ts }
+const CONFIG_CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
+
+function getCachedConfig(key) {
+  const entry = CONFIG_CACHE.get(key);
+  if (!entry) return null;
+  if (Date.now() - entry.ts > CONFIG_CACHE_TTL_MS) { CONFIG_CACHE.delete(key); return null; }
+  return entry.data;
+}
+function setCachedConfig(key, data) {
+  CONFIG_CACHE.set(key, { data, ts: Date.now() });
+}
+function invalidateConfigCache(key) {
+  if (key) CONFIG_CACHE.delete(key);
+  else CONFIG_CACHE.clear();
+}
+
+// ── Server-side backfill metadata cache ─────────────────────────────────────
+// The backfill_metadata lastRunAt is fetched on every /data/kpi-segments page call.
+// Cache it in memory; update when backfill completes.
+let _backfillMetaCache = null;
+let _backfillMetaCacheTs = 0;
+const BACKFILL_META_TTL_MS = 30 * 1000; // 30 seconds
+
+async function getBackfillMeta(configDb) {
+  const now = Date.now();
+  if (_backfillMetaCache && now - _backfillMetaCacheTs < BACKFILL_META_TTL_MS) {
+    return _backfillMetaCache;
+  }
+  const meta = await configDb.collection('backfill_metadata').findOne({ _id: 'status' });
+  _backfillMetaCache = meta;
+  _backfillMetaCacheTs = now;
+  return meta;
+}
+function invalidateBackfillMeta() {
+  _backfillMetaCache = null;
+  _backfillMetaCacheTs = 0;
+}
+
+// ── Index management — run once at startup and after full refresh ────────────
+// createIndex is called on every backfill run otherwise, wasting round trips.
+// MongoDB ignores duplicate requests but we pay the network cost each time.
+let _indexesEnsured = false;
+async function ensureIndexes() {
+  if (_indexesEnsured) return;
+  try {
+    const db = await getConfigDb();
+    const seg = db.collection('backfill_kpi_segments');
+    const qc  = db.collection('backfill_qc_events');
+    const usr = db.collection('backfill_users');
+
+    // ── backfill_kpi_segments ────────────────────────────────
+    await Promise.all([
+      seg.createIndex({ _compositeKey: 1 },   { unique: true, background: true }).catch(() => {}),
+      seg.createIndex({ segmentStart: -1 },    { background: true }).catch(() => {}),
+      seg.createIndex({ workerEmail: 1 },      { background: true }).catch(() => {}),
+      seg.createIndex({ workerUserId: 1 },     { background: true }).catch(() => {}), // was missing
+      seg.createIndex({ statusSlug: 1 },       { background: true }).catch(() => {}),
+      seg.createIndex({ orderType: 1 },        { background: true }).catch(() => {}),
+      seg.createIndex({ isOpen: 1 },           { background: true }).catch(() => {}),
+      seg.createIndex({ departmentName: 1 },   { background: true }).catch(() => {}), // was missing
+      // Compound indexes for common query patterns
+      seg.createIndex({ statusSlug: 1, segmentStart: -1 },  { background: true }).catch(() => {}),
+      seg.createIndex({ workerEmail: 1, segmentStart: -1 }, { background: true }).catch(() => {}),
+      seg.createIndex({ isOpen: 1, segmentStart: -1 },      { background: true }).catch(() => {}), // open-segs recheck
+      seg.createIndex({ orderType: 1, segmentStart: -1 },   { background: true }).catch(() => {}),
+    ]);
+
+    // ── backfill_qc_events ───────────────────────────────────
+    await Promise.all([
+      qc.createIndex({ _qcKey: 1 },           { unique: true, background: true }).catch(() => {}),
+      qc.createIndex({ qcCreatedAt: -1 },      { background: true }).catch(() => {}),
+      qc.createIndex({ departmentName: 1 },    { background: true }).catch(() => {}),
+      qc.createIndex({ errorType: 1 },         { background: true }).catch(() => {}),
+      qc.createIndex({ orderType: 1 },         { background: true }).catch(() => {}), // was missing
+      qc.createIndex({ accountableName: 1 },   { background: true }).catch(() => {}), // was missing
+      // Compound for common filter combos
+      qc.createIndex({ departmentName: 1, qcCreatedAt: -1 }, { background: true }).catch(() => {}),
+      qc.createIndex({ errorType: 1, qcCreatedAt: -1 },      { background: true }).catch(() => {}),
+    ]);
+
+    // ── backfill_users ───────────────────────────────────────
+    await Promise.all([
+      usr.createIndex({ email: 1 },   { background: true }).catch(() => {}),
+      usr.createIndex({ v1Id: 1 },    { background: true }).catch(() => {}),
+      usr.createIndex({ fullName: 1 },{ background: true }).catch(() => {}),
+    ]);
+
+    _indexesEnsured = true;
+    console.log('[INDEXES] All backfill collection indexes ensured');
+  } catch (err) {
+    console.error('[INDEXES] Failed to ensure indexes:', err.message);
+  }
 }
 
 // Batch-fetches parent order docs for a list of order IDs (used by QC enrichment).
@@ -697,7 +818,7 @@ app.get('/kpi-segments', async (req, res) => {
           // V2 user IDs: foreignKeyId is canonical, email is fallback
           workerUserId: assigned.foreignKeyId || assigned.v2Id || null,
           workerName: buildFullName(assigned),
-          workerEmail: assigned.email || null,
+          workerEmail: assigned.email ? assigned.email.toLowerCase().trim() : null,
           changedByName: buildFullName(user),
           segmentStart: toIso(entryDate),
           segmentEnd: toIso(effectiveEnd || segmentEndDate),
@@ -2644,10 +2765,14 @@ async function auditLog(action, collection, data, changedBy) {
 // Returns all benchmark configurations
 app.get('/config/benchmarks', async (req, res) => {
   try {
+    const cached = getCachedConfig('benchmarks');
+    if (cached) return res.json(cached);
     const db = await getConfigDb();
     const benchmarks = await db.collection('dashboard_benchmarks')
       .find({}).sort({ team: 1, status: 1 }).toArray();
-    res.json({ count: benchmarks.length, benchmarks });
+    const payload = { count: benchmarks.length, benchmarks };
+    setCachedConfig('benchmarks', payload);
+    res.json(payload);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -2656,6 +2781,7 @@ app.get('/config/benchmarks', async (req, res) => {
 // —— PUT /config/benchmarks ————————————————————————————————
 // Upsert a benchmark row (by team + status)
 app.put('/config/benchmarks', requireRole('admin', 'manager'), async (req, res) => {
+  invalidateConfigCache('benchmarks'); invalidateConfigCache('benchmarks_statuses');
   try {
     const { team, status, xphUnit, l0, l1, l2, l3, l4, l5, changedBy } = req.body;
     if (!team || !status) return res.status(400).json({ error: 'team and status required' });
@@ -2715,9 +2841,12 @@ app.post('/config/benchmarks/seed', requireRole('admin'), async (req, res) => {
 // —— GET /config/production-hours ——————————————————————————
 app.get('/config/production-hours', async (req, res) => {
   try {
+    const cached = getCachedConfig('production_hours');
+    if (cached) return res.json(cached);
     const db = await getConfigDb();
     const hours = await db.collection('dashboard_production_hours')
       .find({}).sort({ team: 1, status: 1 }).toArray();
+    setCachedConfig('production_hours', { count: hours.length, hours });
     res.json({ count: hours.length, hours });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -2726,6 +2855,7 @@ app.get('/config/production-hours', async (req, res) => {
 
 // —— PUT /config/production-hours ——————————————————————————
 app.put('/config/production-hours', requireRole('admin', 'manager'), async (req, res) => {
+  invalidateConfigCache('production_hours');
   try {
     const { team, status, l0, l1, l2, l3, l4, l5, changedBy } = req.body;
     if (!team || !status) return res.status(400).json({ error: 'team and status required' });
@@ -2784,10 +2914,14 @@ app.post('/config/production-hours/seed', requireRole('admin'), async (req, res)
 // —— GET /config/user-levels ——————————————————————————————
 app.get('/config/user-levels', async (req, res) => {
   try {
+    const cached = getCachedConfig('user_levels');
+    if (cached) return res.json(cached);
     const db = await getConfigDb();
     const levels = await db.collection('dashboard_user_levels')
       .find({}).sort({ name: 1 }).toArray();
-    res.json({ count: levels.length, levels });
+    const payload = { count: levels.length, levels };
+    setCachedConfig('user_levels', payload);
+    res.json(payload);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -2796,6 +2930,7 @@ app.get('/config/user-levels', async (req, res) => {
 // —— PUT /config/user-levels ——————————————————————————————
 // Upsert a user level by email
 app.put('/config/user-levels', requireRole('admin', 'manager'), async (req, res) => {
+  invalidateConfigCache('user_levels');
   try {
     const { email, name, department, level, changedBy } = req.body;
     if (!email) return res.status(400).json({ error: 'email required' });
@@ -3225,8 +3360,7 @@ async function runUserSync(configDb, push) {
     await stagingCol.insertMany(userDocs, { ordered: false });
 
     // Build indexes on staging before swap (cheaper than post-swap rebuild)
-    await stagingCol.createIndex({ email: 1 }).catch(() => {});
-    await stagingCol.createIndex({ v1Id: 1 }).catch(() => {});
+    // Indexes will be applied by ensureIndexes() after the rename
 
     // Atomic rename: staging → backfill_users
     // dropTarget: true drops the existing backfill_users as part of the rename (single op)
@@ -3372,7 +3506,7 @@ async function runBackfill(options = {}) {
                   statusName: entry?.updatedStatus?.name || '',
                   workerUserId: assigned.foreignKeyId || assigned.v2Id || null,
                   workerName: buildFullName(assigned),
-                  workerEmail: assigned.email || null,
+                  workerEmail: assigned.email ? assigned.email.toLowerCase().trim() : null,
                   changedByName: buildFullName(user),
                   segmentStart: toIso(entryDate),
                   segmentEnd: toIso(effectiveEnd || segEnd),
@@ -3608,7 +3742,7 @@ async function runBackfill(options = {}) {
               statusName: entry?.updatedStatus?.name || '',
               workerUserId: assigned.foreignKeyId || assigned.v2Id || null,
               workerName: buildFullName(assigned),
-              workerEmail: assigned.email || null,
+              workerEmail: assigned.email ? assigned.email.toLowerCase().trim() : null,
               changedByName: buildFullName(user),
               segmentStart: toIso(entryDate),
               segmentEnd: toIso(effectiveEnd || segEnd),
@@ -3706,6 +3840,21 @@ async function runBackfill(options = {}) {
             categoryName: doc.category?.name || null,
             text: doc.text || null,
             qcCreatedAt: doc.createdAt ? toIso(toDate(doc.createdAt)) : null,
+            // Find which status the order was in when this QC event was created
+            // by walking orderStatusHistory and finding the active status at qcCreatedAt
+            statusAtQcName: (() => {
+              if (!ord?.orderStatusHistory || !doc.createdAt) return null;
+              const qcTs = toDate(doc.createdAt)?.getTime();
+              if (!qcTs) return null;
+              const hist = ord.orderStatusHistory;
+              let active = null;
+              for (let i = 0; i < hist.length; i++) {
+                const entryTs = toDate(hist[i]?.createdAt)?.getTime();
+                if (entryTs && entryTs <= qcTs) active = hist[i]?.updatedStatus?.name || null;
+                else if (entryTs && entryTs > qcTs) break;
+              }
+              return active;
+            })(),
             _backfilledAt: new Date()
           }},
           upsert: true
@@ -3745,17 +3894,8 @@ async function runBackfill(options = {}) {
       upsertedQc = fullBatchResults.totalUpsertedQc;
     }
 
-    // Ensure indexes exist regardless of path
-    await segCol.createIndex({ _compositeKey: 1 }, { unique: true }).catch(() => {});
-    await segCol.createIndex({ workerEmail: 1 }).catch(() => {});
-    await segCol.createIndex({ statusSlug: 1 }).catch(() => {});
-    await segCol.createIndex({ orderType: 1 }).catch(() => {});
-    await segCol.createIndex({ segmentStart: -1 }).catch(() => {});
-    await segCol.createIndex({ isOpen: 1 }).catch(() => {});
-    await qcCol.createIndex({ _qcKey: 1 }, { unique: true }).catch(() => {});
-    await qcCol.createIndex({ departmentName: 1 }).catch(() => {});
-    await qcCol.createIndex({ errorType: 1 }).catch(() => {});
-    await qcCol.createIndex({ qcCreatedAt: -1 }).catch(() => {});
+    // Indexes managed by ensureIndexes() — called once at startup
+    await ensureIndexes();
 
     // ═════════════════════════════════════════════════════════
     // 3. QUEUE SNAPSHOT (always fresh — captures current state)
@@ -3852,6 +3992,7 @@ async function runBackfill(options = {}) {
     push(`Done in ${(elapsed/1000).toFixed(1)}s — ${upsertedSegs} new segs, ${updatedSegs} updated, ${upsertedQc} new QC, ${totalSegs} total`);
     backfillRunning = false;
     backfillLastRunEnd = Date.now(); // anchor next-run window to completion, not wall clock
+    invalidateBackfillMeta(); // flush cached meta so next request sees fresh lastRunAt
     return metadata;
 
   } catch (err) {
@@ -4040,25 +4181,33 @@ app.get('/data/kpi-segments', async (req, res) => {
     if (req.query.from) filter.segmentStart = { $gte: req.query.from };
     if (req.query.to) filter.segmentStart = { ...filter.segmentStart, $lte: req.query.to + 'T23:59:59' };
 
-    const totalCount = await col.countDocuments(filter);
-    // Project only fields the client needs — cuts 4MB pages down to ~1.5MB
+    // Use a single find() — avoids separate countDocuments() round trip.
+    // We fetch pageSize+1 docs to detect if there are more pages.
+    // This is safe because pageSize is capped at 10000 and dataset is ~95k rows.
     const CLIENT_PROJECTION = {
       orderSerialNumber:1, orderId:1, orderType:1,
       statusSlug:1, statusName:1,
       workerUserId:1, workerName:1, workerEmail:1,
-      departmentName:1,
       segmentStart:1, segmentEnd:1,
       durationMinutes:1, durationSeconds:1,
-      isOpen:1, userLevel:1,
-      _compositeKey:1
+      isOpen:1,
+      // Extra fields for drilldown drawer (KPIUsers segments tab)
+      changedByName:1, isErrorReporting:1, reportItemCount:1, reportItemName:1,
+      orderSource:1, parentOrderId:1
     };
-    const segments = await col.find(filter, { projection: CLIENT_PROJECTION })
+    const rawSegments = await col.find(filter, { projection: CLIENT_PROJECTION })
       .sort({ segmentStart: -1 })
       .skip((page - 1) * pageSize)
-      .limit(pageSize)
+      .limit(pageSize + 1)
       .toArray();
+    const hasMorePage = rawSegments.length > pageSize;
+    const segments = hasMorePage ? rawSegments.slice(0, pageSize) : rawSegments;
+    // Approximate totalCount: exact only on last page, estimated otherwise
+    const totalCount = hasMorePage
+      ? (page - 1) * pageSize + pageSize + 1  // at least this many
+      : (page - 1) * pageSize + segments.length;
 
-    const meta = await db.collection('backfill_metadata').findOne({ _id: 'status' });
+    const meta = await getBackfillMeta(db);
 
     res.json({
       count: segments.length,
@@ -4090,14 +4239,24 @@ app.get('/data/qc-events', async (req, res) => {
     if (req.query.errorType) filter.errorType = req.query.errorType;
     if (req.query.orderType) filter.orderType = req.query.orderType;
 
+    const QC_PROJECTION = {
+      _qcKey:1, orderId:1, orderSerialNumber:1, orderType:1,
+      reporterName:1, departmentName:1,
+      issueName:1, errorType:1,
+      isFixedIt:1, isKickItBack:1,
+      accountableName:1,
+      qcCreatedAt:1,
+      // statusAtQcName populated if available (v5.4.14+)
+      statusAtQcName:1, nextStatusName:1,
+    };
     const totalCount = await col.countDocuments(filter);
-    const events = await col.find(filter)
+    const events = await col.find(filter, { projection: QC_PROJECTION })
       .sort({ qcCreatedAt: -1 })
       .skip((page - 1) * pageSize)
       .limit(pageSize)
       .toArray();
 
-    const meta = await db.collection('backfill_metadata').findOne({ _id: 'status' });
+    const meta = await getBackfillMeta(db);
 
     res.json({
       count: events.length,
@@ -4568,7 +4727,7 @@ app.use((err, req, res, next) => {
 });
 
 // —— Start ——————————————————————————————————————————————
-app.listen(CONFIG.PORT, '0.0.0.0', () => {
+const _httpServer = app.listen(CONFIG.PORT, '0.0.0.0', () => {
   console.log(`IEE KPI Data API v5.0 running on port ${CONFIG.PORT}`);
   console.log(`Environment: ${CONFIG.NODE_ENV}`);
   console.log(`Rate limit: 60 requests/minute`);
@@ -4578,6 +4737,51 @@ app.listen(CONFIG.PORT, '0.0.0.0', () => {
   else { console.log('SendGrid not configured — email scheduler disabled'); }
   // Start backfill auto-scheduler
   startBackfillScheduler();
+
+  // Ensure all indexes exist — runs once, idempotent
+  setTimeout(() => ensureIndexes().catch(e => console.error('[STARTUP]', e.message)), 3000);
+
+  // One-time migration: normalize workerEmail to lowercase in backfill_kpi_segments.
+  // Mixed-case emails (e.g. "Camelo@myiee.org" vs "camelo@myiee.org") cause the same
+  // person to appear as two separate workers in the dropdown.
+  // This runs once at startup and self-disables after completion.
+  setTimeout(async () => {
+    try {
+      const db = await getConfigDb();
+      const col = db.collection('backfill_kpi_segments');
+      const meta = db.collection('backfill_metadata');
+
+      const migrationKey = 'email_lowercase_v1';
+      const done = await meta.findOne({ _id: migrationKey });
+      if (done) return; // already ran
+
+      console.log('[MIGRATION] Normalizing workerEmail case in backfill_kpi_segments...');
+      // Find all segments where email has uppercase chars
+      const mixed = await col.find(
+        { workerEmail: { $regex: '[A-Z]' } },
+        { projection: { _id: 1, workerEmail: 1 } }
+      ).toArray();
+
+      if (mixed.length === 0) {
+        console.log('[MIGRATION] No mixed-case emails found — done');
+      } else {
+        const ops = mixed.map(s => ({
+          updateOne: {
+            filter: { _id: s._id },
+            update: { $set: { workerEmail: s.workerEmail.toLowerCase().trim() } }
+          }
+        }));
+        for (let i = 0; i < ops.length; i += 2000) {
+          await col.bulkWrite(ops.slice(i, i + 2000), { ordered: false });
+        }
+        console.log(`[MIGRATION] Normalized ${mixed.length} workerEmail values to lowercase`);
+      }
+
+      await meta.updateOne({ _id: migrationKey }, { $set: { _id: migrationKey, completedAt: new Date() } }, { upsert: true });
+    } catch (e) {
+      console.error('[MIGRATION] workerEmail normalize failed:', e.message);
+    }
+  }, 12000); // 12s after boot — after indexes are built
 
   // One-time startup: force a user sync so any stale backfill_users collection
   // (e.g. 150k docs from before the staff-only department filter) gets cleaned up
@@ -4596,6 +4800,42 @@ app.listen(CONFIG.PORT, '0.0.0.0', () => {
     }
   }, 8000); // 8s after boot — let connections settle first
 });
+
+// ── Graceful shutdown ────────────────────────────────────────────────────────
+// Railway sends SIGTERM before killing the container. We drain in-flight requests
+// (max 15s) then cleanly close MongoDB connections.
+let _shuttingDown = false;
+const server = app.listen; // reference captured below — overwritten at actual listen
+
+function gracefulShutdown(signal) {
+  if (_shuttingDown) return;
+  _shuttingDown = true;
+  console.log(`[SHUTDOWN] ${signal} received — draining requests (max 15s)`);
+
+  // Stop accepting new connections
+  if (_httpServer) {
+    _httpServer.close(async () => {
+      console.log('[SHUTDOWN] HTTP server closed');
+      try {
+        if (client)       await client.close();
+        if (configClient) await configClient.close();
+        console.log('[SHUTDOWN] MongoDB connections closed');
+      } catch {}
+      process.exit(0);
+    });
+
+    // Force exit after 15s if requests don't drain
+    setTimeout(() => {
+      console.error('[SHUTDOWN] Force exit after 15s timeout');
+      process.exit(1);
+    }, 15000);
+  } else {
+    process.exit(0);
+  }
+}
+
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+process.on('SIGINT',  () => gracefulShutdown('SIGINT'));
 
 // ═══════════════════════════════════════════════════════════
 // CRON SCHEDULER — Automated email reports
