@@ -5257,9 +5257,10 @@ app.get('/data/forecast/arrivals', async (req, res) => {
     const db = await getConfigDb();
     const dept = req.query.dept || ''; // optional department filter
 
-    // Get distinct departments available in the data
-    const allDepts = await db.collection('backfill_order_arrivals')
-      .distinct('dept').then(d => d.filter(Boolean).sort());
+    // Get distinct departments from turnaround collection (more reliable than arrivals
+    // which may not have dept field if heatmap was built before enrichment ran)
+    const allDepts = await db.collection('backfill_order_turnaround')
+      .distinct('departmentName').then(d => d.filter(Boolean).sort()).catch(() => []);
 
     const filter = dept ? { dept } : {};
     // Aggregate across all dept slots for the selected dept (or all)
@@ -5380,6 +5381,13 @@ app.get('/data/forecast/staffing', async (req, res) => {
       .countDocuments({ createdAt: { $gte: d30 }, ...deptFilter });
     const avgPerDay = Math.round(recentCount / 30 * 10) / 10;
 
+    // Get departments from backfill_order_turnaround — this is always populated
+    // even before backfill_order_arrivals is rebuilt with per-dept heatmap slots
+    const departments = await db.collection('backfill_order_turnaround')
+      .distinct('departmentName')
+      .then(d => d.filter(Boolean).sort())
+      .catch(() => []);
+
     res.json({
       arrivals,           // heatmap slots
       xphByStatus,        // throughput per status
@@ -5389,6 +5397,7 @@ app.get('/data/forecast/staffing', async (req, res) => {
       totalOrders,
       avgPerDay,
       maxHourVol,
+      departments,        // available departments for filter dropdown
     });
   } catch (err) {
     res.status(500).json({ error: err.message });

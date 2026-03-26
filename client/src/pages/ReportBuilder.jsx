@@ -6,19 +6,11 @@ import {
   ResponsiveContainer, ReferenceLine
 } from 'recharts';
 import { api } from '../hooks/useApi';
-import { fmtI, fmt, fmtDur, fmtHrs, OrderLink } from '../components/UI';
+import { TOOLTIP_STYLE, fmtI, fmt, fmtDur, fmtHrs, OrderLink } from '../components/UI';
 
 // ── Constants ────────────────────────────────────────────────
 const COLORS = ['#00aeef','#16a34a','#d97706','#7c3aed','#ea580c','#0891b2','#dc2626','#65a30d','#9333ea','#0284c7','#b45309','#15803d'];
 
-const TT_STYLE = {
-  contentStyle: { background:'#ffffff', border:'1px solid #e2e8f0', borderRadius:10, color:'#0f172a', fontSize:12, boxShadow:'0 4px 16px rgba(0,0,0,0.12)', padding:'10px 14px' },
-  labelStyle: { fontWeight:700, color:'#0077cc', marginBottom:4 },
-  itemStyle: { color:'#334155', fontWeight:500 },
-  cursor: { fill:'rgba(0,119,204,0.06)' },
-  labelStyle: { fontWeight:600, color:'#fff', marginBottom:4 },
-  itemStyle: { padding:'2px 0' }
-};
 
 const KPI_METRICS = [
   { value:'count',        label:'Segment Count',       unit:'segs',  fmt:v=>fmtI(v) },
@@ -296,7 +288,7 @@ export default function ReportBuilder() {
                 labelLine={false} style={{ fontSize:10 }}>
                 {chartData.map((_,i) => <Cell key={i} fill={COLORS[i%COLORS.length]} />)}
               </Pie>
-              <Tooltip {...TT_STYLE} formatter={(v) => [formatVal(v), metricDef.label]} />
+              <Tooltip {...TOOLTIP_STYLE} formatter={(v) => [formatVal(v), metricDef.label]} />
               <Legend wrapperStyle={{ fontSize:11, paddingTop:8 }} />
             </PieChart>
           </ResponsiveContainer>
@@ -309,7 +301,7 @@ export default function ReportBuilder() {
               <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.05)" horizontal={false} />
               <XAxis type="number" tick={tickStyle} tickFormatter={formatVal} />
               <YAxis type="category" dataKey="label" width={160} tick={{ ...tickStyle, fontSize:11 }} />
-              <Tooltip {...TT_STYLE} formatter={(v,n) => [formatVal(v), n==='value'?metricDef.label:n]} />
+              <Tooltip {...TOOLTIP_STYLE} formatter={(v,n) => [formatVal(v), n==='value'?metricDef.label:n]} />
               {avgLine && <ReferenceLine x={avgLine} stroke="#d97706" strokeDasharray="4 2" label={{ value:`avg`, fill:'#d97706', fontSize:9 }} />}
               <Bar dataKey="value" name={metricDef.label} radius={[0,4,4,0]}>
                 {chartData.map((_,i) => <Cell key={i} fill={COLORS[i%COLORS.length]} />)}
@@ -326,7 +318,7 @@ export default function ReportBuilder() {
               <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.06)" />
               <XAxis dataKey="label" tick={tickStyle} angle={-40} textAnchor="end" height={60} interval={Math.max(0,Math.floor(chartData.length/20))} />
               <YAxis tick={tickStyle} tickFormatter={formatVal} />
-              <Tooltip {...TT_STYLE} formatter={(v,n) => [formatVal(v), n==='value'?metricDef.label:n]} />
+              <Tooltip {...TOOLTIP_STYLE} formatter={(v,n) => [formatVal(v), n==='value'?metricDef.label:n]} />
               {avgLine && <ReferenceLine y={avgLine} stroke="#d97706" strokeDasharray="4 2" />}
               <Line type="monotone" dataKey="value" name={metricDef.label} stroke={COLORS[0]} strokeWidth={2.5} dot={{ r:3, fill:COLORS[0] }} activeDot={{ r:5 }} />
               {hasSecondary && <Line type="monotone" dataKey="secondary" name={getMetricLabel(config.secondaryMetric,config.source)} stroke={COLORS[2]} strokeWidth={2} strokeDasharray="4 2" dot={false} />}
@@ -348,7 +340,7 @@ export default function ReportBuilder() {
               <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.06)" />
               <XAxis dataKey="label" tick={tickStyle} angle={-40} textAnchor="end" height={60} interval={Math.max(0,Math.floor(chartData.length/20))} />
               <YAxis tick={tickStyle} tickFormatter={formatVal} />
-              <Tooltip {...TT_STYLE} formatter={(v,n) => [formatVal(v), n==='value'?metricDef.label:n]} />
+              <Tooltip {...TOOLTIP_STYLE} formatter={(v,n) => [formatVal(v), n==='value'?metricDef.label:n]} />
               <Area type="monotone" dataKey="value" name={metricDef.label} stroke={COLORS[0]} strokeWidth={2} fill="url(#areaGrad)" />
               <Legend wrapperStyle={{ fontSize:11 }} />
             </AreaChart>
@@ -362,7 +354,7 @@ export default function ReportBuilder() {
               <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.05)" vertical={false} />
               <XAxis dataKey="label" tick={tickStyle} angle={isDateGroupBy?-40:0} textAnchor={isDateGroupBy?"end":"middle"} height={isDateGroupBy?60:40} interval={Math.max(0,Math.floor(chartData.length/25))} />
               <YAxis tick={tickStyle} tickFormatter={formatVal} />
-              <Tooltip {...TT_STYLE} formatter={(v,n) => [formatVal(v), n==='value'?metricDef.label:n]} />
+              <Tooltip {...TOOLTIP_STYLE} formatter={(v,n) => [formatVal(v), n==='value'?metricDef.label:n]} />
               {avgLine && <ReferenceLine y={avgLine} stroke="#d97706" strokeDasharray="4 2" label={{ value:'avg', position:'insideTopRight', fill:'#d97706', fontSize:9 }} />}
               <Bar dataKey="value" name={metricDef.label} radius={[4,4,0,0]}>
                 {chartData.map((_,i) => <Cell key={i} fill={isDateGroupBy?COLORS[0]:COLORS[i%COLORS.length]} />)}

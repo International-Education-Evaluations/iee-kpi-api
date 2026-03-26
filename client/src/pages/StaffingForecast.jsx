@@ -2,13 +2,12 @@ import React, { useEffect, useState, useMemo } from 'react';
 import { BarChart, Bar, LineChart, Line, AreaChart, Area, XAxis, YAxis, CartesianGrid,
          Tooltip, Legend, ResponsiveContainer, Cell, ReferenceLine } from 'recharts';
 import { api } from '../hooks/useApi';
-import { fmt, fmtI } from '../components/UI';
+import { fmt, fmtI, TOOLTIP_STYLE } from '../components/UI';
 
 const DAYS = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
 const HOURS = Array.from({ length: 24 }, (_, i) => i);
 const fmtHour = h => h === 0 ? '12am' : h < 12 ? `${h}am` : h === 12 ? '12pm' : `${h-12}pm`;
 const fmtHrs  = h => h == null ? '—' : h < 24 ? `${h}h` : `${Math.round(h/24*10)/10}d`;
-const TT = { contentStyle:{ background:'#1e293b', border:'1px solid rgba(255,255,255,0.1)', borderRadius:8, color:'#f1f5f9', fontSize:12, padding:'10px 14px' }, labelStyle:{ fontWeight:600, color:'#fff', marginBottom:4 } };
 
 function heatStyle(val, max) {
   if (!max || !val) return { background:'#f1f5f9', color:'#94a3b8' };
@@ -51,8 +50,9 @@ export default function StaffingForecast() {
     ]).then(([s, sl]) => {
       setStaffing(s);
       setSla(sl);
-      // Collect departments from whichever endpoint returned them
-      const depts = sl?.departments || s?.departments || [];
+      // staffing endpoint now always returns departments from backfill_order_turnaround
+      // Fall back to sla.departments if staffing doesn't have them yet
+      const depts = s?.departments || sl?.departments || [];
       if (depts.length > 0) setDepartments(depts);
       setLoading(false);
     });
@@ -203,7 +203,7 @@ export default function StaffingForecast() {
                       <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.05)" vertical={false} />
                       <XAxis dataKey="date" tick={{ fill:'#94a3b8', fontSize:9 }} interval={Math.max(0,Math.floor(trendData.length/10))} />
                       <YAxis tick={{ fill:'#94a3b8', fontSize:10 }} />
-                      <Tooltip {...TT} />
+                      <Tooltip {...TOOLTIP_STYLE} />
                       <Area type="monotone" dataKey="evaluation" name="Evaluation" stroke="#00aeef" strokeWidth={2} fill="url(#evalGrad)" stackId="1" />
                       <Area type="monotone" dataKey="translation" name="Translation" stroke="#16a34a" strokeWidth={2} fill="rgba(22,163,74,0.15)" stackId="1" />
                       <Legend wrapperStyle={{ fontSize:11 }} />
@@ -307,7 +307,7 @@ export default function StaffingForecast() {
                     <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.05)" vertical={false} />
                     <XAxis dataKey="label" tick={{ fill:'#94a3b8', fontSize:9 }} angle={-40} textAnchor="end" height={50} />
                     <YAxis tick={{ fill:'#94a3b8', fontSize:10 }} />
-                    <Tooltip {...TT}
+                    <Tooltip {...TOOLTIP_STYLE}
                       labelFormatter={(label) => `Hour: ${label}`}
                       formatter={(v, n) => n === 'requiredStaff' ? [`${v} staff`, 'Concurrent staff needed'] : [`${v} orders`, 'Avg arrivals/hr']} />
                     <Bar dataKey="requiredStaff" name="Staff needed" radius={[4,4,0,0]}>
