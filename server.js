@@ -701,7 +701,7 @@ app.get('/health', async (req, res) => {
   try {
     const db = await getDb('orders');
     await db.command({ ping: 1 });
-    res.json({ status: 'ok', timestamp: new Date().toISOString(), env: CONFIG.NODE_ENV, version: '5.3' });
+    res.json({ status: 'ok', timestamp: new Date().toISOString(), env: CONFIG.NODE_ENV, version: '5.4.22' });
   } catch (err) {
     res.status(500).json({ status: 'error', message: err.message });
   }
@@ -1557,7 +1557,10 @@ app.get('/indexes', async (req, res) => {
 // inside the backfill caused a self-referential HTTP round-trip that added
 // 10s to every backfill cycle. This function is called directly instead.
 async function computeQueueWaitSummary(days = 90) {
-  const cutoff = getCutoff(days);
+  // Floor at 2025-01-01 — pre-2025 orders are historical V1 backlog and skew wait stats
+  const WAIT_FLOOR = new Date('2025-01-01T00:00:00Z');
+  const rawCutoff = getCutoff(days);
+  const cutoff = rawCutoff < WAIT_FLOOR ? WAIT_FLOOR : rawCutoff;
   const TERMINAL_SLUGS = ['completed', 'deleted', 'refunded', 'confirmed-fraudulent', 'expired'];
 
   const db = await getDb('orders');
@@ -1684,8 +1687,8 @@ app.get('/queue-snapshot', async (req, res) => {
     const db = await getDb('orders');
     const ordersCol = db.collection('orders');
 
-    // Default cutoff: exclude orders stuck since before 2024
-    const sinceStr = req.query.since || '2024-01-01';
+    // Default cutoff: exclude orders stuck since before 2025 (pre-2025 data is historical V1 backlog)
+    const sinceStr = req.query.since || '2025-01-01';
     const sinceCutoff = new Date(sinceStr + 'T00:00:00Z');
 
     // Terminal status types to exclude

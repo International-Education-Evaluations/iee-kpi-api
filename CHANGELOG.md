@@ -1,85 +1,124 @@
 # IEE Operations Dashboard — Changelog
 
+## v5.4.22 (2026-03-26)
+
+### Staffing Forecast — New System
+- **`runOrderArrivalBackfill` (Step 3c)** — New backfill step runs inside every cycle. Queries `orders.orders` for `createdAt`, `orderType`, `processTime`, `orderDueDate`, `orderCompletedAt`, `orderStatusHistory`, and `isUrgent`. Writes to two new collections:
+  - `backfill_order_turnaround` — one doc per order: `turnaroundHrs`, `isLate`, `daysLate`, `statusWaits` map (minutes per Waiting status)
+  - `backfill_order_arrivals` — heatmap: `{dow, hour, dept}` → counts
+- **GO_LIVE = 2026-02-07** — hard floor on all arrival queries. Excludes V1 migration batch (all imported orders stamped `createdAt = 2026-02-06`). Auto-purge detects and reseeds if pre-launch records are found in collection
+- **Streaming cursor** — `batchSize(500)` + `for await` loop flushes every 1,000 orders. Caps memory to ~350MB vs 460MB spike with `.toArray()`
+- **`maxTimeMS: 120000`** on production cursor — prevents indefinite hang
+- **Department enrichment** — post-upsert step joins `backfill_kpi_segments` on `orderSerialNumber` to derive `departmentName` per order (most frequent dept seen in segments for that order)
+- **`$percentile` removed** — replaced with JS-based percentile computation (`$push` values → sort → index). Required for Atlas M10 compatibility (MongoDB 6.x, `$percentile` requires 7.0+)
+- **3 new server endpoints:** `/data/forecast/arrivals`, `/data/forecast/staffing`, `/data/forecast/sla-analysis` — all accept `?dept=` filter, all return `departments` list
+- **`StaffingForecast.jsx`** (428 lines) — 4 tabs:
+  - **Demand** — 60-day stacked area chart (Evaluation vs Translation), hour×day heatmap, day-of-week summary bar chart (Sun–Sat volume)
+  - **Staffing Model** — `Required staff = ceil(avg arrivals ÷ team XpH)`. Bar chart colored red/amber/green. XpH per status table with "staff at 50 ord/hr" column
+  - **SLA Analysis** — P50/P75/P90 actual turnaround by order type + process time. Recommended SLA = P75 × 1.2 rounded to nearest half-day. On-track/At-risk/Breaching badges
+  - **Bottlenecks** — Waiting statuses where P75 queue wait > 4h. Full status wait time table
+- **Department filter dropdown** — reloads all three data sources filtered to selected department. Active dept shown as badge in subtitle
+- **`avgPerDay` fixed** — now uses 30-day rolling `countDocuments` instead of lifetime total ÷ 7
+
+### Backfill Engine Hardening
+- **Backfill watchdog** — `setInterval` every 30s checks if a run has been active > 10 minutes. Forces `backfillRunning = false` to self-recover from stuck runs without redeploy
+- **`backfillStartedAt` timestamp** — set at run start, cleared on success and error, used by watchdog
+- **Memory threshold raised** 300MB → 450MB for cron guard — accounts for higher RSS during order arrival seeding
+
+### AI Assistant
+- **2 new tools added:**
+  - `fetch_order_demand` — arrival patterns, peak hours/days, SLA distribution, bottlenecks, recommended SLA targets
+  - `fetch_staffing_model` — required staff by hour, XpH per status, peak staffing hour
+- **8 new suggested questions** — replaced generic prompts with capability-showcasing examples: daily ops briefing, worker XpH drop investigation, department staffing forecast, SLA health check, bottleneck detection, performance ranking vs benchmark, QC kick-back deep dive, stuck order identification
+
+### KPI Overview
+- **Alerts & Anomalies collapsed by default** — click "▼ Show" to expand. Badge shows count with red pulse for errors, amber for warnings
+- **Alerts respect active filters** — when dept/worker/status filters are active, anomaly feed evaluates only segments within that filtered set. Switching to a department shows only that department's alerts
+- **Invalid hook fix** — `anomalyOpen` state moved to component top level. Previous IIFE pattern (`(() => { React.useState() })()`) caused React "invalid hook call" crash → white screen on KPI Overview
+
+### QC Overview
+- **Blank department excluded** — events with no `departmentName` are excluded from the `byDept` grouping chart and pie. Still visible in raw events table and drilldowns
+
+### Chat / AI Conversations
+- **Conversation sidebar** — saved conversations listed in left panel. Auto-saves after every assistant reply (debounced 1.2s). Click to rename, delete with confirmation
+- **Per-user isolation** — conversations stored with `userId` field, `GET /ai/conversations` scoped to requesting user
+- **5 new endpoints** — `GET/POST /ai/conversations`, `GET/PUT/DELETE /ai/conversations/:id`
+
+### Report Builder
+- **Saved reports scoped to userId** — `GET /reports/saved` filters to requesting user's reports. Legacy reports without userId remain visible to all
+
+### Per-User Storage
+- **`userGet(key)` / `userSet(key)` / `userDel(key)`** in `useApi.js` — all keys prefixed `iee:<userId>:` for full isolation across users on shared browser
+- **KPI Users** — selected worker and active breakdown tab persisted per user via `userGet`/`userSet`
+
+### Tour
+- **Rewritten** — 18 steps, accurate `data-tour` selectors, smooth scroll-before-spotlight (350ms settle), viewport clamping, auto-flip on overflow, `iee_tour_v2_completed` storage key
+- **Pills and FilterBar** now forward `...rest` props so `data-tour` anchors work correctly
+
+### Stability
+- **Gzip compression** — native `zlib`, ~85% response size reduction
+- **Server-side config cache** — 5min TTL, write-through invalidation on all PUT endpoints
+- **Backfill metadata cache** — 30s TTL
+- **`ensureIndexes()`** at startup — adds all missing indexes including `workerUserId`, `departmentName`, compounds
+- **Graceful shutdown** — SIGTERM/SIGINT handlers drain active connections
+
+### Documentation
+- **IEE Ops Dashboard User Guide** — 13-section Word document (.docx) covering all pages, key concepts (5-bucket, XpH, In-Range %), filters, role breakdown, staffing forecast explanation, AI example questions, quick tips
+
+---
+
 ## v5.4 (2026-03-25)
 
 ### Login Fix
-- **503 crash resolved** — Login, Setup, and Invite pages now handle non-JSON server responses (e.g. Railway/Atlas 503 "Service Unavailable" HTML) gracefully instead of crashing with `Unexpected token 'S'`.
-- **Persistent auth** — Switched from `sessionStorage` to `localStorage`. Login now survives tab close, new tabs, and browser restart.
-- **Client-side JWT expiration** — `isAuth()` now decodes the JWT payload and checks the `exp` claim. Expired tokens are cleared immediately instead of waiting for a 401 on the first API call.
-- **Server health check** — Login page pings `/health` on mount and shows a red "Server Unavailable" banner if the API is down, with actionable guidance.
-- **Button text fix** — Sign In button text changed from `text-ink-900` to `text-white` for readability on brand cyan background.
+- **503 crash resolved** — Login, Setup, and Invite pages now handle non-JSON server responses gracefully
+- **Persistent auth** — Switched from `sessionStorage` to `localStorage`
+- **Client-side JWT expiration** — `isAuth()` decodes JWT payload and checks `exp` claim
+- **Server health check** — Login page pings `/health` on mount, shows red banner if API is down
 
 ### Refresh Controls
-- **Top bar refresh widget** — All authenticated pages now show a sticky header with: auto-refresh status (enabled/paused/syncing), last refresh time + duration, next refresh countdown (live), and a "↻ Refresh" button (admin only) to trigger immediate incremental backfill.
-- **`GET /backfill/next`** — New lightweight endpoint returning `isRunning`, `lastRunAt`, `nextRunAt`, `enabled`, `intervalMin` for the dashboard widget.
-- **Scheduler hardened** — Polling interval reduced from 15s to 60s. Memory safety guard skips auto-backfill if RSS > 400MB.
+- **Top bar refresh widget** — auto-refresh status, last refresh time, next refresh countdown, manual trigger button
+- **`GET /backfill/next`** — new lightweight endpoint for the dashboard widget
+- **Scheduler hardened** — 60s polling interval, memory safety guard at RSS > 400MB
 
-### Dashboard Rebuild — All 4 Pages
-- **KPI Overview** — Added: median duration, week-over-week volume trend arrow, XpH in worker table, percentage column in status breakdown, 5-bucket progress bar visualization, proper chart tooltips with formatters, shortened date labels (Jan 15 instead of 2026-01-15), adaptive X-axis intervals.
-- **User Drill-Down** — Added: XpH metric card, median duration, ComposedChart with volume bars + avg duration line overlay, dual Y-axis labels, percentage column in status table.
-- **QC Overview** — Added: daily QC trend stacked bar (Fixed vs Kick Back), week-over-week trend on total events, kick-back rate column in user table with red highlighting >20%, fix rate with color coding (green ≥80%, amber ≥50%, red <50%), custom pie labels for large slices.
-- **Queue Ops** — Added: dynamic aging chart height based on row count, proper chart legend with bucket descriptions, zero-value suppression in table (grey "0" instead of bold), conditional color formatting on all aging columns.
-- **All pages** — Shared tooltip style with shadow + rounded corners. Chart legends via new `ChartLegend` component. Filter reset button only shows when filters are active.
+### Dashboard Rebuild
+- **KPI Overview** — median duration, week-over-week trend arrow, XpH in worker table, 5-bucket progress bar, proper chart tooltips
+- **User Drill-Down** — XpH metric card, ComposedChart with volume bars + duration line, dual Y-axis
+- **QC Overview** — daily QC trend stacked bar, week-over-week trend, kick-back rate with color coding
+- **Queue Ops** — dynamic aging chart, legend with bucket descriptions, zero-value suppression
+- **Shared** — unified tooltip style, ChartLegend component, filter reset button
 
 ### Responsive / Mobile
-- **Sidebar collapse** — Sidebar hidden on screens ≤1024px, replaced with hamburger menu. Overlay sidebar with backdrop tap-to-close.
-- **Metric cards** — Responsive grid: 2 cols on mobile, 3 on sm, 4 on md, up to 7 on xl. Touch-friendly padding.
-- **Tables** — Sticky headers on scroll. Reduced padding on mobile. Horizontal scroll with momentum.
-- **Filter bars** — Flexible wrapping, smaller touch targets on mobile.
-- **Top bar** — Responsive padding, hamburger toggle on mobile.
-- **Pills** — Horizontal scroll overflow for narrow screens.
-
-### Shared Components
-- **UI.jsx** — New: `fmtDur()` (human-readable duration), `fmtHrs()`, `MiniStat`, `ChartLegend`, `TOOLTIP_STYLE`. Enhanced `Card` with trend arrows and icon slot.
-- **DashboardGrid** — Tighter margins (10px vs 12px), responsive widget title bar.
-
-### Dev Experience
-- **Vite proxy complete** — Added all missing API paths (`/data`, `/backfill`, `/reports`, `/user`, `/email`, `/glossary`, `/kpi-classify`, `/credential-counts`, `/report-counts`, `/qc-orders`, `/qc-discovery`, `/indexes`, `/collections`) to the Vite dev server proxy. No more 404s in local dev.
+- Sidebar collapse with hamburger on ≤1024px screens
+- Responsive metric card grid (2–7 cols), touch-friendly padding
+- Sticky table headers, horizontal scroll with momentum
 
 ---
 
 ## v5.3 (2026-03-25)
 
 ### Performance
-- **Global data cache** — KPI segments, QC events, and queue snapshot load once and persist in memory across page navigations. Switching between KPI Overview, User Drill-Down, QC Overview, and Queue Ops is now instant (no re-fetch).
-- **Queue snapshot cached in backfill** — Queue Ops now reads from `backfill_queue_snapshot` (updated every 5 min) instead of hitting production MongoDB on every page visit. Sub-second load.
+- **Global data cache** — segments, QC events, queue snapshot cached in memory
+- **Queue snapshot cached in backfill** — sub-second Queue Ops load
 
 ### Data Fixes
-- **QC backfill fields** — Added `isFixedIt` (boolean), `isKickItBack` (boolean), `accountableName`, `orderSerialNumber`, `orderType`, `issueCustomText` to backfill QC documents. Both incremental and full refresh paths. QC Overview now shows Fixed It / Kick Back counts, order counts, and user counts correctly.
-- **User backfill v1Id** — `backfill_users` now stores `v1Id` from MongoDB `user.user` collection, enabling the `workerUserId → department` join for KPI classification.
-- **User collection name** — Fixed `user.users` (plural, wrong) → `user.user` (singular, correct) in backfill. Users: 0 bug resolved.
-- **Seed schema** — Benchmarks and production hours now use flat `l0`–`l5` fields matching the UI and PUT endpoint schema. Previously nested `{ levels: { L0: ... } }` caused all values to show as dashes.
-- **Department field** — Settings > User Levels now reads `u.department` (matching `/users` API) instead of `u.departmentName`.
-
-### UI/UX
-- **Grid layout locked** — Widgets cannot be dragged or resized unless "Customize Layout" is clicked. Fixed `onLayoutChange` firing when `editing=false`.
-- **QC Event Log table** — New widget on QC Overview showing the 200 most recent events with columns: Date, Order (clickable), Outcome (badge), Accountable User, Department, Issue, Reporter, Type.
-- **Queue Ops cached label** — Shows "(cached)" with timestamp, or "(live)" when force-refreshed. "Force Live Refresh" button available for on-demand data.
+- **QC backfill fields** — added `isFixedIt`, `isKickItBack`, `accountableName`, `orderSerialNumber`, `orderType`, `issueCustomText`
+- **User backfill `v1Id`** — enables `workerUserId → department` join
+- **User collection name** — fixed `user.users` → `user.user`
+- **Seed schema** — flat `l0`–`l5` benchmark fields
 
 ### Auth
-- **User invite flow** — Admin creates user with `sendInvite: true` → system emails invite link via SendGrid → user sets password at `/invite?token=...` → auto-login. 7-day expiry, resend support.
-- **Accept-invite public endpoint** — `POST /auth/accept-invite` added to auth bypass list.
-
-### API
-- **`POST /config/user-levels/seed`** — Bulk seed user levels by V1 ID.
-- **`POST /config/benchmarks/thresholds/seed`** — Bulk seed 5-bucket thresholds.
-- **`GET /data/queue-snapshot`** — Fast-read cached queue snapshot from backfill.
-- **`workerUserId` filter** — Added to `GET /data/kpi-segments` query params.
-- **Classification endpoint** — Now resolves user levels by `v1Id` first (then email fallback), and adds `departmentName` to classified segments.
+- **User invite flow** — SendGrid email → `/invite?token=` → auto-login. 7-day expiry
 
 ### Identity
-- **Worker identity keyed by `workerUserId`** — All KPI pages use V1 MySQL user ID as canonical key instead of `workerEmail`. `disambiguateWorkers()` resolves `workerUserId → workerEmail → workerName` with collision detection.
+- **Worker identity keyed by `workerUserId`** — V1 MySQL integer as canonical key with collision detection
 
 ---
 
 ## v5.2 (2026-03-25)
-- React dashboard: 14 pages with light theme (IEE brand cyan)
-- react-grid-layout v2 on KPI Overview, User Drill-Down, QC Overview, Queue Ops
-- Report Builder with 7 metrics, 10 group-by options, 5 chart types, CSV export
-- Incremental backfill with bulkWrite, open segment recovery, monthly batched full refresh
-- User invite system with SendGrid email
-- AI chatbot with 7 tools, guardrails, glossary
-- Per-user customizable dashboard layouts saved to MongoDB
-- Dual MongoDB connections (read-only prod + readWrite config)
+- React dashboard: 14 pages, IEE brand cyan light theme
+- Report Builder: 7 metrics, 10 group-by, 5 chart types, CSV export
+- Incremental backfill with bulkWrite, open segment recovery
+- AI chatbot: 7 tools, guardrails, glossary
+- Per-user dashboard layouts saved to MongoDB
 - 5-bucket KPI classification + thresholds UI
-- Security hardening (rate limits, auth, graceful shutdown)
+- Rate limits, auth hardening, graceful shutdown

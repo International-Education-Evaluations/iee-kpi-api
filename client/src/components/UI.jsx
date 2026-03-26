@@ -230,9 +230,10 @@ export function Skel({ rows=5, cols=4 }) {
 }
 
 export const TOOLTIP_STYLE = {
-  contentStyle: { background:'#ffffff', border:'1px solid #e2e8f0', borderRadius:10, color:'#0f172a', fontSize:12, fontFamily:'"DM Sans",system-ui,sans-serif', boxShadow:'0 8px 24px rgba(0,0,0,0.1)', padding:'10px 14px' },
-  labelStyle: { fontWeight:600, marginBottom:4, color:'#0f172a' },
-  itemStyle: { padding:'2px 0', fontSize:12 },
+  contentStyle: { background:'#ffffff', border:'1px solid #e2e8f0', borderRadius:10, color:'#0f172a', fontSize:12, fontFamily:'"DM Sans",system-ui,sans-serif', boxShadow:'0 4px 16px rgba(0,0,0,0.12)', padding:'10px 14px' },
+  labelStyle: { fontWeight:700, marginBottom:4, color:'#0077cc', fontSize:13 },
+  itemStyle: { padding:'2px 0', fontSize:12, color:'#334155', fontWeight:500 },
+  cursor: { fill:'rgba(0,119,204,0.06)' },
 };
 
 export function ChartLegend({ items }) {

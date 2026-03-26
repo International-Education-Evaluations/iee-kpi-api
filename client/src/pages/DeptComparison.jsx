@@ -5,7 +5,20 @@ import { api } from '../hooks/useApi';
 import { fmt, fmtI, fmtDur } from '../components/UI';
 
 const COLORS = ['#00aeef','#16a34a','#d97706','#7c3aed','#ea580c','#0284c7','#dc2626','#65a30d'];
-const TT = { contentStyle:{ background:'#1e293b', border:'1px solid rgba(255,255,255,0.1)', borderRadius:8, color:'#f1f5f9', fontSize:12 } };
+const TT = {
+  contentStyle:{
+    background:'#ffffff',
+    border:'1px solid #e2e8f0',
+    borderRadius:10,
+    color:'#1e293b',
+    fontSize:12,
+    boxShadow:'0 4px 16px rgba(0,0,0,0.12)',
+    padding:'10px 14px',
+  },
+  labelStyle:{ fontWeight:700, color:'#0077cc', marginBottom:4, fontSize:13 },
+  itemStyle:{ color:'#334155', fontWeight:500 },
+  cursor:{ fill:'rgba(0,119,204,0.06)' },
+};
 
 function StatCell({ value, max, color }) {
   const pct = max > 0 ? Math.min(value / max * 100, 100) : 0;
@@ -177,7 +190,9 @@ export default function DeptComparison() {
               <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.05)" vertical={false} />
               <XAxis dataKey="dept" tick={{ fill:'#94a3b8', fontSize:10 }} angle={-35} textAnchor="end" height={70} />
               <YAxis tick={{ fill:'#94a3b8', fontSize:10 }} tickFormatter={cDef.fmt} />
-              <Tooltip {...TT} formatter={v=>[cDef.fmt(v), cDef.label]} />
+              <Tooltip {...TT}
+                labelFormatter={(label) => label}
+                formatter={(v, _name) => [cDef.fmt(v), cDef.label]} />
               <Bar dataKey={chartMetric} radius={[4,4,0,0]}>
                 {chartData.map((_,i) => <Cell key={i} fill={COLORS[i % COLORS.length]} />)}
               </Bar>

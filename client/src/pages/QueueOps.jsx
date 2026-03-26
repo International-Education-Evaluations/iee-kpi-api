@@ -126,7 +126,7 @@ export default function QueueOps() {
           <p className="text-[11px] text-ink-400 mt-0.5">Live queue status {refreshLabel&&<span className="text-ink-500">· {refreshLabel}</span>} · <span className="text-brand-500">Click any row to drill into orders</span></p>
         </div>
         <div className="flex items-center gap-3">
-          <Pills tabs={[{key:'snapshot',label:'Live Snapshot'},{key:'history',label:'Wait Summary (2024+)'}]} data-tour='queue-tabs' active={view} onChange={setView} />
+          <Pills tabs={[{key:'snapshot',label:'Live Snapshot'},{key:'history',label:'Wait Summary (2025+)'}]} data-tour='queue-tabs' active={view} onChange={setView} />
           <button onClick={forceRefreshQueue} disabled={loading} className="text-xs text-brand-600 hover:text-brand-700 font-semibold disabled:text-ink-400">{loading?'Refreshing…':'↻ Live Refresh'}</button>
         </div>
       </div>

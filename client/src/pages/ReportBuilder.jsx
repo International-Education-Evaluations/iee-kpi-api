@@ -12,7 +12,10 @@ import { fmtI, fmt, fmtDur, fmtHrs, OrderLink } from '../components/UI';
 const COLORS = ['#00aeef','#16a34a','#d97706','#7c3aed','#ea580c','#0891b2','#dc2626','#65a30d','#9333ea','#0284c7','#b45309','#15803d'];
 
 const TT_STYLE = {
-  contentStyle: { background:'#1e293b', border:'1px solid rgba(255,255,255,0.1)', borderRadius:10, color:'#f1f5f9', fontSize:12, padding:'10px 14px' },
+  contentStyle: { background:'#ffffff', border:'1px solid #e2e8f0', borderRadius:10, color:'#0f172a', fontSize:12, boxShadow:'0 4px 16px rgba(0,0,0,0.12)', padding:'10px 14px' },
+  labelStyle: { fontWeight:700, color:'#0077cc', marginBottom:4 },
+  itemStyle: { color:'#334155', fontWeight:500 },
+  cursor: { fill:'rgba(0,119,204,0.06)' },
   labelStyle: { fontWeight:600, color:'#fff', marginBottom:4 },
   itemStyle: { padding:'2px 0' }
 };

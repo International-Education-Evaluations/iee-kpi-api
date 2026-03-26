@@ -120,6 +120,18 @@ export default function StaffingForecast() {
     </div>
   );
 
+  // Surface server errors instead of crashing
+  if (staffing?.error || sla?.error) return (
+    <div className="card-surface p-8 text-center">
+      <div className="text-2xl mb-3">⚠️</div>
+      <h3 className="text-base font-display font-bold text-ink-700 mb-2">Forecast data unavailable</h3>
+      <p className="text-sm text-ink-400 max-w-md mx-auto">
+        {staffing?.error || sla?.error}
+      </p>
+      <p className="text-xs text-ink-300 mt-3">Run a backfill to seed the forecast data, then refresh this page.</p>
+    </div>
+  );
+
   const noData = !staffing?.arrivals?.length;
 
   return (
@@ -129,11 +141,11 @@ export default function StaffingForecast() {
         <div>
           <h1 className="text-xl font-display font-bold text-ink-900">Staffing Forecast</h1>
           <p className="text-xs text-ink-400 mt-0.5">
-            Demand patterns from {fmtI(staffing?.totalOrders || 0)} orders · {fmtI(Math.round(staffing?.avgPerDay || 0))} avg orders/day{dept && <span className="ml-2 px-1.5 py-0.5 bg-brand-100 text-brand-700 text-[10px] rounded font-semibold">{dept}</span>}
+            Demand patterns from {fmtI(staffing?.totalOrders || 0)} orders · {fmtI(Math.round(staffing?.avgPerDay || 0))} avg orders/day
+            {dept && <span className="ml-2 px-1.5 py-0.5 bg-brand-100 text-brand-700 text-[10px] rounded font-semibold">{dept}</span>}
           </p>
         </div>
         <div className="flex items-center gap-3 flex-wrap">
-          {/* Department filter */}
           <div className="flex items-center gap-2">
             <label className="text-[10px] font-semibold uppercase tracking-wider text-ink-400">Dept</label>
             <select value={dept} onChange={e => handleDeptChange(e.target.value)}
@@ -143,12 +155,12 @@ export default function StaffingForecast() {
             </select>
           </div>
           <div className="flex gap-1 bg-surface-100 p-1 rounded-lg border border-surface-200 flex-wrap">
-          {[['demand','📈 Demand'],['staffing','👥 Staffing Model'],['sla','⏱ SLA Analysis'],['bottlenecks','🚧 Bottlenecks']].map(([k,l]) => (
-            <button key={k} onClick={() => setTab(k)}
-              className={`px-3 py-1.5 text-xs font-semibold rounded-md transition-all ${tab===k?'bg-white text-brand-600 shadow-sm border border-surface-200':'text-ink-500 hover:text-ink-700'}`}>
-              {l}
-            </button>
-          ))}
+            {[['demand','📈 Demand'],['staffing','👥 Staffing Model'],['sla','⏱ SLA Analysis'],['bottlenecks','🚧 Bottlenecks']].map(([k,l]) => (
+              <button key={k} onClick={() => setTab(k)}
+                className={`px-3 py-1.5 text-xs font-semibold rounded-md transition-all ${tab===k?'bg-white text-brand-600 shadow-sm border border-surface-200':'text-ink-500 hover:text-ink-700'}`}>
+                {l}
+              </button>
+            ))}
           </div>
         </div>
       </div>
