@@ -3,6 +3,7 @@ import { BrowserRouter, Routes, Route, Navigate, Outlet } from 'react-router-dom
 import { isAuth, isAdmin, isManagerPlus } from './hooks/useApi';
 import Sidebar from './components/Sidebar';
 import LoginPage from './pages/LoginPage';
+import InvitePage from './pages/InvitePage';
 import KPIOverview from './pages/KPIOverview';
 import KPIUsers from './pages/KPIUsers';
 import QCOverview from './pages/QCOverview';
@@ -33,6 +34,7 @@ export default function App() {
     <BrowserRouter>
       <Routes>
         <Route path="/login" element={<LoginPage />} />
+        <Route path="/invite" element={<InvitePage />} />
         <Route element={<AuthGuard />}>
           <Route path="/" element={<KPIOverview />} />
           <Route path="/kpi/users" element={<KPIUsers />} />

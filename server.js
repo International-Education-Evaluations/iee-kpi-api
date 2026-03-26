@@ -52,6 +52,7 @@ const CONFIG = {
   CLAUDE_API_KEY: process.env.CLAUDE_API_KEY || '',
   SENDGRID_API_KEY: process.env.SENDGRID_API_KEY || '',
   SENDGRID_TEMPLATE_ID: process.env.SENDGRID_TEMPLATE_ID || '',
+  SENDGRID_INVITE_TEMPLATE_ID: process.env.SENDGRID_INVITE_TEMPLATE_ID || '',
   SENDGRID_FROM_EMAIL: process.env.SENDGRID_FROM_EMAIL || 'ops@myiee.org',
   SETUP_SECRET: process.env.SETUP_SECRET || '',
   NODE_ENV: process.env.NODE_ENV || 'production'
@@ -491,7 +492,7 @@ function verifyToken(token) {
 
 function authMiddleware(req, res, next) {
   // Skip auth for public routes
-  if (req.path === '/health' || req.path === '/auth/login' || req.path === '/auth/setup') return next();
+  if (req.path === '/health' || req.path === '/auth/login' || req.path === '/auth/setup' || req.path === '/auth/accept-invite') return next();
 
   // Skip auth for static assets and SPA routes (React handles auth client-side)
   // Static files: .js, .css, .html, .png, .svg, .ico, .woff, etc.
@@ -1834,12 +1835,14 @@ app.get('/auth/users', requireRole('admin'), async (req, res) => {
   }
 });
 
-// —— POST /auth/users — Create user (admin only) ——————————
+// —— POST /auth/users — Create user or send invite (admin only) ——
+// Body: { email, name, role, password }         → create with password
+// Body: { email, name, role, sendInvite: true }  → create pending + send invite email
 app.post('/auth/users', requireRole('admin'), async (req, res) => {
   try {
-    const { email, password, name, role } = req.body;
-    if (!email || !password || !name) {
-      return res.status(400).json({ error: 'email, password, and name required' });
+    const { email, name, role, password, sendInvite } = req.body;
+    if (!email || !name) {
+      return res.status(400).json({ error: 'email and name required' });
     }
     const validRoles = ['admin', 'manager', 'viewer'];
     if (role && !validRoles.includes(role)) {
@@ -1850,16 +1853,21 @@ app.post('/auth/users', requireRole('admin'), async (req, res) => {
     const exists = await db.collection('dashboard_users').findOne({ email: email.toLowerCase().trim() });
     if (exists) return res.status(400).json({ error: 'User with this email already exists' });
 
-    const hash = await bcrypt.hash(password, 12);
     const apiKey = 'iee_' + crypto.randomBytes(24).toString('hex');
+    const inviteToken = sendInvite ? crypto.randomBytes(32).toString('hex') : null;
+    const inviteExpiresAt = sendInvite ? new Date(Date.now() + 7 * 24 * 60 * 60 * 1000) : null; // 7 days
 
     const user = {
       email: email.toLowerCase().trim(),
-      passwordHash: hash,
+      passwordHash: password ? await bcrypt.hash(password, 12) : null,
       name: name.trim(),
       role: role || 'viewer',
       apiKey,
-      isActive: true,
+      isActive: !sendInvite, // pending until they accept
+      isPending: !!sendInvite,
+      inviteToken,
+      inviteExpiresAt,
+      invitedBy: req.user?.name || 'admin',
       createdAt: new Date(),
       updatedAt: new Date(),
       createdBy: req.user?.name || 'admin'
@@ -1868,13 +1876,133 @@ app.post('/auth/users', requireRole('admin'), async (req, res) => {
     const result = await db.collection('dashboard_users').insertOne(user);
 
     await auditLog('create_user', 'dashboard_users',
-      { email: user.email, role: user.role, createdBy: req.user?.name },
+      { email: user.email, role: user.role, createdBy: req.user?.name, invited: !!sendInvite },
       req.user?.name);
+
+    // Send invite email if requested and SendGrid is configured
+    if (sendInvite && CONFIG.SENDGRID_API_KEY && CONFIG.SENDGRID_INVITE_TEMPLATE_ID) {
+      try {
+        const sgMail = require('@sendgrid/mail');
+        sgMail.setApiKey(CONFIG.SENDGRID_API_KEY);
+
+        const dashboardUrl = req.headers.origin || `https://${req.headers.host}`;
+        const inviteUrl = `${dashboardUrl}/invite?token=${inviteToken}`;
+
+        await sgMail.send({
+          to: user.email,
+          from: CONFIG.SENDGRID_FROM_EMAIL,
+          templateId: CONFIG.SENDGRID_INVITE_TEMPLATE_ID,
+          dynamicTemplateData: {
+            recipient_name: user.name.split(' ')[0],
+            sender_name: req.user?.name || 'Operations',
+            role: user.role,
+            invite_url: inviteUrl,
+            expires_in: '7 days',
+            dashboard_url: dashboardUrl
+          }
+        });
+        console.log(`[INVITE] Sent invite email to ${user.email}`);
+      } catch (emailErr) {
+        console.error(`[INVITE] Failed to send invite email:`, emailErr.message);
+        // Don't fail the request — user is created, email just didn't send
+      }
+    }
 
     res.json({
       success: true,
-      user: { id: result.insertedId, email: user.email, name: user.name, role: user.role, apiKey }
+      invited: !!sendInvite,
+      user: { id: result.insertedId, email: user.email, name: user.name, role: user.role, apiKey, isPending: user.isPending }
     });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// —— POST /auth/accept-invite — Set password via invite token ——
+// Public endpoint — no auth required
+app.post('/auth/accept-invite', async (req, res) => {
+  try {
+    const { token, password } = req.body;
+    if (!token || !password) return res.status(400).json({ error: 'token and password required' });
+    if (password.length < 6) return res.status(400).json({ error: 'Password must be at least 6 characters' });
+
+    const db = await getConfigDb();
+    const user = await db.collection('dashboard_users').findOne({ inviteToken: token });
+
+    if (!user) return res.status(404).json({ error: 'Invalid or expired invite link' });
+    if (user.inviteExpiresAt && new Date() > new Date(user.inviteExpiresAt)) {
+      return res.status(410).json({ error: 'Invite link has expired. Ask your administrator to resend.' });
+    }
+
+    const hash = await bcrypt.hash(password, 12);
+    await db.collection('dashboard_users').updateOne(
+      { _id: user._id },
+      { $set: {
+        passwordHash: hash,
+        isActive: true,
+        isPending: false,
+        inviteToken: null,
+        inviteExpiresAt: null,
+        activatedAt: new Date(),
+        updatedAt: new Date()
+      }}
+    );
+
+    await auditLog('accept_invite', 'dashboard_users', { email: user.email }, user.email);
+
+    // Auto-login
+    const token2 = generateToken({ ...user, isActive: true, isPending: false });
+    res.json({
+      success: true,
+      token: token2,
+      user: { id: user._id, email: user.email, name: user.name, role: user.role }
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// —— POST /auth/resend-invite — Resend invite email (admin) ——
+app.post('/auth/resend-invite', requireRole('admin'), async (req, res) => {
+  try {
+    const { email } = req.body;
+    if (!email) return res.status(400).json({ error: 'email required' });
+
+    const db = await getConfigDb();
+    const user = await db.collection('dashboard_users').findOne({ email: email.toLowerCase().trim() });
+    if (!user) return res.status(404).json({ error: 'User not found' });
+    if (!user.isPending) return res.status(400).json({ error: 'User has already accepted their invite' });
+
+    // Generate new token
+    const inviteToken = crypto.randomBytes(32).toString('hex');
+    const inviteExpiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
+
+    await db.collection('dashboard_users').updateOne(
+      { _id: user._id },
+      { $set: { inviteToken, inviteExpiresAt, updatedAt: new Date() } }
+    );
+
+    if (CONFIG.SENDGRID_API_KEY && CONFIG.SENDGRID_INVITE_TEMPLATE_ID) {
+      const sgMail = require('@sendgrid/mail');
+      sgMail.setApiKey(CONFIG.SENDGRID_API_KEY);
+      const dashboardUrl = req.headers.origin || `https://${req.headers.host}`;
+      await sgMail.send({
+        to: user.email,
+        from: CONFIG.SENDGRID_FROM_EMAIL,
+        templateId: CONFIG.SENDGRID_INVITE_TEMPLATE_ID,
+        dynamicTemplateData: {
+          recipient_name: user.name.split(' ')[0],
+          sender_name: req.user?.name || 'Operations',
+          role: user.role,
+          invite_url: `${dashboardUrl}/invite?token=${inviteToken}`,
+          expires_in: '7 days',
+          dashboard_url: dashboardUrl
+        }
+      });
+    }
+
+    await auditLog('resend_invite', 'dashboard_users', { email: user.email }, req.user?.name);
+    res.json({ success: true });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -2606,6 +2734,62 @@ app.put('/config/user-levels', requireRole('admin', 'manager'), async (req, res)
 
     await auditLog('upsert', 'dashboard_user_levels', doc, changedBy);
     res.json({ success: true, level: doc });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// —— POST /config/user-levels/seed — Bulk seed user levels ———
+// Body: { levels: [{ v1Id, level }, ...], changedBy }
+app.post('/config/user-levels/seed', requireRole('admin'), async (req, res) => {
+  try {
+    const { levels, changedBy } = req.body;
+    if (!Array.isArray(levels)) return res.status(400).json({ error: 'levels array required' });
+
+    const db = await getConfigDb();
+    let upserted = 0;
+    for (const l of levels) {
+      if (!l.v1Id || !l.level) continue;
+      await db.collection('dashboard_user_levels').updateOne(
+        { v1Id: String(l.v1Id) },
+        { $set: { v1Id: String(l.v1Id), level: l.level, updatedAt: new Date(), updatedBy: changedBy || 'seed' },
+          $setOnInsert: { createdAt: new Date() } },
+        { upsert: true }
+      );
+      upserted++;
+    }
+    await auditLog('seed', 'dashboard_user_levels', { count: upserted }, changedBy);
+    res.json({ success: true, upserted });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// —— POST /config/benchmarks/thresholds/seed — Bulk seed thresholds ——
+// Body: { thresholds: [{ status, excludeShortSec, inRangeMinSec, inRangeMaxSec, excludeLongSec }, ...] }
+app.post('/config/benchmarks/thresholds/seed', requireRole('admin'), async (req, res) => {
+  try {
+    const { thresholds, changedBy } = req.body;
+    if (!Array.isArray(thresholds)) return res.status(400).json({ error: 'thresholds array required' });
+
+    const db = await getConfigDb();
+    let updated = 0;
+    for (const t of thresholds) {
+      if (!t.status) continue;
+      const update = { updatedAt: new Date(), updatedBy: changedBy || 'seed' };
+      if (t.excludeShortSec !== undefined) update.excludeShortMin = Number(t.excludeShortSec);
+      if (t.inRangeMinSec !== undefined) update.inRangeMin = Number(t.inRangeMinSec);
+      if (t.inRangeMaxSec !== undefined) update.inRangeMax = Number(t.inRangeMaxSec);
+      if (t.excludeLongSec !== undefined) update.excludeLongMax = Number(t.excludeLongSec);
+
+      await db.collection('dashboard_benchmarks').updateMany(
+        { status: t.status },
+        { $set: update }
+      );
+      updated++;
+    }
+    await auditLog('seed_thresholds', 'dashboard_benchmarks', { count: updated }, changedBy);
+    res.json({ success: true, updated });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -3551,6 +3735,7 @@ app.get('/data/kpi-segments', async (req, res) => {
     const filter = {};
     if (req.query.orderType) filter.orderType = req.query.orderType;
     if (req.query.workerEmail) filter.workerEmail = req.query.workerEmail;
+    if (req.query.workerUserId) filter.workerUserId = req.query.workerUserId;
     if (req.query.statusSlug) filter.statusSlug = req.query.statusSlug;
     if (req.query.from) filter.segmentStart = { $gte: req.query.from };
     if (req.query.to) filter.segmentStart = { ...filter.segmentStart, $lte: req.query.to + 'T23:59:59' };

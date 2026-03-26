@@ -35,7 +35,7 @@ export default function KPIUsers() {
       const dis = disambiguateWorkers(all);
       setSegs(dis);
       const m={};
-      dis.forEach(s=>{if(s.workerEmail) m[s.workerEmail]=s.displayName||s.workerName;});
+      dis.forEach(s=>{if(s._workerId) m[s._workerId]=s.displayName||s.workerName;});
       setWorkers(Object.entries(m).map(([v,l])=>({value:v,label:l})).sort((a,b)=>a.label.localeCompare(b.label)));
     } catch(e){console.error(e);}
     setLoading(false);
@@ -44,7 +44,7 @@ export default function KPIUsers() {
   const userSegs = useMemo(() => {
     if(!sel) return [];
     return segs.filter(s => {
-      if(s.workerEmail!==sel) return false;
+      if(s._workerId!==sel) return false;
       if(fFrom&&s.segmentStart&&s.segmentStart<fFrom) return false;
       if(fTo&&s.segmentStart&&s.segmentStart>fTo+'T23:59:59') return false;
       if(fStatus&&(s.statusName||s.statusSlug)!==fStatus) return false;
@@ -63,7 +63,7 @@ export default function KPIUsers() {
 
   const byStatus=useMemo(()=>{const d={};userSegs.forEach(s=>{const k=s.statusName||s.statusSlug;if(!d[k])d[k]={status:k,count:0,totalMin:0,closed:0};d[k].count++;if(!s.isOpen&&s.durationMinutes>0){d[k].totalMin+=s.durationMinutes;d[k].closed++;}});return Object.values(d).map(d=>({...d,avg:d.closed?Math.round(d.totalMin/d.closed*10)/10:null})).sort((a,b)=>b.count-a.count);},[userSegs]);
 
-  const statuses = useMemo(()=>[...new Set(segs.filter(s=>s.workerEmail===sel).map(s=>s.statusName||s.statusSlug).filter(Boolean))].sort(),[segs,sel]);
+  const statuses = useMemo(()=>[...new Set(segs.filter(s=>s._workerId===sel).map(s=>s.statusName||s.statusSlug).filter(Boolean))].sort(),[segs,sel]);
   const selName=workers.find(w=>w.value===sel)?.label||'Select a worker';
 
   return (

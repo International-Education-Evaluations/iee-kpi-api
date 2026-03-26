@@ -113,18 +113,39 @@ export function Skel({ rows=5, cols=4 }) {
   </div>;
 }
 
-// ── Worker name disambiguator ───────────────────────────────
-export function disambiguateWorkers(items, nameKey='workerName', emailKey='workerEmail') {
-  const nameCounts = {};
+// ── Worker identity resolver ──────────────────────────────────
+// Groups workers by workerUserId (V1 MySQL ID) as the canonical key.
+// Falls back to workerEmail → workerName for segments missing an ID.
+// Returns items with _workerId (stable key) and displayName (UI label).
+export function disambiguateWorkers(items) {
+  // Build ID→name map (prefer most common name per ID)
+  const idNames = {};
   for (const item of items) {
-    const name = item[nameKey] || 'UNATTRIBUTED';
-    nameCounts[name] = (nameCounts[name] || 0) + 1;
+    const id = item.workerUserId || item.workerEmail || item.workerName || null;
+    if (!id) continue;
+    if (!idNames[id]) idNames[id] = {};
+    const name = item.workerName || 'UNATTRIBUTED';
+    idNames[id][name] = (idNames[id][name] || 0) + 1;
+  }
+  // Pick the most frequent name per ID
+  const canonical = {};
+  for (const [id, names] of Object.entries(idNames)) {
+    canonical[id] = Object.entries(names).sort((a,b) => b[1] - a[1])[0][0];
+  }
+  // Check for name collisions across different IDs
+  const nameToIds = {};
+  for (const [id, name] of Object.entries(canonical)) {
+    if (!nameToIds[name]) nameToIds[name] = [];
+    nameToIds[name].push(id);
   }
   return items.map(item => {
-    const name = item[nameKey] || 'UNATTRIBUTED';
-    const displayName = nameCounts[name] > 1 && item[emailKey]
-      ? `${name} (${item[emailKey]})`
+    const id = item.workerUserId || item.workerEmail || item.workerName || null;
+    const name = id ? (canonical[id] || item.workerName || 'UNATTRIBUTED') : (item.workerName || 'UNATTRIBUTED');
+    // If multiple IDs share the same name, disambiguate with email
+    const isDuplicate = nameToIds[name] && nameToIds[name].length > 1;
+    const displayName = isDuplicate && item.workerEmail
+      ? `${name} (${item.workerEmail})`
       : name;
-    return { ...item, displayName };
+    return { ...item, _workerId: id, displayName };
   });
 }

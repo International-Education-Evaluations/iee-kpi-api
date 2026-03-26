@@ -43,13 +43,13 @@ export default function KPIOverview() {
 
   const workers = useMemo(() => {
     const m = {};
-    segs.forEach(s => { if (s.workerEmail) m[s.workerEmail] = s.displayName || s.workerName; });
+    segs.forEach(s => { if (s._workerId) m[s._workerId] = s.displayName || s.workerName; });
     return Object.entries(m).map(([v,l]) => ({value:v,label:l})).sort((a,b) => a.label.localeCompare(b.label));
   }, [segs]);
 
   const filtered = useMemo(() => segs.filter(s => {
     if (fType && s.orderType !== fType) return false;
-    if (fWorker && s.workerEmail !== fWorker) return false;
+    if (fWorker && s._workerId !== fWorker) return false;
     if (fFrom && s.segmentStart && s.segmentStart < fFrom) return false;
     if (fTo && s.segmentStart && s.segmentStart > fTo + 'T23:59:59') return false;
     return true;
@@ -61,7 +61,7 @@ export default function KPIOverview() {
     const totalMin = closed.reduce((a,s) => a + (s.durationMinutes||0), 0);
     return { total: filtered.length, closed: closed.length, open: filtered.filter(s=>s.isOpen).length,
       avg: closed.length ? totalMin/closed.length : 0, hrs: totalMin/60,
-      workers: new Set(filtered.map(s=>s.workerEmail).filter(Boolean)).size,
+      workers: new Set(filtered.map(s=>s._workerId).filter(Boolean)).size,
       orders: new Set(filtered.map(s=>s.orderSerialNumber).filter(Boolean)).size };
   }, [filtered]);
 
@@ -85,8 +85,8 @@ export default function KPIOverview() {
   const byWorker = useMemo(() => {
     const m = {};
     filtered.forEach(s => {
-      const k = s.workerEmail||'none';
-      if (!m[k]) m[k] = {worker:s.displayName||s.workerName||'UNATTRIBUTED',email:k,count:0,totalMin:0,closed:0};
+      const k = s._workerId||'none';
+      if (!m[k]) m[k] = {worker:s.displayName||s.workerName||'UNATTRIBUTED',workerId:k,count:0,totalMin:0,closed:0};
       m[k].count++; if(!s.isOpen&&s.durationMinutes>0){m[k].totalMin+=s.durationMinutes;m[k].closed++;}
     });
     return Object.values(m).map(d=>({...d,avg:d.closed?Math.round(d.totalMin/d.closed*10)/10:null,hrs:Math.round(d.totalMin/60*10)/10})).sort((a,b)=>b.count-a.count);
@@ -218,7 +218,7 @@ export default function KPIOverview() {
                 {key:'count',label:'Segments',right:true,render:v=>fmtI(v)},
                 {key:'avg',label:'Avg Min',right:true,render:v=>fmt(v)},
                 {key:'hrs',label:'Total Hrs',right:true,render:v=>fmt(v)}
-              ]} rows={byWorker} onRow={r => r.email !== 'none' && nav(`/kpi/users?worker=${r.email}`)} />
+              ]} rows={byWorker} onRow={r => r.workerId !== 'none' && nav(`/kpi/users?worker=${r.workerId}`)} />
             }
           </Widget>
         </div>
