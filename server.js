@@ -4442,7 +4442,7 @@ function startBackfillScheduler() {
 // —— POST /reports/query — Execute a report ——————————————
 app.post('/reports/query', async (req, res) => {
   try {
-    const { source, metric, groupBy, filters, dateGrouping } = req.body;
+    const { source, metric, secondaryMetric, groupBy, filters, sortBy, limit } = req.body;
     if (!source || !metric || !groupBy) {
       return res.status(400).json({ error: 'source, metric, and groupBy required' });
     }
@@ -4450,90 +4450,143 @@ app.post('/reports/query', async (req, res) => {
     const db = await getConfigDb();
     const colName = source === 'qc' ? 'backfill_qc_events' : 'backfill_kpi_segments';
     const col = db.collection(colName);
+    const dateField = source === 'qc' ? 'qcCreatedAt' : 'segmentStart';
 
-    // Build match filter
+    // ── Build match filter ───────────────────────────────────
     const match = {};
     if (filters) {
-      if (filters.dateFrom) {
-        const dateField = source === 'qc' ? 'qcCreatedAt' : 'segmentStart';
-        match[dateField] = { ...match[dateField], $gte: filters.dateFrom };
-      }
-      if (filters.dateTo) {
-        const dateField = source === 'qc' ? 'qcCreatedAt' : 'segmentStart';
-        match[dateField] = { ...match[dateField], $lte: filters.dateTo + 'T23:59:59' };
-      }
-      if (filters.workers?.length) match.workerEmail = { $in: filters.workers };
-      if (filters.statuses?.length) match.statusSlug = { $in: filters.statuses };
-      if (filters.orderTypes?.length) match.orderType = { $in: filters.orderTypes };
-      if (filters.departments?.length) match.departmentName = { $in: filters.departments };
-      if (filters.errorTypes?.length) match.errorType = { $in: filters.errorTypes };
-      if (filters.excludeOpen) match.isOpen = { $ne: true };
+      if (filters.dateFrom) match[dateField] = { ...match[dateField], $gte: filters.dateFrom };
+      if (filters.dateTo)   match[dateField] = { ...match[dateField], $lte: filters.dateTo + 'T23:59:59' };
+      if (filters.workers?.length)     match.workerEmail   = { $in: filters.workers };
+      if (filters.statuses?.length)    match.statusSlug    = { $in: filters.statuses };
+      if (filters.orderType)           match.orderType     = filters.orderType;
+      if (filters.orderTypes?.length)  match.orderType     = { $in: filters.orderTypes };
+      if (filters.departments?.length) match.departmentName= { $in: filters.departments };
+      if (filters.errorTypes?.length)  match.errorType     = { $in: filters.errorTypes };
+      if (filters.issues?.length)      match.issueName     = { $in: filters.issues };
+      if (filters.excludeOpen)         match.isOpen        = { $ne: true };
     }
 
-    // Build group key
-    const dateField = source === 'qc' ? 'qcCreatedAt' : 'segmentStart';
-    let groupKey;
-    switch (groupBy) {
-      case 'worker': groupKey = source === 'qc' ? '$errorAssignedToName' : '$workerName'; break;
-      case 'workerEmail': groupKey = source === 'qc' ? '$errorAssignedToEmail' : '$workerEmail'; break;
-      case 'status': groupKey = '$statusSlug'; break;
-      case 'statusName': groupKey = '$statusName'; break;
-      case 'department': groupKey = '$departmentName'; break;
-      case 'orderType': groupKey = '$orderType'; break;
-      case 'errorType': groupKey = '$errorType'; break;
-      case 'issueName': groupKey = '$issueName'; break;
-      case 'date':
-        // Group by day/week/month
-        if (dateGrouping === 'week') {
-          groupKey = { $dateToString: { format: '%G-W%V', date: { $dateFromString: { dateString: `$${dateField}` } } } };
-        } else if (dateGrouping === 'month') {
-          groupKey = { $substr: [`$${dateField}`, 0, 7] };
-        } else {
-          groupKey = { $substr: [`$${dateField}`, 0, 10] }; // day
-        }
-        break;
-      default: groupKey = '$' + groupBy;
+    // ── Build group key ──────────────────────────────────────
+    function buildGroupKey(gb) {
+      switch (gb) {
+        case 'worker':      return source==='qc' ? '$accountableName' : '$workerName';
+        case 'workerEmail': return source==='qc' ? '$accountableEmail' : '$workerEmail';
+        case 'statusName':  return '$statusName';
+        case 'statusSlug':
+        case 'status':      return '$statusSlug';
+        case 'department':  return '$departmentName';
+        case 'orderType':   return '$orderType';
+        case 'errorType':   return '$errorType';
+        case 'issueName':   return '$issueName';
+        case 'orderSource': return '$orderSource';
+        case 'date':  return { $substr: [`$${dateField}`, 0, 10] };
+        case 'week':  return { $dateToString: { format:'%G-W%V', date:{ $dateFromString:{ dateString:`$${dateField}` } } } };
+        case 'month': return { $substr: [`$${dateField}`, 0, 7] };
+        default: return '$' + gb;
+      }
     }
 
-    // Build metric aggregation
-    let metricField;
-    switch (metric) {
-      case 'count': metricField = { $sum: 1 }; break;
-      case 'avgDuration': metricField = { $avg: '$durationMinutes' }; break;
-      case 'totalHours': metricField = { $sum: { $divide: ['$durationMinutes', 60] } }; break;
-      case 'totalMinutes': metricField = { $sum: '$durationMinutes' }; break;
-      case 'maxDuration': metricField = { $max: '$durationMinutes' }; break;
-      case 'minDuration': metricField = { $min: '$durationMinutes' }; break;
-      case 'uniqueOrders': metricField = { $addToSet: '$orderSerialNumber' }; break;
-      default: metricField = { $sum: 1 };
+    // ── Build metric accumulator ─────────────────────────────
+    function buildMetricAccumulator(m) {
+      switch (m) {
+        case 'count':          return { $sum: 1 };
+        case 'avgDuration':    return { $avg: '$durationMinutes' };
+        case 'medianDuration': return { $push: '$durationMinutes' }; // post-processed
+        case 'totalHours':     return { $sum: { $divide: ['$durationMinutes', 60] } };
+        case 'totalMinutes':   return { $sum: '$durationMinutes' };
+        case 'maxDuration':    return { $max: '$durationMinutes' };
+        case 'minDuration':    return { $min: '$durationMinutes' };
+        case 'xph':            return null; // computed post-group
+        case 'uniqueOrders':   return { $addToSet: '$orderSerialNumber' };
+        case 'openRate':       return null; // computed post-group
+        case 'inRangeCount':   return null; // computed post-group — needs benchmark lookup
+        case 'fixedIt':        return { $sum: { $cond: ['$isFixedIt', 1, 0] } };
+        case 'kickBack':       return { $sum: { $cond: ['$isKickItBack', 1, 0] } };
+        case 'fixRate':        return null; // computed post-group
+        case 'kbRate':         return null; // computed post-group
+        default:               return { $sum: 1 };
+      }
     }
+
+    const primaryAcc   = buildMetricAccumulator(metric);
+    const secondaryAcc = secondaryMetric ? buildMetricAccumulator(secondaryMetric) : null;
+    const groupSpec    = { _id: buildGroupKey(groupBy), count: { $sum: 1 } };
+
+    // Always collect what we need for post-computed metrics
+    const needsDurations = ['xph', 'openRate', 'medianDuration'].includes(metric) || ['xph','openRate','medianDuration'].includes(secondaryMetric);
+    const needsOpen      = ['openRate'].includes(metric) || ['openRate'].includes(secondaryMetric);
+
+    if (primaryAcc)   groupSpec.value     = primaryAcc;
+    else              groupSpec._durations = { $push: '$durationMinutes' };
+    if (needsOpen)    groupSpec._openCount = { $sum: { $cond: ['$isOpen', 1, 0] } };
+    if (secondaryAcc) groupSpec.secondary  = secondaryAcc;
+    else if (secondaryMetric) groupSpec._secDurations = { $push: '$durationMinutes' };
 
     const pipeline = [
       { $match: match },
-      { $group: { _id: groupKey, value: metricField, count: { $sum: 1 } } },
-      { $sort: { value: -1 } },
-      { $limit: 200 }
+      { $group: groupSpec },
+      { $limit: Math.min(limit || 200, 1000) }
     ];
 
-    let results = await col.aggregate(pipeline).toArray();
+    let results = await col.aggregate(pipeline, { allowDiskUse: true }).toArray();
 
-    // Post-process uniqueOrders to get count
-    if (metric === 'uniqueOrders') {
-      results = results.map(r => ({ ...r, value: Array.isArray(r.value) ? r.value.length : 0 }));
+    // ── Post-process computed metrics ───────────────────────
+    function postProcess(r, m, valField, durField, openField) {
+      const raw = r[valField];
+      switch (m) {
+        case 'uniqueOrders':
+          return Array.isArray(raw) ? raw.length : 0;
+        case 'medianDuration': {
+          const arr = (r[durField] || []).filter(v => v != null).sort((a,b)=>a-b);
+          if (!arr.length) return null;
+          const mid = Math.floor(arr.length/2);
+          return arr.length%2 ? arr[mid] : (arr[mid-1]+arr[mid])/2;
+        }
+        case 'xph': {
+          const durs = (r[durField] || []).filter(v => v != null);
+          const totalMin = durs.reduce((a,b)=>a+b,0);
+          return totalMin > 0 ? durs.length / (totalMin/60) : 0;
+        }
+        case 'openRate':
+          return r.count > 0 ? ((r[openField] || 0) / r.count) * 100 : 0;
+        case 'fixRate': {
+          const fi = r._fi || 0; return r.count > 0 ? (fi/r.count)*100 : 0;
+        }
+        case 'kbRate': {
+          const kb = r._kb || 0; return r.count > 0 ? (kb/r.count)*100 : 0;
+        }
+        default:
+          return typeof raw === 'number' ? Math.round(raw * 100) / 100 : raw;
+      }
     }
 
-    // Round numeric values
-    results = results.map(r => ({
-      label: r._id || 'N/A',
-      value: typeof r.value === 'number' ? Math.round(r.value * 100) / 100 : r.value,
-      count: r.count
-    }));
+    results = results.map(r => {
+      const value     = postProcess(r, metric,          'value',      '_durations',    '_openCount');
+      const secondary = secondaryMetric
+        ? postProcess(r, secondaryMetric, 'secondary',  '_secDurations', '_openCount')
+        : undefined;
+      return {
+        label:     r._id || '(blank)',
+        value:     typeof value === 'number' ? Math.round(value * 10000) / 10000 : (value ?? 0),
+        secondary: secondary != null ? (typeof secondary === 'number' ? Math.round(secondary * 10000)/10000 : secondary) : undefined,
+        count:     r.count
+      };
+    });
+
+    // ── Sort ────────────────────────────────────────────────
+    switch (sortBy || 'value_desc') {
+      case 'value_asc':  results.sort((a,b)=>a.value-b.value); break;
+      case 'value_desc': results.sort((a,b)=>b.value-a.value); break;
+      case 'label_asc':  results.sort((a,b)=>String(a.label).localeCompare(String(b.label))); break;
+      case 'label_desc': results.sort((a,b)=>String(b.label).localeCompare(String(a.label))); break;
+      case 'count_desc': results.sort((a,b)=>b.count-a.count); break;
+    }
 
     const totalDocs = await col.countDocuments(match);
 
     res.json({
-      source, metric, groupBy, dateGrouping,
-      filters,
+      source, metric, secondaryMetric, groupBy, filters,
       totalMatched: totalDocs,
       resultCount: results.length,
       results
@@ -4548,11 +4601,13 @@ app.post('/reports/query', async (req, res) => {
 app.get('/reports/filters', async (req, res) => {
   try {
     const db = await getConfigDb();
-    const [workers, statuses, departments, errorTypes] = await Promise.all([
+    const [workers, statuses, departments, errorTypes, issues, kpiDepts] = await Promise.all([
       db.collection('backfill_kpi_segments').distinct('workerEmail'),
       db.collection('backfill_kpi_segments').distinct('statusSlug'),
       db.collection('backfill_qc_events').distinct('departmentName'),
-      db.collection('backfill_qc_events').distinct('errorType')
+      db.collection('backfill_qc_events').distinct('errorType'),
+      db.collection('backfill_qc_events').distinct('issueName'),
+      db.collection('backfill_kpi_segments').distinct('departmentName'),
     ]);
 
     // Worker name map
@@ -4576,8 +4631,9 @@ app.get('/reports/filters', async (req, res) => {
     res.json({
       workers: workers.filter(Boolean).map(e => ({ email: e, name: workerNames[e] || e })).sort((a, b) => (a.name || '').localeCompare(b.name || '')),
       statuses: statuses.filter(Boolean).map(s => ({ slug: s, name: statusNames[s] || s })).sort((a, b) => (a.name || '').localeCompare(b.name || '')),
-      departments: departments.filter(Boolean).sort(),
+      departments: [...new Set([...departments, ...kpiDepts])].filter(Boolean).sort(),
       errorTypes: errorTypes.filter(Boolean).sort(),
+      issues: issues.filter(Boolean).sort(),
       orderTypes: ['evaluation', 'translation']
     });
   } catch (err) {
@@ -4585,45 +4641,65 @@ app.get('/reports/filters', async (req, res) => {
   }
 });
 
-// —— POST /reports/export — CSV export ———————————————————
+// —— POST /reports/export — CSV export of report results ————
 app.post('/reports/export', async (req, res) => {
   try {
-    const { source, filters } = req.body;
+    const { source, metric, secondaryMetric, groupBy, filters, sortBy, limit } = req.body;
     const db = await getConfigDb();
     const colName = source === 'qc' ? 'backfill_qc_events' : 'backfill_kpi_segments';
+    const col = db.collection(colName);
+    const dateField = source === 'qc' ? 'qcCreatedAt' : 'segmentStart';
 
+    // Same match logic as /reports/query
     const match = {};
     if (filters) {
-      if (filters.dateFrom) {
-        const df = source === 'qc' ? 'qcCreatedAt' : 'segmentStart';
-        match[df] = { ...match[df], $gte: filters.dateFrom };
-      }
-      if (filters.dateTo) {
-        const df = source === 'qc' ? 'qcCreatedAt' : 'segmentStart';
-        match[df] = { ...match[df], $lte: filters.dateTo + 'T23:59:59' };
-      }
-      if (filters.workers?.length) match.workerEmail = { $in: filters.workers };
-      if (filters.statuses?.length) match.statusSlug = { $in: filters.statuses };
-      if (filters.orderTypes?.length) match.orderType = { $in: filters.orderTypes };
+      if (filters.dateFrom) match[dateField] = { ...match[dateField], $gte: filters.dateFrom };
+      if (filters.dateTo)   match[dateField] = { ...match[dateField], $lte: filters.dateTo + 'T23:59:59' };
+      if (filters.workers?.length)     match.workerEmail    = { $in: filters.workers };
+      if (filters.statuses?.length)    match.statusSlug     = { $in: filters.statuses };
+      if (filters.orderType)           match.orderType      = filters.orderType;
+      if (filters.departments?.length) match.departmentName = { $in: filters.departments };
+      if (filters.errorTypes?.length)  match.errorType      = { $in: filters.errorTypes };
+      if (filters.issues?.length)      match.issueName      = { $in: filters.issues };
+      if (filters.excludeOpen)         match.isOpen         = { $ne: true };
     }
 
-    const docs = await db.collection(colName).find(match).sort({ segmentStart: -1 }).limit(50000).toArray();
+    // If no groupBy/metric, export raw matching docs (up to 50k)
+    if (!groupBy || !metric) {
+      const docs = await col.find(match).sort({ [dateField]: -1 }).limit(50000).toArray();
+      if (!docs.length) return res.status(404).json({ error: 'No data found' });
+      const keys = Object.keys(docs[0]).filter(k => !k.startsWith('_'));
+      const esc = v => { if (v==null) return ''; const s=String(v); return s.includes(',')||s.includes('"')||s.includes('\n')?`"${s.replace(/"/g,'""')}"`  :s; };
+      const csv = [keys.join(','), ...docs.map(d => keys.map(k => esc(d[k])).join(','))].join('\n');
+      res.setHeader('Content-Type', 'text/csv');
+      res.setHeader('Content-Disposition', `attachment; filename="iee-${source}-raw-${new Date().toISOString().slice(0,10)}.csv"`);
+      return res.send(csv);
+    }
 
-    if (!docs.length) return res.status(404).json({ error: 'No data found for these filters' });
+    // Export the aggregated report — re-run the query and format as CSV
+    const internalReq = { body: req.body, user: req.user };
+    const rows = await new Promise((resolve, reject) => {
+      const mockRes = {
+        json: d => resolve(d),
+        status: () => ({ json: e => reject(new Error(e.error)) })
+      };
+      // Re-use query logic by calling the handler directly via internalFetch
+      internalFetch(`/reports/query`, { method:'POST', body: JSON.stringify(req.body) })
+        .then(resolve).catch(reject);
+    });
 
-    // Build CSV
-    const keys = Object.keys(docs[0]).filter(k => !k.startsWith('_'));
-    const header = keys.join(',');
-    const rows = docs.map(d => keys.map(k => {
-      const v = d[k];
-      if (v === null || v === undefined) return '';
-      const s = String(v);
-      return s.includes(',') || s.includes('"') || s.includes('\n') ? `"${s.replace(/"/g, '""')}"` : s;
-    }).join(','));
+    const results = rows.results || [];
+    if (!results.length) return res.status(404).json({ error: 'No data found' });
+
+    const headers = ['Rank', 'Group', metric, secondaryMetric||null, 'Record Count'].filter(Boolean);
+    const csvRows = results.map((r, i) => {
+      const vals = [i+1, r.label, r.value, secondaryMetric?r.secondary:null, r.count].filter((_,j) => headers[j] != null);
+      return vals.map(v => { if (v==null)return''; const s=String(v); return s.includes(',')||s.includes('"')?`"${s.replace(/"/g,'""')}"`  :s; }).join(',');
+    });
 
     res.setHeader('Content-Type', 'text/csv');
-    res.setHeader('Content-Disposition', `attachment; filename="iee-${source}-export-${new Date().toISOString().slice(0, 10)}.csv"`);
-    res.send([header, ...rows].join('\n'));
+    res.setHeader('Content-Disposition', `attachment; filename="iee-report-${source}-${new Date().toISOString().slice(0,10)}.csv"`);
+    res.send([headers.join(','), ...csvRows].join('\n'));
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
