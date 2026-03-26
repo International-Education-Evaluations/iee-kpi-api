@@ -4457,7 +4457,17 @@ app.post('/reports/query', async (req, res) => {
     if (filters) {
       if (filters.dateFrom) match[dateField] = { ...match[dateField], $gte: filters.dateFrom };
       if (filters.dateTo)   match[dateField] = { ...match[dateField], $lte: filters.dateTo + 'T23:59:59' };
-      if (filters.workers?.length)     match.workerEmail   = { $in: filters.workers };
+      if (filters.workers?.length) {
+        // workers filter contains workerUserId values (integers as strings) or emails
+        // Split into uids and emails for proper matching
+        const uids   = filters.workers.filter(w => /^\d+$/.test(String(w))).map(Number);
+        const emails = filters.workers.filter(w => !/^\d+$/.test(String(w)));
+        const workerClauses = [];
+        if (uids.length)   workerClauses.push({ workerUserId: { $in: uids } });
+        if (emails.length) workerClauses.push({ workerEmail: { $in: emails } });
+        if (workerClauses.length === 1) Object.assign(match, workerClauses[0]);
+        else if (workerClauses.length > 1) match.$or = [...(match.$or||[]), ...workerClauses];
+      }
       if (filters.statuses?.length)    match.statusSlug    = { $in: filters.statuses };
       if (filters.orderType)           match.orderType     = filters.orderType;
       if (filters.orderTypes?.length)  match.orderType     = { $in: filters.orderTypes };
@@ -4470,7 +4480,11 @@ app.post('/reports/query', async (req, res) => {
     // ── Build group key ──────────────────────────────────────
     function buildGroupKey(gb) {
       switch (gb) {
-        case 'worker':      return source==='qc' ? '$accountableName' : '$workerName';
+        // Group 'worker' by workerUserId (stable V1 integer ID).
+        // Falls back to workerEmail for segments where workerUserId is null.
+        // This ensures each real person is one group regardless of name/email variants.
+        case 'worker':      return source==='qc' ? '$accountableName'
+          : { $ifNull: ['$workerUserId', { $ifNull: ['$workerEmail', '$workerName'] }] };
         case 'workerEmail': return source==='qc' ? '$accountableEmail' : '$workerEmail';
         case 'statusName':  return '$statusName';
         case 'statusSlug':
@@ -4561,13 +4575,55 @@ app.post('/reports/query', async (req, res) => {
       }
     }
 
+    // Build canonical name map for worker groupBy relabeling.
+    // r._id is now workerUserId (integer) or workerEmail (string fallback).
+    // We resolve it to a display name using backfill_users as source of truth.
+    let canonWorkerById = null;   // v1Id (string) → name
+    let canonWorkerByEmail = null; // email → name
+    if (groupBy === 'worker' && source !== 'qc') {
+      const bfUsers = await db.collection('backfill_users')
+        .find({}, { projection:{ v1Id:1, email:1, fullName:1 } }).toArray();
+      canonWorkerById = {};
+      canonWorkerByEmail = {};
+      bfUsers.forEach(u => {
+        if (u.v1Id && u.fullName)  canonWorkerById[String(u.v1Id)]  = u.fullName;
+        if (u.email && u.fullName) canonWorkerByEmail[u.email.toLowerCase()] = u.fullName;
+      });
+      // Fallback: most-frequent name per uid/email from segments
+      const segNames = await db.collection('backfill_kpi_segments').aggregate([
+        { $match: { workerName: { $ne:null } } },
+        { $group: { _id:{ uid:'$workerUserId', email:'$workerEmail', name:'$workerName' }, cnt:{ $sum:1 } } },
+        { $sort: { cnt:-1 } },
+        { $group: { _id:{ uid:'$_id.uid', email:'$_id.email' }, name:{ $first:'$_id.name' } } }
+      ]).toArray();
+      segNames.forEach(s => {
+        const uid = s._id.uid ? String(s._id.uid) : null;
+        const em  = s._id.email ? s._id.email.toLowerCase() : null;
+        if (uid && !canonWorkerById[uid])   canonWorkerById[uid]  = s.name;
+        if (em  && !canonWorkerByEmail[em]) canonWorkerByEmail[em] = s.name;
+      });
+    }
+
     results = results.map(r => {
       const value     = postProcess(r, metric,          'value',      '_durations',    '_openCount');
       const secondary = secondaryMetric
         ? postProcess(r, secondaryMetric, 'secondary',  '_secDurations', '_openCount')
         : undefined;
+      // Relabel: r._id is workerUserId (number/string) or workerEmail (string)
+      let label = r._id != null ? String(r._id) : '(blank)';
+      if (groupBy === 'worker' && source !== 'qc' && (canonWorkerById || canonWorkerByEmail)) {
+        const rawId = r._id;
+        // If it looks like an integer it's a workerUserId
+        if (rawId != null && /^\d+$/.test(String(rawId))) {
+          label = canonWorkerById?.[String(rawId)] || String(rawId);
+        } else {
+          // It's an email (fallback for segments without workerUserId)
+          const em = (rawId || '').toString().toLowerCase();
+          label = canonWorkerByEmail?.[em] || canonWorkerById?.[em] || rawId || '(blank)';
+        }
+      }
       return {
-        label:     r._id || '(blank)',
+        label,
         value:     typeof value === 'number' ? Math.round(value * 10000) / 10000 : (value ?? 0),
         secondary: secondary != null ? (typeof secondary === 'number' ? Math.round(secondary * 10000)/10000 : secondary) : undefined,
         count:     r.count
@@ -4610,14 +4666,66 @@ app.get('/reports/filters', async (req, res) => {
       db.collection('backfill_kpi_segments').distinct('departmentName'),
     ]);
 
-    // Worker name map
-    const workerNames = {};
+    // Build worker list keyed by workerUserId (stable V1 MySQL integer ID).
+    // Falls back to workerEmail for segments where workerUserId is null.
+    // Name comes from backfill_users (HR source of truth) → most-frequent segment name.
+    //
+    // Using workerUserId as the key means:
+    // - Same person with different email variants is one entry
+    // - Name changes / typos don't create duplicate entries
+    // - Report filter values are stable integers, not mutable strings
+
+    // Step 1: canonical name + email from backfill_users, keyed by v1Id
+    const userByV1Id = {};  // v1Id → { name, email }
+    const userByEmail = {}; // email → { name, v1Id }
+    const bfUsers = await db.collection('backfill_users')
+      .find({}, { projection: { v1Id:1, email:1, fullName:1 } }).toArray();
+    bfUsers.forEach(u => {
+      const v1 = u.v1Id ? String(u.v1Id) : null;
+      const em = u.email ? u.email.toLowerCase() : null;
+      if (v1 && u.fullName) userByV1Id[v1] = { name: u.fullName, email: em };
+      if (em && u.fullName) userByEmail[em] = { name: u.fullName, v1Id: v1 };
+    });
+
+    // Step 2: aggregate distinct (workerUserId, workerEmail, most-frequent workerName)
+    // from segments to get a deduplicated worker list
     const workerDocs = await db.collection('backfill_kpi_segments')
       .aggregate([
-        { $match: { workerEmail: { $ne: null } } },
-        { $group: { _id: '$workerEmail', name: { $first: '$workerName' } } }
+        { $match: { $or: [{ workerUserId: { $ne: null } }, { workerEmail: { $ne: null } }] } },
+        { $group: {
+            _id: { uid: '$workerUserId', email: '$workerEmail' },
+            nameCount: { $push: '$workerName' },
+            segCount: { $sum: 1 }
+        }},
+        { $sort: { segCount: -1 } }
       ]).toArray();
-    workerDocs.forEach(w => { workerNames[w._id] = w.name; });
+
+    // Step 3: build deduplicated worker list keyed by workerUserId (or email fallback)
+    const workerMap = {}; // key → { id, email, name, segCount }
+    for (const w of workerDocs) {
+      const uid   = w._id.uid ? String(w._id.uid) : null;
+      const email = w._id.email ? w._id.email.toLowerCase() : null;
+      const key   = uid || email || 'unknown';
+
+      // Canonical name: backfill_users first, then most-frequent from segments
+      let name = (uid && userByV1Id[uid]?.name)
+               || (email && userByEmail[email]?.name)
+               || null;
+      if (!name) {
+        // most-frequent name from pushed array
+        const freq = {};
+        for (const n of w.nameCount) if (n) freq[n] = (freq[n]||0)+1;
+        name = Object.entries(freq).sort((a,b)=>b[1]-a[1])[0]?.[0] || key;
+      }
+
+      const canonEmail = (uid && userByV1Id[uid]?.email) || email || '';
+
+      if (!workerMap[key] || w.segCount > workerMap[key].segCount) {
+        workerMap[key] = { id: key, uid, email: canonEmail, name, segCount: w.segCount };
+      }
+    }
+
+    const workerNames = {}; // kept for status names below - not used for workers anymore
 
     // Status name map
     const statusNames = {};
@@ -4629,7 +4737,9 @@ app.get('/reports/filters', async (req, res) => {
     statusDocs.forEach(s => { statusNames[s._id] = s.name; });
 
     res.json({
-      workers: workers.filter(Boolean).map(e => ({ email: e, name: workerNames[e] || e })).sort((a, b) => (a.name || '').localeCompare(b.name || '')),
+      workers: Object.values(workerMap)
+        .map(w => ({ id: w.id, uid: w.uid, email: w.email, name: w.name }))
+        .sort((a, b) => (a.name || '').localeCompare(b.name || '')),
       statuses: statuses.filter(Boolean).map(s => ({ slug: s, name: statusNames[s] || s })).sort((a, b) => (a.name || '').localeCompare(b.name || '')),
       departments: [...new Set([...departments, ...kpiDepts])].filter(Boolean).sort(),
       errorTypes: errorTypes.filter(Boolean).sort(),
@@ -4655,7 +4765,15 @@ app.post('/reports/export', async (req, res) => {
     if (filters) {
       if (filters.dateFrom) match[dateField] = { ...match[dateField], $gte: filters.dateFrom };
       if (filters.dateTo)   match[dateField] = { ...match[dateField], $lte: filters.dateTo + 'T23:59:59' };
-      if (filters.workers?.length)     match.workerEmail    = { $in: filters.workers };
+      if (filters.workers?.length) {
+        const uids   = filters.workers.filter(w => /^\d+$/.test(String(w))).map(Number);
+        const emails = filters.workers.filter(w => !/^\d+$/.test(String(w)));
+        const workerClauses = [];
+        if (uids.length)   workerClauses.push({ workerUserId: { $in: uids } });
+        if (emails.length) workerClauses.push({ workerEmail: { $in: emails } });
+        if (workerClauses.length === 1) Object.assign(match, workerClauses[0]);
+        else if (workerClauses.length > 1) match.$or = [...(match.$or||[]), ...workerClauses];
+      }
       if (filters.statuses?.length)    match.statusSlug     = { $in: filters.statuses };
       if (filters.orderType)           match.orderType      = filters.orderType;
       if (filters.departments?.length) match.departmentName = { $in: filters.departments };
@@ -4857,7 +4975,56 @@ const _httpServer = app.listen(CONFIG.PORT, '0.0.0.0', () => {
     } catch (e) {
       console.error('[MIGRATION] workerEmail normalize failed:', e.message);
     }
-  }, 12000); // 12s after boot — after indexes are built
+  }, 12000);
+
+  // Migration 2: normalize workerName in backfill_kpi_segments using backfill_users
+  // as the source of truth. Fixes "deana deana" style bad names from source system.
+  // Groups segments by email, computes most-frequent name, cross-refs backfill_users.
+  setTimeout(async () => {
+    try {
+      const db = await getConfigDb();
+      const meta = db.collection('backfill_metadata');
+      const migrationKey2 = 'workername_normalize_v1';
+      const done2 = await meta.findOne({ _id: migrationKey2 });
+      if (done2) return;
+
+      console.log('[MIGRATION] Normalizing workerName from backfill_users...');
+
+      // Build canonical name map from backfill_users
+      const userDocs = await db.collection('backfill_users')
+        .find({}, { projection:{email:1,fullName:1} }).toArray();
+      const canonMap = {};
+      userDocs.forEach(u => { if (u.email && u.fullName) canonMap[u.email.toLowerCase()] = u.fullName; });
+
+      if (Object.keys(canonMap).length === 0) {
+        console.log('[MIGRATION] backfill_users empty — skipping (will retry next boot)');
+        return; // Don't mark done — retry next boot after user sync runs
+      }
+
+      // Find segments where workerEmail maps to a different canonical name
+      const col = db.collection('backfill_kpi_segments');
+      let updatedCount = 0;
+
+      // Process in batches by email
+      for (const [email, canonName] of Object.entries(canonMap)) {
+        const result = await col.updateMany(
+          { workerEmail: email, workerName: { $ne: canonName, $ne: null } },
+          { $set: { workerName: canonName } }
+        );
+        updatedCount += result.modifiedCount || 0;
+      }
+
+      if (updatedCount > 0) {
+        console.log(`[MIGRATION] Normalized ${updatedCount} segment workerName values`);
+      } else {
+        console.log('[MIGRATION] No workerName corrections needed');
+      }
+
+      await meta.updateOne({ _id: migrationKey2 }, { $set: { _id: migrationKey2, completedAt: new Date(), updated: updatedCount } }, { upsert: true });
+    } catch (e) {
+      console.error('[MIGRATION] workerName normalize failed:', e.message);
+    }
+  }, 15000); // 15s — after user sync completes // 12s after boot — after indexes are built
 
   // One-time startup: force a user sync so any stale backfill_users collection
   // (e.g. 150k docs from before the staff-only department filter) gets cleaned up

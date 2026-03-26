@@ -372,7 +372,7 @@ export default function ReportBuilder() {
     }
   };
 
-  const workers = filterOpts?.workers || [];
+  const workers = (filterOpts?.workers || []).map(w => ({ value: w.id, label: w.name || w.id }));
   const statuses = filterOpts?.statuses || [];
   const departments = filterOpts?.departments?.map(d=>({value:d,label:d})) || [];
   const errorTypes = filterOpts?.errorTypes?.map(e=>({value:e,label:e})) || [];
@@ -519,7 +519,7 @@ export default function ReportBuilder() {
               onChange={v=>updF('orderType',v[v.length-1]||'')} placeholder="All types" />
 
             {config.source === 'kpi' && <>
-              <MultiSelect label="Workers" options={workers.map(w=>({value:w.email,label:w.name||w.email}))}
+              <MultiSelect label="Workers" options={workers}
                 value={config.filters.workers} onChange={v=>updF('workers',v)} placeholder="All workers" />
               <MultiSelect label="Statuses" options={statuses.map(s=>({value:s.slug,label:s.name||s.slug}))}
                 value={config.filters.statuses} onChange={v=>updF('statuses',v)} placeholder="All statuses" />

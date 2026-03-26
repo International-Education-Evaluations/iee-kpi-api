@@ -30,18 +30,21 @@ export function DataProvider({ children }) {
       setUsers(userList);
 
       // Build lookup maps
-      const userByEmail = {};
+      // Build lookup maps — always prefer workerUserId (V1 integer) over email.
+      // Email can be inconsistent across systems; workerUserId is the stable canonical key.
       const userByV1Id  = {};
+      const userByEmail = {};
       for (const u of userList) {
-        if (u.email) userByEmail[u.email.toLowerCase()] = { dept: u.departmentName || '', name: u.fullName || '' };
         if (u.v1Id)  userByV1Id[String(u.v1Id)]         = { dept: u.departmentName || '', name: u.fullName || '' };
+        if (u.email) userByEmail[u.email.toLowerCase()]  = { dept: u.departmentName || '', name: u.fullName || '' };
       }
 
-      const levelByEmail = {};
+      // Level lookup: v1Id first (stable), email fallback
       const levelByV1Id  = {};
+      const levelByEmail = {};
       for (const l of (lvlData.levels || [])) {
-        if (l.email) levelByEmail[l.email.toLowerCase()] = l.level;
         if (l.v1Id)  levelByV1Id[String(l.v1Id)]         = l.level;
+        if (l.email) levelByEmail[l.email.toLowerCase()]  = l.level;
       }
 
       // ── Fix 1 + 4: parallel pagination — fetch p1 to learn totalPages,
@@ -73,11 +76,12 @@ export function DataProvider({ children }) {
         let dept  = '';
         let level = '';
 
-        if (email && userByEmail[email])  dept  = userByEmail[email].dept;
-        else if (v1Id && userByV1Id[v1Id]) dept  = userByV1Id[v1Id].dept;
+        // v1Id is preferred — stable integer ID. Email fallback for segments without v1Id.
+        if (v1Id && userByV1Id[v1Id])   dept  = userByV1Id[v1Id].dept;
+        else if (email && userByEmail[email]) dept  = userByEmail[email].dept;
 
-        if (email && levelByEmail[email])  level = levelByEmail[email];
-        else if (v1Id && levelByV1Id[v1Id]) level = levelByV1Id[v1Id];
+        if (v1Id && levelByV1Id[v1Id])  level = levelByV1Id[v1Id];
+        else if (email && levelByEmail[email]) level = levelByEmail[email];
 
         return { ...s, departmentName: dept, userLevel: level };
       });
