@@ -3009,8 +3009,11 @@ app.post(`/ai/chat`, aiRateLimit, async (req, res) => {
         });
       }
 
-      // Continue conversation with tool results
-      const continuedMessages = [
+      // Continue conversation with tool results.
+      // CRITICAL: mutate messages in-place so each iteration builds on full history.
+      // Every tool_use block must be immediately followed by its tool_result block.
+      // Rebuilding from a stale snapshot causes 400 "tool_use without tool_result" errors.
+      messages = [
         ...messages,
         { role: 'assistant', content: claudeData.content },
         { role: 'user', content: toolResults }
@@ -3027,20 +3030,19 @@ app.post(`/ai/chat`, aiRateLimit, async (req, res) => {
           model: guardrailConfig.model || 'claude-sonnet-4-5',
           max_tokens: guardrailConfig.maxTokens || 4096,
           system: systemPrompt + contextStr,
-          messages: continuedMessages,
+          messages,
           tools
         })
       });
 
       if (!continueRes.ok) {
         const errBody = await continueRes.text();
-        console.error('Claude continue error:', continueRes.status, errBody);
+        console.error(`[AI/chat] continue error ${continueRes.status}:`, await continueRes.text().catch(()=>''));
         break;
       }
 
       claudeData = await continueRes.json();
-      // Update messages for potential next iteration
-      messages.push({ role: 'assistant', content: claudeData.content });
+      console.log(`[AI/chat] tool iter ${iterations} — stop_reason=${claudeData.stop_reason}`);
     }
 
     // Extract text response
@@ -3783,9 +3785,14 @@ async function runOrderArrivalBackfill(prodDb, configDb, push, opts = {}) {
     // We identify them by cross-referencing with production: easier to just purge and
     // rebuild by resetting the cutoff when we detect the collection has suspect data.
     const totalExisting = await turnCol.countDocuments();
-    // Purge stale data: if the collection contains pre-floor records wipe and reseed.
+    // Purge stale data: wipe and reseed if collection contains pre-floor OR migration-day records.
     const hasPreFloorData = totalExisting > 0 &&
-      await turnCol.countDocuments({ createdAt: { $lt: DATA_FLOOR } }) > 0;
+      await turnCol.countDocuments({
+        $or: [
+          { createdAt: { $lt: DATA_FLOOR } },
+          { createdAt: { $gte: MIGRATION_DAY_START, $lt: MIGRATION_DAY_END } }
+        ]
+      }) > 0;
 
     if (hasPreFloorData) {
       const preCount = await turnCol.countDocuments({ createdAt: { $lt: DATA_FLOOR } });
@@ -3799,14 +3806,16 @@ async function runOrderArrivalBackfill(prodDb, configDb, push, opts = {}) {
 
     const cursor = ordersCol.find(
       { paymentStatus:'paid', orderType:{ $in:['evaluation','translation'] }, deletedAt:null,
-        // Hard floor: only 2025-01-01 onward — pre-2025 data is fragile.
-        // Also exclude Feb 6 2026 migration day (123,490 bulk-imported V1 orders
-        // all stamped that single day — not real organic demand).
-        createdAt: { $gte: DATA_FLOOR, $not: { $gte: MIGRATION_DAY_START, $lt: MIGRATION_DAY_END } },
+        // Exclude Feb 6 2026 migration day (123,490 bulk-imported V1 orders stamped that day).
+        // $not with range operators is invalid in MongoDB — must use $nor instead.
+        // $gte DATA_FLOOR ensures we never pull pre-2025 data.
+        // $nor excludes the exact migration day window.
+        createdAt: { $gte: DATA_FLOOR },
+        $nor: [{ createdAt: { $gte: MIGRATION_DAY_START, $lt: MIGRATION_DAY_END } }],
         $or:[{ createdAt:{ $gte:cutoff } },{ orderPlaced:{ $gte:cutoff } }] },
       { projection:{ orderSerialNumber:1, orderType:1, createdAt:1, orderPlaced:1, paidAt:1,
           orderCompletedAt:1, orderDueDate:1, isUrgent:1, processTime:1,
-          orderStatus:1, institution:1, orderStatusHistory:1 },
+          orderStatus:1, institution:1, orderStatusHistory:1, reportItems:1 },
         maxTimeMS: 120000 }
     ).batchSize(500);
 
@@ -3832,6 +3841,8 @@ async function runOrderArrivalBackfill(prodDb, configDb, push, opts = {}) {
       const oType       = order.orderType;
       const processSlug = order.processTime?.slug || 'standard';
       const isUrgent    = !!order.isUrgent;
+      const reportItemName = Array.isArray(order.reportItems) && order.reportItems.length
+        ? (order.reportItems[0]?.name || null) : null;
       const completedAt = toDate(order.orderCompletedAt);
       const dueAt       = toDate(order.orderDueDate);
       const turnaroundHrs = completedAt ? Math.round((completedAt - arrivedAt) / 360000) / 10 : null;
@@ -3853,6 +3864,7 @@ async function runOrderArrivalBackfill(prodDb, configDb, push, opts = {}) {
       turnaroundOps.push({ updateOne: { filter:{ orderSerialNumber:serial }, update:{ $set:{
         orderSerialNumber:serial, orderType:oType, processTimeSlug:processSlug,
         isUrgent, institutionName:order.institution?.name||null,
+        reportItemName,
         createdAt:arrivedAt, completedAt:completedAt||null, dueAt:dueAt||null,
         turnaroundHrs, isLate, daysLate, isCompleted:!!completedAt,
         currentStatusType:order.orderStatus?.statusType||null, statusWaits,
@@ -3973,6 +3985,7 @@ async function runOrderArrivalBackfill(prodDb, configDb, push, opts = {}) {
       turnCol.createIndex({ createdAt:-1 }, { background:true }).catch(()=>{}),
       turnCol.createIndex({ orderSerialNumber:1 }, { unique:true, background:true }).catch(()=>{}),
       turnCol.createIndex({ orderType:1, createdAt:-1 }, { background:true }).catch(()=>{}),
+      turnCol.createIndex({ reportItemName:1, createdAt:-1 }, { background:true }).catch(()=>{}),
       turnCol.createIndex({ isCompleted:1, turnaroundHrs:1 }, { background:true }).catch(()=>{}),
       turnCol.createIndex({ processTimeSlug:1 }, { background:true }).catch(()=>{}),
       arrCol.createIndex({ dow:1, hour:1 }, { background:true }).catch(()=>{}),
@@ -5696,6 +5709,7 @@ app.get('/data/forecast/staffing', async (req, res) => {
   try {
     const db = await getConfigDb();
     const dept = req.query.dept || ''; // optional department filter
+    const deptFilter = dept ? { departmentName: dept } : {};
 
     // Arrival heatmap — filter by dept if specified, collapse to dow-hour
     let rawArrivals = await db.collection('backfill_order_arrivals').find(dept ? { dept } : {}).toArray();
@@ -5763,16 +5777,20 @@ app.get('/data/forecast/staffing', async (req, res) => {
     for (const s of arrivals) totalByHour[s.hour] = (totalByHour[s.hour]||0) + s.count;
     const maxHourVol = Math.max(...totalByHour, 1);
 
-    // Overall demand stats
-    const totalOrders = arrivals.reduce((a,s) => a + s.count, 0);
+    // Overall demand stats — count directly from turnaround collection for accuracy.
+    // Summing heatmap slot counts is unreliable (slots aggregate across dept keys).
+    const totalOrders = await db.collection('backfill_order_turnaround')
+      .countDocuments(deptFilter);
 
-    // avgPerDay: use last 30 actual calendar days for a meaningful recent average
-    // (dividing total by 7 gives lifetime total/week which is misleading for new systems)
-    const d30 = new Date(Date.now() - 30 * 86400000);
-    const deptFilter = dept ? { departmentName: dept } : {};
-    const recentCount = await db.collection('backfill_order_turnaround')
-      .countDocuments({ createdAt: { $gte: d30 }, ...deptFilter });
-    const avgPerDay = Math.round(recentCount / 30 * 10) / 10;
+    // avgPerDay: divide total by actual data span in days (not hardcoded 180).
+    // GO_LIVE is 2026-02-07 — we only have data since then (~47 days at launch).
+    // Using a hardcoded denominator would understate the true daily rate.
+    const GO_LIVE = new Date('2026-02-07T00:00:00.000Z');
+    const spanStart = earliestDoc?.createdAt
+      ? new Date(Math.max(new Date(earliestDoc.createdAt).getTime(), GO_LIVE.getTime()))
+      : GO_LIVE;
+    const spanDaysActual = Math.max(1, Math.round((Date.now() - spanStart.getTime()) / 86400000));
+    const avgPerDay = Math.round(totalOrders / spanDaysActual * 10) / 10;
 
     // Get departments from backfill_order_turnaround — this is always populated
     // even before backfill_order_arrivals is rebuilt with per-dept heatmap slots
@@ -5842,6 +5860,7 @@ app.get('/data/forecast/staffing', async (req, res) => {
       totalByDow,
       totalOrders,
       avgPerDay,
+      spanDaysActual,     // real data span used for avgPerDay denominator
       maxHourVol,
       departments,        // available departments for filter dropdown
       modelMeta,          // transparency data for the confidence panel
@@ -5862,20 +5881,17 @@ app.get('/data/forecast/sla-analysis', async (req, res) => {
 
     const [byTypeRaw, byStatusRaw, bottlenecksRaw, departments, dailyTrend] = await Promise.all([
 
-      // Turnaround distribution by order type + process time (JS percentiles — avoids $percentile MongoDB 7+ req)
-      // Use $sample to cap array size for percentile calc — prevents memory bloat at scale.
-      // 2000 samples gives <2% percentile error (CLT), avoids $push on 50k+ doc arrays.
+      // Turnaround distribution by report type + process time
       db.collection('backfill_order_turnaround').aggregate([
         { $match: { isCompleted:true, createdAt:{ $gte:d180 }, turnaroundHrs:{ $gt:0, $lt:2000 }, ...deptMatch } },
         { $group: {
-            _id: { orderType:'$orderType', processTimeSlug:'$processTimeSlug' },
+            _id: { reportItemName:{ $ifNull:['$reportItemName','(unknown)'] }, processTimeSlug:'$processTimeSlug' },
             count:    { $sum:1 }, avgHrs:{ $avg:'$turnaroundHrs' },
             latePct:  { $avg:{ $cond:['$isLate',1,0] } },
             avgDaysLate: { $avg:{ $cond:['$isLate','$daysLate',null] } },
-            // $firstN capped at 2000 — statistically sufficient for P50/P75/P90
             hrs: { $firstN: { input:'$turnaroundHrs', n:2000 } }
         }},
-        { $project: { _id:0, orderType:'$_id.orderType', processTimeSlug:'$_id.processTimeSlug',
+        { $project: { _id:0, reportItemName:'$_id.reportItemName', processTimeSlug:'$_id.processTimeSlug',
             count:1, avgHrs:{ $round:['$avgHrs',1] },
             latePct:{ $round:[{ $multiply:['$latePct',100] },1] },
             avgDaysLate:{ $round:['$avgDaysLate',1] }, hrs:1 }}

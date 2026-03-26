@@ -319,7 +319,7 @@ export default function StaffingForecast() {
           {/* ── Summary strip ───────────────────────────────────── */}
           <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
             <StatCard label="Total Orders (history)" value={fmtI(staffing.totalOrders)} sub="all time in backfill" />
-            <StatCard label="Avg Orders / Day" value={fmt(staffing.avgPerDay)} sub="last 180 days" />
+            <StatCard label="Avg Orders / Day" value={fmt(staffing.avgPerDay)} sub={`last ${staffing.spanDaysActual || staffing.modelMeta?.dataSpanDays || '—'} days`} />
             <StatCard label="Peak Hour" value={peakHour ? fmtHour(peakHour.hour) : '—'} sub={`~${peakHour?.avgArrivals||0} orders avg`} />
             <StatCard label="Peak Day" value={DAYS[peakDow]} sub="highest weekly volume" />
           </div>
@@ -509,13 +509,13 @@ export default function StaffingForecast() {
 
               <div className="card-surface overflow-hidden">
                 <div className="px-4 py-3 border-b border-surface-200 flex items-center justify-between">
-                  <span className="text-xs font-semibold text-ink-600">SLA Recommendations by Order Type + Process Time</span>
-                  <span className="text-[10px] text-ink-400">Based on last 180 days</span>
+                  <span className="text-xs font-semibold text-ink-600">SLA Recommendations by Report Type + Process Time</span>
+                  <span className="text-[10px] text-ink-400">Based on last {staffing?.spanDaysActual || staffing?.modelMeta?.dataSpanDays || 180} days</span>
                 </div>
                 <table className="w-full">
                   <thead className="bg-surface-50 border-b border-surface-200">
                     <tr>
-                      {['Order Type','Process Time','Orders','P50','P75','P90','Current Late %','Recommended SLA','Status'].map(h=>(
+                      {['Report Type','Process Time','Orders','P50','P75','P90','Current Late %','Recommended SLA','Status'].map(h=>(
                         <th key={h} className="px-3 py-2 text-[10px] font-bold uppercase tracking-wider text-ink-400 text-left whitespace-nowrap">{h}</th>
                       ))}
                     </tr>
@@ -523,7 +523,7 @@ export default function StaffingForecast() {
                   <tbody>
                     {(sla?.recommendations || []).sort((a,b)=>b.count-a.count).map((r,i) => (
                       <tr key={i} className="border-b border-surface-100 hover:bg-surface-50 text-sm">
-                        <td className="px-3 py-2 font-medium text-ink-900 capitalize">{r.orderType||'—'}</td>
+                        <td className="px-3 py-2 font-medium text-ink-900">{r.reportItemName||'—'}</td>
                         <td className="px-3 py-2 text-xs text-ink-600 font-mono">{r.processTimeSlug||'standard'}</td>
                         <td className="px-3 py-2 font-mono text-xs text-right">{fmtI(r.count)}</td>
                         <td className="px-3 py-2 font-mono text-xs text-right">{fmtHrs(r.p50Hrs)}</td>
@@ -589,7 +589,7 @@ export default function StaffingForecast() {
                       </tr>
                     ))}
                     {!(sla?.bottlenecks?.length) && (
-                      <tr><td colSpan={6} className="px-3 py-6 text-center text-emerald-600 text-sm font-semibold">✓ No critical bottlenecks detected in last 180 days</td></tr>
+                      <tr><td colSpan={6} className="px-3 py-6 text-center text-emerald-600 text-sm font-semibold">✓ No critical bottlenecks detected in last {staffing?.spanDaysActual || staffing?.modelMeta?.dataSpanDays || 180} days</td></tr>
                     )}
                   </tbody>
                 </table>
