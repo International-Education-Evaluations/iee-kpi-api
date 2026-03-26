@@ -33,6 +33,145 @@ function StatCard({ label, value, sub, color = 'text-ink-900' }) {
   );
 }
 
+
+// ── Model Transparency Component ─────────────────────────────────────────────
+const DOW_NAMES = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
+
+function ConfidenceDot({ weeks }) {
+  if (weeks >= 8) return (
+    <span title={`${weeks} weeks of data — stable`}
+      className="inline-flex items-center gap-1 text-[10px] font-semibold text-emerald-700">
+      <span className="w-2 h-2 rounded-full bg-emerald-500 inline-block" />{weeks}w
+    </span>
+  );
+  if (weeks >= 4) return (
+    <span title={`${weeks} weeks of data — building`}
+      className="inline-flex items-center gap-1 text-[10px] font-semibold text-amber-700">
+      <span className="w-2 h-2 rounded-full bg-amber-400 inline-block" />{weeks}w
+    </span>
+  );
+  return (
+    <span title={`${weeks} weeks of data — too few for reliable patterns`}
+      className="inline-flex items-center gap-1 text-[10px] font-semibold text-red-600">
+      <span className="w-2 h-2 rounded-full bg-red-400 inline-block" />{weeks}w
+    </span>
+  );
+}
+
+function ModelTransparency({ meta, dept }) {
+  const [open, setOpen] = React.useState(false);
+
+  const overallConfidence = (() => {
+    if (!meta) return 'unknown';
+    const minWeeks = Math.min(...(meta.dowSampleWeeks || [0]));
+    const avgWeeks = (meta.dowSampleWeeks || []).reduce((a,b) => a+b, 0) / 7;
+    const hasEnoughSegs = meta.xphSampleSize >= 200;
+    if (minWeeks >= 8 && hasEnoughSegs) return 'high';
+    if (avgWeeks >= 4 && hasEnoughSegs) return 'medium';
+    return 'low';
+  })();
+
+  const confidenceConfig = {
+    high:   { label:'High Confidence', color:'text-emerald-700', bg:'bg-emerald-50 border-emerald-200', dot:'bg-emerald-500' },
+    medium: { label:'Building Confidence', color:'text-amber-700', bg:'bg-amber-50 border-amber-200', dot:'bg-amber-400' },
+    low:    { label:'Low Confidence', color:'text-red-700', bg:'bg-red-50 border-red-200', dot:'bg-red-400' },
+    unknown:{ label:'No Data', color:'text-ink-500', bg:'bg-surface-50 border-surface-200', dot:'bg-ink-300' },
+  }[overallConfidence];
+
+  const fmtDate = (d) => d ? new Date(d).toLocaleDateString('en-US', { month:'short', day:'numeric', year:'numeric' }) : '—';
+
+  return (
+    <div className={`card-surface border overflow-hidden ${confidenceConfig.bg}`}>
+      <button onClick={() => setOpen(o => !o)}
+        className="w-full px-4 py-3 flex items-center justify-between hover:opacity-80 transition-opacity">
+        <div className="flex items-center gap-2">
+          <span className={`w-2.5 h-2.5 rounded-full ${confidenceConfig.dot} inline-block`} />
+          <span className={`text-xs font-bold ${confidenceConfig.color}`}>ℹ Model Transparency — {confidenceConfig.label}</span>
+          {dept && <span className="text-[10px] text-ink-500 bg-white/60 px-1.5 py-0.5 rounded border border-white/80">{dept}</span>}
+        </div>
+        <span className="text-[10px] text-ink-400">{open ? '▲ Hide' : '▼ View details'}</span>
+      </button>
+
+      {open && (
+        <div className="px-4 pb-4 space-y-4 border-t border-white/50">
+
+          {/* Data foundation */}
+          <div className="pt-3">
+            <div className="text-[10px] font-bold uppercase tracking-wider text-ink-500 mb-2">Data Foundation</div>
+            <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+              {[
+                { label:'Orders in model', value: fmtI(meta.totalOrders || 0), sub:'since go-live' },
+                { label:'Date range', value: `${fmtDate(meta.earliestDate)}`, sub: `→ ${fmtDate(meta.latestDate)}` },
+                { label:'Data span', value: `${meta.dataSpanWeeks}w`, sub: `${meta.dataSpanDays} calendar days` },
+                { label:'Segments for XpH', value: fmtI(meta.xphSampleSize || 0), sub:'last 60 days' },
+              ].map(({ label, value, sub }) => (
+                <div key={label} className="bg-white/60 rounded-lg px-3 py-2 border border-white/80">
+                  <div className="text-[9px] uppercase tracking-wider text-ink-400 mb-0.5">{label}</div>
+                  <div className="text-sm font-bold text-ink-900">{value}</div>
+                  <div className="text-[9px] text-ink-400">{sub}</div>
+                </div>
+              ))}
+            </div>
+          </div>
+
+          {/* Per-day stability */}
+          <div>
+            <div className="text-[10px] font-bold uppercase tracking-wider text-ink-500 mb-2">
+              Day-of-Week Pattern Stability
+              <span className="ml-2 font-normal normal-case text-ink-400">≥8 weeks = stable · 4–7 = building · &lt;4 = unreliable</span>
+            </div>
+            <div className="flex gap-2 flex-wrap">
+              {DOW_NAMES.map((day, d) => (
+                <div key={day} className="bg-white/60 border border-white/80 rounded-lg px-3 py-2 text-center min-w-[60px]">
+                  <div className="text-[9px] font-semibold text-ink-500 mb-1">{day}</div>
+                  <ConfidenceDot weeks={meta.dowSampleWeeks?.[d] || 0} />
+                </div>
+              ))}
+            </div>
+            {Math.min(...(meta.dowSampleWeeks || [0])) < 4 && (
+              <p className="text-[10px] text-red-600 mt-2">
+                ⚠ Some days have fewer than 4 weeks of data. Heatmap patterns for those days may reflect noise rather than real demand cycles. Revisit this model after accumulating 8+ weeks.
+              </p>
+            )}
+          </div>
+
+          {/* XpH warning */}
+          {(meta.xphSampleSize || 0) < 200 && (
+            <div className="bg-amber-100/60 border border-amber-200 rounded-lg px-3 py-2">
+              <p className="text-[11px] text-amber-800">
+                <strong>Low XpH sample size ({fmtI(meta.xphSampleSize)} segments).</strong> The weighted team XpH is based on fewer segments than ideal. XpH estimates stabilise around 500+ segments. The staffing number may shift as more data accumulates.
+              </p>
+            </div>
+          )}
+
+          {/* Model assumptions */}
+          <div>
+            <div className="text-[10px] font-bold uppercase tracking-wider text-ink-500 mb-2">Model Assumptions (known limitations)</div>
+            <div className="space-y-1.5">
+              {[
+                ['100% staff utilisation', 'The model assumes every staff member is processing orders continuously. Real utilisation is typically 70–85%. Add 20–30% buffer to the recommended numbers.'],
+                ['Orders arrive evenly within each hour', 'The model averages arrivals across each 1-hour window. If your 6pm orders all arrive at 6:01pm, the peak is sharper than the model shows.'],
+                ['All statuses have equal staffing weight', 'The weighted XpH treats all statuses as interchangeable. In reality Digital Fulfillment workers cannot do Initial Evaluation work. Department filtering helps, but cross-status staffing variance is not modelled.'],
+                ['No seasonality or events', `You have ${meta.dataSpanWeeks} weeks of data — not enough to detect annual cycles, institutional deadlines, or promotional events. A Georgia Tech admission deadline spike will not be predicted.`],
+                ['No queue backlog factor', 'The model calculates staff needed for incoming demand only. If there is an existing backlog, additional staff is required to drain it on top of handling new arrivals.'],
+              ].map(([title, desc]) => (
+                <div key={title} className="flex gap-2 text-[11px]">
+                  <span className="text-ink-300 mt-0.5 shrink-0">→</span>
+                  <span><strong className="text-ink-700">{title}:</strong> <span className="text-ink-500">{desc}</span></span>
+                </div>
+              ))}
+            </div>
+          </div>
+
+          <div className="text-[10px] text-ink-400 pt-1 border-t border-white/50">
+            Model generated {new Date(meta.generatedAt).toLocaleString('en-US', { month:'short', day:'numeric', hour:'numeric', minute:'2-digit' })} · Data updates every 5 minutes with backfill
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 export default function StaffingForecast() {
   const [staffing, setStaffing]   = useState(null);
   const [sla,      setSla]        = useState(null);
@@ -294,6 +433,9 @@ export default function StaffingForecast() {
                   The number shown is concurrent staff needed at peak, not total headcount.
                 </p>
               </div>
+
+              {/* ── Model Transparency Panel ─────────────────────────── */}
+              {staffing?.modelMeta && <ModelTransparency meta={staffing.modelMeta} dept={dept} />}
 
               <div className="card-surface p-4 bg-slate-900">
                 <div className="flex items-center justify-between mb-3 flex-wrap gap-2">

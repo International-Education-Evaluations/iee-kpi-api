@@ -3604,11 +3604,33 @@ async function runOrderArrivalBackfill(prodDb, configDb, push) {
     // departmentName seen in segments for that order (the team that worked it most).
     push('  Enriching turnaround with department names...');
     try {
+      // Department lives in backfill_users (keyed by v1Id).
+      // Segments have workerUserId = v1Id but NOT departmentName directly.
+      // Join path: turnaround.orderSerialNumber → segments.orderSerialNumber
+      //            → segments.workerUserId → users.v1Id → users.departmentName
+      // We take the most frequent (workerUserId, departmentName) pair per order.
+
       const deptByOrder = await configDb.collection('backfill_kpi_segments').aggregate([
-        { $match: { orderSerialNumber: { $exists: true, $ne: null }, departmentName: { $exists: true, $ne: '' } } },
-        { $group: { _id: { order: '$orderSerialNumber', dept: '$departmentName' }, count: { $sum: 1 } } },
-        { $sort: { count: -1 } },
-        { $group: { _id: '$_id.order', departmentName: { $first: '$_id.dept' } } }
+        // Step 1: get distinct (orderSerialNumber, workerUserId) with frequency
+        { $match: { orderSerialNumber: { $exists:true, $ne:null }, workerUserId: { $exists:true, $ne:null } } },
+        { $group: { _id: { order:'$orderSerialNumber', uid:'$workerUserId' }, count:{ $sum:1 } } },
+        { $sort: { count:-1 } },
+        { $group: { _id:'$_id.order', workerUserId:{ $first:'$_id.uid' } } },
+        // Step 2: lookup departmentName from backfill_users via v1Id
+        { $lookup: {
+            from: 'backfill_users',
+            let: { uid: '$workerUserId' },
+            pipeline: [
+              { $match: { $expr: { $eq: [{ $toString:'$v1Id' }, { $toString:'$$uid' }] } } },
+              { $project: { _id:0, departmentName:1 } }
+            ],
+            as: 'user'
+        }},
+        { $project: {
+            _id:1,
+            departmentName: { $ifNull: [{ $arrayElemAt:['$user.departmentName',0] }, null] }
+        }},
+        { $match: { departmentName: { $ne: null } } }
       ]).toArray();
 
       if (deptByOrder.length > 0) {
@@ -3622,9 +3644,10 @@ async function runOrderArrivalBackfill(prodDb, configDb, push) {
           await turnCol.bulkWrite(deptOps.slice(i, i + 2000), { ordered: false });
         }
         push(`  Enriched ${deptByOrder.length} orders with department names`);
-        // Ensure index for dept filtering
-        await turnCol.createIndex({ departmentName: 1 }, { background: true }).catch(() => {});
-        await turnCol.createIndex({ departmentName: 1, createdAt: -1 }, { background: true }).catch(() => {});
+        await turnCol.createIndex({ departmentName:1 }, { background:true }).catch(()=>{});
+        await turnCol.createIndex({ departmentName:1, createdAt:-1 }, { background:true }).catch(()=>{});
+      } else {
+        push('  Dept enrichment: 0 matches (backfill_users may not have v1Id populated yet)');
       }
     } catch (dErr) {
       push(`  Dept enrichment: SKIPPED (${dErr.message})`);
@@ -5388,16 +5411,69 @@ app.get('/data/forecast/staffing', async (req, res) => {
       .then(d => d.filter(Boolean).sort())
       .catch(() => []);
 
+    // Model metadata for transparency panel
+    const [earliestDoc, latestDoc, totalSegments] = await Promise.all([
+      db.collection('backfill_order_turnaround').findOne(
+        { createdAt:{ $exists:true }, ...deptFilter },
+        { sort:{ createdAt:1 }, projection:{ createdAt:1 } }
+      ),
+      db.collection('backfill_order_turnaround').findOne(
+        { createdAt:{ $exists:true }, ...deptFilter },
+        { sort:{ createdAt:-1 }, projection:{ createdAt:1 } }
+      ),
+      db.collection('backfill_kpi_segments').countDocuments(
+        dept ? { departmentName:dept, isOpen:false, segmentStart:{ $gte:cutoff60.toISOString() } }
+             : { isOpen:false, segmentStart:{ $gte:cutoff60.toISOString() } }
+      ),
+    ]);
+
+    const earliestDate = earliestDoc?.createdAt || null;
+    const latestDate   = latestDoc?.createdAt   || null;
+    const dataSpanDays = earliestDate && latestDate
+      ? Math.round((new Date(latestDate) - new Date(earliestDate)) / 86400000)
+      : 0;
+    const dataSpanWeeks = Math.round(dataSpanDays / 7 * 10) / 10;
+
+    // Per-DOW sample counts — how many distinct calendar days exist for each day-of-week
+    // Used to assess heatmap pattern stability (need ≥8 weeks per dow for confidence)
+    const totalByDow = [0,1,2,3,4,5,6].map(d =>
+      arrivals.filter(s => s.dow === d).reduce((a,s) => a + s.count, 0)
+    );
+    // Estimate distinct weeks per dow from order turnaround data
+    const dowSampleWeeks = await Promise.all([0,1,2,3,4,5,6].map(async (dow) => {
+      // Count distinct ISO weeks that have data for this dow
+      const docs = await db.collection('backfill_order_turnaround').aggregate([
+        { $match: { createdAt:{ $exists:true }, ...deptFilter,
+            $expr:{ $eq:[{ $subtract:[{ $dayOfWeek:'$createdAt' },1] }, dow] } } },
+        { $group: { _id: { $dateToString:{ format:'%G-W%V', date:'$createdAt' } } } },
+        { $count: 'weeks' }
+      ]).toArray();
+      return docs[0]?.weeks || 0;
+    }));
+
+    const modelMeta = {
+      earliestDate,
+      latestDate,
+      dataSpanDays,
+      dataSpanWeeks,
+      totalSegmentsForXph: totalSegments,
+      dowSampleWeeks,  // [sun,mon,tue,wed,thu,fri,sat] — weeks of data per day
+      xphSampleSize: xphByStatus.reduce((a,s) => a + s.segments, 0),
+      activeDept: dept || null,
+      generatedAt: new Date(),
+    };
+
     res.json({
       arrivals,           // heatmap slots
       xphByStatus,        // throughput per status
       waitByStatus,       // avg wait per status queue
       totalByHour,
-      totalByDow: [0,1,2,3,4,5,6].map(d => arrivals.filter(s=>s.dow===d).reduce((a,s)=>a+s.count,0)),
+      totalByDow,
       totalOrders,
       avgPerDay,
       maxHourVol,
       departments,        // available departments for filter dropdown
+      modelMeta,          // transparency data for the confidence panel
     });
   } catch (err) {
     res.status(500).json({ error: err.message });
