@@ -6,7 +6,7 @@ export default function SettingsPage() {
   const [tab, setTab] = useState('benchmarks');
   return (
     <div className="space-y-5">
-      <div><h1 className="text-xl font-display font-bold text-ink-900">Configuration</h1><p className="text-xs text-ink-400 mt-0.5">Benchmarks, production hours, user levels · All changes audited</p></div>
+      <div><h1 className="text-xl font-display font-bold text-ink-900" data-tour="settings-title">Configuration</h1><p className="text-xs text-ink-400 mt-0.5">Benchmarks, production hours, user levels · All changes audited</p></div>
       <Pills tabs={[{key:'benchmarks',label:'Benchmarks'},{key:'thresholds',label:'Thresholds'},{key:'hours',label:'Production Hours'},{key:'levels',label:'User Levels'},{key:'audit',label:'Audit Log'}]} active={tab} onChange={setTab} />
       {tab==='benchmarks'&&<BenchmarkConfig />}
       {tab==='thresholds'&&<ThresholdConfig />}

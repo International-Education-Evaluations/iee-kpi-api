@@ -1,4 +1,5 @@
-import React, { useState } from 'react';
+import React, { useState, useCallback } from 'react';
+import Tour, { useTourAutoStart } from './components/Tour';
 import { BrowserRouter, Routes, Route, Navigate, Outlet } from 'react-router-dom';
 import { isAuth, isAdmin, isManagerPlus } from './hooks/useApi';
 import { DataProvider } from './hooks/useData';
@@ -21,6 +22,8 @@ import BackfillPage from './pages/BackfillPage';
 
 function AuthGuard() {
   const [sidebarOpen, setSidebarOpen] = useState(false);
+  const [tourOpen, setTourOpen] = useTourAutoStart();
+  const startTour = useCallback(() => setTourOpen(true), [setTourOpen]);
   if (!isAuth()) return <Navigate to="/login" replace />;
   return (
     <DataProvider>
@@ -54,6 +57,7 @@ function AuthGuard() {
           <main className="flex-1 p-3 sm:p-6 overflow-auto"><Outlet /></main>
         </div>
       </div>
+      {tourOpen && <Tour onClose={() => setTourOpen(false)} />}
     </DataProvider>
   );
 }

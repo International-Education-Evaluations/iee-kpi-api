@@ -46,7 +46,7 @@ export default function ChatPage() {
   return (
     <div className="flex flex-col h-[calc(100vh-3rem)] max-h-[calc(100vh-3rem)]">
       <div className="flex items-center justify-between mb-3">
-        <div><h1 className="text-xl font-display font-bold text-ink-900">AI Assistant</h1><p className="text-xs text-ink-400 mt-0.5">Ask questions about your KPI, QC, and Queue data</p></div>
+        <div><h1 className="text-xl font-display font-bold text-ink-900" data-tour="chat-title">AI Assistant</h1><p className="text-xs text-ink-400 mt-0.5">Ask questions about your KPI, QC, and Queue data</p></div>
         {isManagerPlus() && <button onClick={loadPrompt} className="text-xs text-ink-400 hover:text-ink-900 transition-colors px-3 py-1.5 border border-surface-200 rounded-lg">⚙ System Prompt</button>}
       </div>
 

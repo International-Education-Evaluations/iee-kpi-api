@@ -1,4 +1,4 @@
-import React, { useEffect, useState, useMemo, useCallback } from 'react';
+import React, { useEffect, useState, useMemo, useCallback, useDeferredValue, useTransition } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, Cell } from 'recharts';
 import { Card, Table, Pills, FilterBar, FilterSelect, FilterInput, FilterReset,
@@ -47,6 +47,15 @@ export default function KPIOverview() {
   const [drawer, setDrawer] = useState({ open:false, title:'', subtitle:'', rows:[] });
   const nav = useNavigate();
 
+  // Defer heavy filter computations so filter inputs stay responsive even on 95k rows.
+  // The filter inputs update instantly; the charts/tables update after the browser is idle.
+  const deferredFType    = useDeferredValue(fType);
+  const deferredFDept    = useDeferredValue(fDept);
+  const deferredFWorker  = useDeferredValue(fWorker);
+  const deferredFStatus  = useDeferredValue(fStatus);
+  const deferredFFrom    = useDeferredValue(fFrom);
+  const deferredFTo      = useDeferredValue(fTo);
+
   useEffect(() => { loadKpi(); }, [loadKpi]);
   useEffect(() => { api('/config/benchmarks').then(d=>setBenchmarks(d.benchmarks||[])).catch(()=>{}); }, []);
 
@@ -72,14 +81,14 @@ export default function KPIOverview() {
   const depts = useMemo(()=>[...new Set(segs.map(s=>s.departmentName).filter(Boolean))].sort(),[segs]);
 
   const filtered = useMemo(()=>segs.filter(s=>{
-    if(fType&&s.orderType!==fType)return false;
-    if(fDept&&s.departmentName!==fDept)return false;
-    if(fWorker&&s._workerId!==fWorker)return false;
-    if(fStatus&&(s.statusName||s.statusSlug)!==fStatus)return false;
-    if(fFrom&&s.segmentStart&&s.segmentStart<fFrom)return false;
-    if(fTo&&s.segmentStart&&s.segmentStart>fTo+'T23:59:59')return false;
+    if(deferredFType&&s.orderType!==deferredFType)return false;
+    if(deferredFDept&&s.departmentName!==deferredFDept)return false;
+    if(deferredFWorker&&s._workerId!==deferredFWorker)return false;
+    if(deferredFStatus&&(s.statusName||s.statusSlug)!==deferredFStatus)return false;
+    if(deferredFFrom&&s.segmentStart&&s.segmentStart<deferredFFrom)return false;
+    if(deferredFTo&&s.segmentStart&&s.segmentStart>deferredFTo+'T23:59:59')return false;
     return true;
-  }),[segs,fType,fDept,fFrom,fTo,fWorker,fStatus]);
+  }),[segs,deferredFType,deferredFDept,deferredFFrom,deferredFTo,deferredFWorker,deferredFStatus]);
 
   const metrics = useMemo(()=>{
     if(!filtered.length)return null;
@@ -200,11 +209,11 @@ export default function KPIOverview() {
   return (
     <div className="space-y-4">
       <div>
-        <h1 className="text-lg sm:text-xl font-display font-bold text-ink-900">KPI Overview</h1>
+        <h1 className="text-lg sm:text-xl font-display font-bold text-ink-900" data-tour="kpi-overview-title">KPI Overview</h1>
         <p className="text-[11px] text-ink-400 mt-0.5">Processing performance · Last 60 days · {fmtI(segs.length)} segments · {metrics?.depts||0} departments · <span className="text-brand-500">Click status or worker rows to drill in</span></p>
       </div>
 
-      <FilterBar>
+      <FilterBar data-tour="filter-bar">
         <FilterSelect label="Department" value={fDept} onChange={setFDept} options={depts} />
         <FilterSelect label="Order Type" value={fType} onChange={setFType} options={['evaluation','translation']} />
         <FilterSelect label="Status" value={fStatus} onChange={setFStatus} options={statuses} />
@@ -214,7 +223,7 @@ export default function KPIOverview() {
         {hasFilters && <FilterReset onClick={clearFilters} />}
       </FilterBar>
 
-      <div className="metric-grid">
+      <div className="metric-grid" data-tour="metric-cards">
         <Card label="Segments" value={fmtI(metrics?.total)} loading={loading} trend={metrics?.volTrend} />
         <Card label="Closed" value={fmtI(metrics?.closed)} color="green" loading={loading} />
         <Card label="Open" value={fmtI(metrics?.open)} color="amber" loading={loading} />
@@ -225,7 +234,7 @@ export default function KPIOverview() {
       </div>
 
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-        <div className="card-surface p-4">
+        <div className="card-surface p-4" data-tour="bucket-chart">
           <div className="text-xs font-semibold text-ink-600 mb-3">5-Bucket Classification</div>
           {bucketData.length>0?<div className="space-y-3">
             <div className="text-center">
@@ -275,7 +284,7 @@ export default function KPIOverview() {
           </ResponsiveContainer>:<div className="h-48 loading rounded-lg" />}
       </div>
 
-      <div className="card-surface overflow-hidden">
+      <div className="card-surface overflow-hidden" data-tour="breakdown-table">
         <div className="px-4 py-3 border-b border-surface-200 flex items-center justify-between">
           <span className="text-xs font-semibold text-ink-600">Breakdown</span>
           <Pills tabs={[{key:'status',label:'By Status'},{key:'worker',label:'By Worker'}]} active={view} onChange={setView} />

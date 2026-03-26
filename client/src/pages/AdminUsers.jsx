@@ -63,7 +63,7 @@ export default function AdminUsers() {
   return (
     <div className="space-y-4">
       <div className="flex items-center justify-between">
-        <div><h1 className="text-lg sm:text-xl font-display font-bold text-ink-900">User Management</h1><p className="text-xs text-ink-400 mt-0.5">{users.length} dashboard users</p></div>
+        <div><h1 className="text-lg sm:text-xl font-display font-bold text-ink-900" data-tour="admin-users-title">User Management</h1><p className="text-xs text-ink-400 mt-0.5">{users.length} dashboard users</p></div>
         <button onClick={() => { setShowCreate(!showCreate); setError(''); setSuccess(''); }} className="px-4 py-2 bg-brand-500 hover:bg-brand-600 text-white text-sm rounded-lg font-semibold">+ Invite User</button>
       </div>
 

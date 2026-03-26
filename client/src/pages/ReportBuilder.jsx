@@ -107,7 +107,7 @@ export default function ReportBuilder() {
   return (
     <div className="space-y-4">
       <div className="flex items-center justify-between">
-        <div><h1 className="text-xl font-display font-bold text-ink-900">Report Builder</h1>
+        <div><h1 className="text-xl font-display font-bold text-ink-900" data-tour="report-builder-title">Report Builder</h1>
           <p className="text-xs text-ink-400 mt-0.5">Create custom reports from KPI and QC data</p></div>
         <div className="flex gap-2">
           <button onClick={exportCsv} disabled={exporting} className="px-3 py-1.5 bg-slate-700 hover:bg-slate-600 text-ink-900 text-xs rounded-lg font-medium">

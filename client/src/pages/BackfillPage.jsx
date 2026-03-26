@@ -60,7 +60,7 @@ export default function BackfillPage() {
   return (
     <div className="space-y-5">
       <div className="flex items-center justify-between">
-        <div><h1 className="text-xl font-display font-bold text-ink-900">Data Backfill</h1>
+        <div><h1 className="text-xl font-display font-bold text-ink-900" data-tour="backfill-title">Data Backfill</h1>
           <p className="text-xs text-ink-400 mt-0.5">Sync production data into the dashboard for fast reads</p></div>
       </div>
 

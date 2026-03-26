@@ -1431,153 +1431,111 @@ app.get('/indexes', async (req, res) => {
 //
 // Only includes non-terminal statuses. Excludes zero-duration entries.
 // This is HISTORICAL (over the window), not live — use /queue-snapshot for live.
+// ── computeQueueWaitSummary — shared logic used by both the HTTP endpoint
+// and the backfill system. Calling internalFetch('/queue-wait-summary') from
+// inside the backfill caused a self-referential HTTP round-trip that added
+// 10s to every backfill cycle. This function is called directly instead.
+async function computeQueueWaitSummary(days = 90) {
+  const cutoff = getCutoff(days);
+  const TERMINAL_SLUGS = ['completed', 'deleted', 'refunded', 'confirmed-fraudulent', 'expired'];
+
+  const db = await getDb('orders');
+  const ordersCol = db.collection('orders');
+
+  const orders = await ordersCol.aggregate([
+    {
+      $match: {
+        paymentStatus: 'paid',
+        orderType: { $in: ['evaluation', 'translation'] },
+        deletedAt: null,
+        orderStatusHistory: { $exists: true, $not: { $size: 0 } },
+        'orderStatusHistory.createdAt': { $gte: cutoff }
+      }
+    },
+    { $project: { orderType: 1, orderStatusHistory: 1 } }
+  ], { allowDiskUse: true }).toArray();
+
+  const statusMap = new Map();
+
+  for (const order of orders) {
+    const history = Array.isArray(order.orderStatusHistory) ? order.orderStatusHistory : [];
+    for (let i = 0; i < history.length; i++) {
+      const entry = history[i];
+      const entryDate = toDate(entry?.createdAt);
+      if (!entryDate || entryDate < cutoff) continue;
+
+      const slug = entry?.updatedStatus?.slug || '';
+      const name = entry?.updatedStatus?.name || '';
+      const type = entry?.updatedStatus?.statusType || '';
+      if (TERMINAL_SLUGS.includes(slug)) continue;
+
+      const nextEntry = i + 1 < history.length ? history[i + 1] : null;
+      const nextDate = toDate(nextEntry?.createdAt);
+      const durationHours = nextDate ? (nextDate.getTime() - entryDate.getTime()) / 3600000 : null;
+      if (durationHours !== null && durationHours <= 0) continue;
+
+      const nextSlug = nextEntry?.updatedStatus?.slug || null;
+      const nextName = nextEntry?.updatedStatus?.name || null;
+      const isOpen = nextDate === null;
+
+      if (!statusMap.has(slug)) {
+        statusMap.set(slug, { slug, name, type, durations: [], openCount: 0, totalVolume: 0, evalCount: 0, transCount: 0, nextStatuses: new Map() });
+      }
+
+      const bucket = statusMap.get(slug);
+      bucket.totalVolume++;
+      if (order.orderType === 'evaluation') bucket.evalCount++;
+      if (order.orderType === 'translation') bucket.transCount++;
+      if (isOpen) { bucket.openCount++; }
+      else if (durationHours !== null) { bucket.durations.push(durationHours); }
+      if (nextSlug) { const ns = nextName || nextSlug; bucket.nextStatuses.set(ns, (bucket.nextStatuses.get(ns) || 0) + 1); }
+    }
+  }
+
+  function percentile(sorted, p) {
+    if (!sorted.length) return null;
+    const idx = (p / 100) * (sorted.length - 1);
+    const lo = Math.floor(idx); const hi = Math.ceil(idx);
+    if (lo === hi) return Math.round(sorted[lo] * 10) / 10;
+    return Math.round((sorted[lo] + (sorted[hi] - sorted[lo]) * (idx - lo)) * 10) / 10;
+  }
+
+  const summary = [...statusMap.values()].map(s => {
+    const sorted = s.durations.slice().sort((a, b) => a - b);
+    const avg = sorted.length ? Math.round((sorted.reduce((a, b) => a + b, 0) / sorted.length) * 10) / 10 : null;
+    const topNext = [...s.nextStatuses.entries()].sort((a,b)=>b[1]-a[1]).slice(0,3).map(([n,c])=>`${n} (${c})`).join(', ');
+    return {
+      statusName: s.name, statusSlug: s.slug, statusType: s.type,
+      totalVolume: s.totalVolume, completedCount: sorted.length,
+      openCount: s.openCount, evaluationCount: s.evalCount, translationCount: s.transCount,
+      medianWaitHours: percentile(sorted, 50), avgWaitHours: avg,
+      p75WaitHours: percentile(sorted, 75), p90WaitHours: percentile(sorted, 90),
+      over24h: sorted.filter(h=>h>24).length, over48h: sorted.filter(h=>h>48).length, over72h: sorted.filter(h=>h>72).length,
+      minWaitHours: sorted.length ? Math.round(sorted[0]*100)/100 : null,
+      maxWaitHours: sorted.length ? Math.round(sorted[sorted.length-1]*10)/10 : null,
+      topNextStatuses: topNext,
+      isWaiting: ['Holding','Waiting','On-Hold'].includes(s.type) || s.slug.startsWith('awaiting'),
+      isProcessing: s.type === 'Processing'
+    };
+  }).sort((a,b) => b.totalVolume - a.totalVolume);
+
+  return {
+    refreshedAt: new Date().toISOString(),
+    days,
+    dateRange: { from: cutoff.toISOString(), to: new Date().toISOString() },
+    orderCount: orders.length,
+    statusCount: summary.length,
+    summary
+  };
+}
+
 app.get('/queue-wait-summary', async (req, res) => {
+  // Thin wrapper — delegates to computeQueueWaitSummary() which is also called
+  // directly by the backfill system to avoid a self-referential HTTP round-trip.
   try {
     const days = parsePositiveInt(req.query.days, 60, { min: 1, max: 900 });
-    const cutoff = getCutoff(days);
-
-    const TERMINAL_SLUGS = ['completed', 'deleted', 'refunded', 'confirmed-fraudulent', 'expired'];
-
-    const db = await getDb('orders');
-    const ordersCol = db.collection('orders');
-
-    const orders = await ordersCol.aggregate([
-      {
-        $match: {
-          paymentStatus: 'paid',
-          orderType: { $in: ['evaluation', 'translation'] },
-          deletedAt: null,
-          orderStatusHistory: { $exists: true, $not: { $size: 0 } },
-          'orderStatusHistory.createdAt': { $gte: cutoff }
-        }
-      },
-      {
-        $project: {
-          orderType: 1,
-          orderStatusHistory: 1
-        }
-      }
-    ], { allowDiskUse: true }).toArray();
-
-    // Collect durations per status
-    const statusMap = new Map();
-
-    for (const order of orders) {
-      const history = Array.isArray(order.orderStatusHistory) ? order.orderStatusHistory : [];
-
-      for (let i = 0; i < history.length; i++) {
-        const entry = history[i];
-        const entryDate = toDate(entry?.createdAt);
-        if (!entryDate || entryDate < cutoff) continue;
-
-        const slug = entry?.updatedStatus?.slug || '';
-        const name = entry?.updatedStatus?.name || '';
-        const type = entry?.updatedStatus?.statusType || '';
-
-        // Skip terminal statuses
-        if (TERMINAL_SLUGS.includes(slug)) continue;
-
-        const nextEntry = i + 1 < history.length ? history[i + 1] : null;
-        const nextDate = toDate(nextEntry?.createdAt);
-        const durationHours = nextDate
-          ? (nextDate.getTime() - entryDate.getTime()) / 3600000
-          : null;
-
-        // Skip zero/negative durations
-        if (durationHours !== null && durationHours <= 0) continue;
-
-        const nextSlug = nextEntry?.updatedStatus?.slug || null;
-        const nextName = nextEntry?.updatedStatus?.name || null;
-        const isOpen = nextDate === null;
-
-        if (!statusMap.has(slug)) {
-          statusMap.set(slug, {
-            slug, name, type,
-            durations: [],     // completed durations in hours
-            openCount: 0,      // still in this status (no exit)
-            totalVolume: 0,    // total entries
-            evalCount: 0,
-            transCount: 0,
-            nextStatuses: new Map()  // where orders go after this
-          });
-        }
-
-        const bucket = statusMap.get(slug);
-        bucket.totalVolume++;
-        if (order.orderType === 'evaluation') bucket.evalCount++;
-        if (order.orderType === 'translation') bucket.transCount++;
-
-        if (isOpen) {
-          bucket.openCount++;
-        } else if (durationHours !== null) {
-          bucket.durations.push(durationHours);
-        }
-
-        // Track next status distribution
-        if (nextSlug) {
-          const ns = nextName || nextSlug;
-          bucket.nextStatuses.set(ns, (bucket.nextStatuses.get(ns) || 0) + 1);
-        }
-      }
-    }
-
-    // Compute percentiles and build response
-    function percentile(sorted, p) {
-      if (!sorted.length) return null;
-      const idx = (p / 100) * (sorted.length - 1);
-      const lo = Math.floor(idx);
-      const hi = Math.ceil(idx);
-      if (lo === hi) return Math.round(sorted[lo] * 10) / 10;
-      return Math.round((sorted[lo] + (sorted[hi] - sorted[lo]) * (idx - lo)) * 10) / 10;
-    }
-
-    const summary = [...statusMap.values()]
-      .map(s => {
-        const sorted = s.durations.slice().sort((a, b) => a - b);
-        const avg = sorted.length
-          ? Math.round((sorted.reduce((a, b) => a + b, 0) / sorted.length) * 10) / 10
-          : null;
-
-        // Top 3 next statuses
-        const topNext = [...s.nextStatuses.entries()]
-          .sort((a, b) => b[1] - a[1])
-          .slice(0, 3)
-          .map(([name, count]) => `${name} (${count})`)
-          .join(', ');
-
-        return {
-          statusName: s.name,
-          statusSlug: s.slug,
-          statusType: s.type,
-          totalVolume: s.totalVolume,
-          completedCount: sorted.length,
-          openCount: s.openCount,
-          evaluationCount: s.evalCount,
-          translationCount: s.transCount,
-          medianWaitHours: percentile(sorted, 50),
-          avgWaitHours: avg,
-          p75WaitHours: percentile(sorted, 75),
-          p90WaitHours: percentile(sorted, 90),
-          over24h: sorted.filter(h => h > 24).length,
-          over48h: sorted.filter(h => h > 48).length,
-          over72h: sorted.filter(h => h > 72).length,
-          minWaitHours: sorted.length ? Math.round(sorted[0] * 100) / 100 : null,
-          maxWaitHours: sorted.length ? Math.round(sorted[sorted.length - 1] * 10) / 10 : null,
-          topNextStatuses: topNext,
-          isWaiting: ['Holding', 'Waiting', 'On-Hold'].includes(s.type) || s.slug.startsWith('awaiting'),
-          isProcessing: s.type === 'Processing'
-        };
-      })
-      .sort((a, b) => b.totalVolume - a.totalVolume);
-
-    res.json({
-      refreshedAt: new Date().toISOString(),
-      days,
-      dateRange: { from: cutoff.toISOString(), to: new Date().toISOString() },
-      orderCount: orders.length,
-      statusCount: summary.length,
-      summary
-    });
+    const result = await computeQueueWaitSummary(days);
+    res.json(result);
   } catch (err) {
     console.error('Queue wait summary error:', err);
     res.status(500).json({ error: err.message });
@@ -3825,7 +3783,9 @@ async function runBackfill(options = {}) {
     // 90-day window — 450 days was excessive and the primary cause of timeouts.
     try {
       push('Computing queue wait summary...');
-      const waitResult = await internalFetch('/queue-wait-summary?days=90');
+      // Call the shared function directly — no HTTP round-trip overhead.
+      // internalFetch('/queue-wait-summary') was adding ~10s to every backfill cycle.
+      const waitResult = await computeQueueWaitSummary(90);
       await configDb.collection('backfill_queue_wait_summary').updateOne(
         { _id: 'current' },
         { $set: { ...waitResult, _backfilledAt: new Date() } },
@@ -4158,7 +4118,13 @@ app.get('/data/qc-events', async (req, res) => {
 app.get('/data/users', async (req, res) => {
   try {
     const db = await getConfigDb();
-    const users = await db.collection('backfill_users').find({}).sort({ fullName: 1 }).toArray();
+    // Project only the fields the client actually needs for department/level resolution.
+    // Before the staff-only filter fix, backfill_users had 150k docs and fetching
+    // all fields took ~20s. This projection keeps it fast even on a stale collection.
+    const users = await db.collection('backfill_users')
+      .find({}, { projection: { v2Id:1, v1Id:1, fullName:1, email:1, departmentName:1, departmentId:1, isActive:1 } })
+      .sort({ fullName: 1 })
+      .toArray();
     res.json({ count: users.length, source: 'backfill', users });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -4254,9 +4220,10 @@ app.get('/data/queue-wait-summary', async (req, res) => {
       delete cached._id;
       res.json({ ...cached, source: 'backfill' });
     } else {
-      // No cache yet (first deploy) — fall back to live with a shorter window
-      console.log('[QUEUE-WAIT] No cache found, falling back to live /queue-wait-summary?days=90');
-      const live = await internalFetch('/queue-wait-summary?days=90');
+      // No cache yet (first deploy after backfill runs it will be populated).
+      // Compute directly — no HTTP round-trip.
+      console.log('[QUEUE-WAIT] No cache found, computing live (first deploy)');
+      const live = await computeQueueWaitSummary(90);
       res.json({ ...live, source: 'live-fallback' });
     }
   } catch (err) {
@@ -4611,6 +4578,23 @@ app.listen(CONFIG.PORT, '0.0.0.0', () => {
   else { console.log('SendGrid not configured — email scheduler disabled'); }
   // Start backfill auto-scheduler
   startBackfillScheduler();
+
+  // One-time startup: force a user sync so any stale backfill_users collection
+  // (e.g. 150k docs from before the staff-only department filter) gets cleaned up
+  // immediately on first boot instead of waiting for the next scheduled backfill.
+  setTimeout(async () => {
+    try {
+      const configDb = await getConfigDb();
+      const noop = (msg) => console.log(`[STARTUP-USERSYNC] ${msg}`);
+      noop._forceUserSync = true;
+      const result = await runUserSync(configDb, noop);
+      if (!result.skipped) {
+        console.log(`[STARTUP-USERSYNC] Complete — ${result.count} staff users in backfill_users`);
+      }
+    } catch (e) {
+      console.error('[STARTUP-USERSYNC] Failed:', e.message);
+    }
+  }, 8000); // 8s after boot — let connections settle first
 });
 
 // ═══════════════════════════════════════════════════════════

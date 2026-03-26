@@ -160,7 +160,7 @@ export default function QCOverview() {
   return (
     <div className="space-y-4">
       <div>
-        <h1 className="text-lg sm:text-xl font-display font-bold text-ink-900">QC Overview</h1>
+        <h1 className="text-lg sm:text-xl font-display font-bold text-ink-900" data-tour="qc-title">QC Overview</h1>
         <p className="text-[11px] text-ink-400 mt-0.5">Quality control events · {fmtI(events.length)} total · <span className="text-brand-500">Click department, issue, or user rows to see events</span></p>
       </div>
 

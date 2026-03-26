@@ -17,7 +17,7 @@ const NAV = [
   { to:'/admin/backfill', icon:'↻', label:'Data Backfill', section:'ADMIN', adminOnly:true },
 ];
 
-export default function Sidebar({ onNavigate }) {
+export default function Sidebar({ onNavigate, onStartTour }) {
   const user = getUser();
   const nav = useNavigate();
   const sections = [...new Set(NAV.map(n => n.section))];
@@ -75,6 +75,12 @@ export default function Sidebar({ onNavigate }) {
           className="mt-2 text-[11px] text-ink-400 hover:text-danger font-medium transition-colors">
           Sign out
         </button>
+        {onStartTour && (
+          <button onClick={onStartTour}
+            className="mt-2 text-[11px] text-brand-500 hover:text-brand-700 font-medium transition-colors flex items-center gap-1">
+            🗺️ Take a tour
+          </button>
+        )}
       </div>
     </aside>
   );
