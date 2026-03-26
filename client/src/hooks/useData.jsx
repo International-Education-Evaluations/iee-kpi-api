@@ -40,17 +40,22 @@ export function DataProvider({ children }) {
         if (b.status) xphUnitBySlug[b.status] = b.xphUnit || 'Orders';
       }
 
-      // Build lookup maps
-      // Build lookup maps — always prefer workerUserId (V1 integer) over email.
-      // Email can be inconsistent across systems; workerUserId is the stable canonical key.
-      const userByV1Id  = {};
-      const userByEmail = {};
+      // Build lookup maps.
+      // IMPORTANT: segments carry workerUserId as a v2Id ObjectId string
+      // (e.g. "687a5894ef7495fca0666516"), NOT a v1Id integer.
+      // backfill_users has both v2Id and v1Id — must key on v2Id to match segments.
+      // Email is a reliable fallback since it's consistent across both systems.
+      const userByV2Id  = {}; // v2Id string → { dept, name }
+      const userByEmail = {}; // email lower  → { dept, name }
       for (const u of userList) {
-        if (u.v1Id)  userByV1Id[String(u.v1Id)]         = { dept: u.departmentName || '', name: u.fullName || '' };
-        if (u.email) userByEmail[u.email.toLowerCase()]  = { dept: u.departmentName || '', name: u.fullName || '' };
+        const entry = { dept: u.departmentName || '', name: u.fullName || '' };
+        if (u.v2Id)  userByV2Id[String(u.v2Id)]         = entry;
+        if (u.email) userByEmail[u.email.toLowerCase()]  = entry;
       }
 
-      // Level lookup: v1Id first (stable), email fallback
+      // Level lookup: dashboard_user_levels stores v1Id + email.
+      // workerUserId is v2Id so v1Id path never hits — email is the only working key.
+      // Keep levelByV1Id for forward-compat once user-levels is migrated to v2Id.
       const levelByV1Id  = {};
       const levelByEmail = {};
       for (const l of (lvlData.levels || [])) {
@@ -82,17 +87,18 @@ export function DataProvider({ children }) {
       // ── Enrich segments with department + level ──────────────────────────
       const enriched = all.map(s => {
         const email = (s.workerEmail || '').toLowerCase();
-        const v1Id  = s.workerUserId ? String(s.workerUserId) : '';
+        const v2Id  = s.workerUserId ? String(s.workerUserId) : ''; // workerUserId IS a v2Id
 
         let dept  = '';
         let level = '';
 
-        // v1Id is preferred — stable integer ID. Email fallback for segments without v1Id.
-        if (v1Id && userByV1Id[v1Id])   dept  = userByV1Id[v1Id].dept;
+        // v2Id lookup preferred — workerUserId in segments is a v2Id ObjectId string.
+        // Email fallback for segments where workerUserId is null/missing.
+        if (v2Id && userByV2Id[v2Id])        dept  = userByV2Id[v2Id].dept;
         else if (email && userByEmail[email]) dept  = userByEmail[email].dept;
 
-        if (v1Id && levelByV1Id[v1Id])  level = levelByV1Id[v1Id];
-        else if (email && levelByEmail[email]) level = levelByEmail[email];
+        // Level: dashboard_user_levels keyed on email (v1Id path dead until migration).
+        if (email && levelByEmail[email])     level = levelByEmail[email];
 
         // Compute unitValue based on xphUnit for this status:
         // Orders = 1 per segment, Credentials = credentialCount, Reports = reportItemCount

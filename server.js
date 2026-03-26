@@ -902,27 +902,27 @@ app.get('/kpi-classify', async (req, res) => {
       if (u.v1Id) levelByV1Id[String(u.v1Id)] = u.level;
     }
 
-    // Index backfill users by v1Id and email for department resolution
-    const deptByV1Id = {};
+    // Index backfill users by v2Id (primary — matches segment workerUserId) and email (fallback).
+    // NOTE: segments carry workerUserId as a v2Id ObjectId string, NOT v1Id integer.
+    // v1Id is an integer (e.g. 311571); workerUserId is "687a5894ef7495fca0666516" — never equal.
+    const deptByV2Id  = {};
     const deptByEmail = {};
     for (const u of backfillUsers) {
-      if (u.v1Id && u.departmentName) deptByV1Id[String(u.v1Id)] = u.departmentName;
-      if (u.email && u.departmentName) deptByEmail[u.email.toLowerCase()] = u.departmentName;
+      if (u.v2Id && u.departmentName)  deptByV2Id[String(u.v2Id)]          = u.departmentName;
+      if (u.email && u.departmentName) deptByEmail[u.email.toLowerCase()]  = u.departmentName;
     }
 
     // 3. Classify each segment
     const classified = segments.map(seg => {
       const benchmark = benchmarkMap[seg.statusSlug] || benchmarkMap[seg.statusName] || null;
 
-      // Level resolution: workerUserId (v1Id) first, then email
-      const workerId = seg.workerUserId ? String(seg.workerUserId) : null;
+      // Level resolution: email first (v1Id path dead — workerUserId is v2Id, not v1Id)
       const workerEmail = seg.workerEmail ? seg.workerEmail.toLowerCase() : null;
-      const userLevel = (workerId ? levelByV1Id[workerId] : null)
-        || (workerEmail ? levelByEmail[workerEmail] : null)
-        || null;
+      const userLevel = (workerEmail ? levelByEmail[workerEmail] : null) || null;
 
-      // Department resolution: workerUserId first, then email
-      const departmentName = (workerId ? deptByV1Id[workerId] : null)
+      // Department resolution: v2Id first (workerUserId IS v2Id), email fallback
+      const workerId = seg.workerUserId ? String(seg.workerUserId) : null;
+      const departmentName = (workerId ? deptByV2Id[workerId] : null)
         || (workerEmail ? deptByEmail[workerEmail] : null)
         || null;
 
