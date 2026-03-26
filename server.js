@@ -2437,6 +2437,13 @@ app.post('/ai/chat', aiRateLimit, async (req, res) => {
     // Define tools that Claude can use to fetch live data
     // GUARDRAILS: All tools are capped at 90 days max, return summaries only (never raw rows)
     const guardrailConfig = await getGuardrails();
+    // Guard: if stored model string is stale/invalid, override with current default.
+    // Prevents a bad value in dashboard_ai_guardrails from silently 500ing all chat.
+    const VALID_MODELS = ['claude-sonnet-4-5', 'claude-opus-4-5', 'claude-haiku-4-5'];
+    if (guardrailConfig.model && !VALID_MODELS.includes(guardrailConfig.model)) {
+      console.warn(`[AI] Stored model "${guardrailConfig.model}" is not valid — overriding with claude-sonnet-4-5`);
+      guardrailConfig.model = 'claude-sonnet-4-5';
+    }
     const maxIterations = guardrailConfig.maxToolIterations || 5;
     const tools = [
       {
@@ -2522,7 +2529,7 @@ app.post('/ai/chat', aiRateLimit, async (req, res) => {
         'anthropic-version': '2023-06-01'
       },
       body: JSON.stringify({
-        model: guardrailConfig.model || 'claude-sonnet-4-20250514',
+        model: guardrailConfig.model || 'claude-sonnet-4-5',
         max_tokens: guardrailConfig.maxTokens || 4096,
         system: systemPrompt + glossaryText + contextStr,
         messages,
@@ -3008,7 +3015,7 @@ app.post('/ai/chat', aiRateLimit, async (req, res) => {
           'anthropic-version': '2023-06-01'
         },
         body: JSON.stringify({
-          model: guardrailConfig.model || 'claude-sonnet-4-20250514',
+          model: guardrailConfig.model || 'claude-sonnet-4-5',
           max_tokens: guardrailConfig.maxTokens || 4096,
           system: systemPrompt + contextStr,
           messages: continuedMessages,
@@ -3418,7 +3425,7 @@ const DEFAULT_GUARDRAILS = {
   maxPageSize: 2000,
   maxToolIterations: 5,
   maxTokens: 4096,
-  model: 'claude-sonnet-4-20250514',
+  model: 'claude-sonnet-4-5',
   allowedTools: ['fetch_kpi_summary', 'fetch_queue_snapshot', 'fetch_queue_wait_summary', 'fetch_qc_summary', 'fetch_user_list', 'fetch_worker_pattern', 'fetch_anomaly_scan'],
   rateLimitPerMinute: 10,
   summaryOnly: true,
@@ -3445,7 +3452,7 @@ app.put('/ai/guardrails', requireRole('admin'), async (req, res) => {
       maxPageSize: Math.min(maxPageSize || 2000, 5000),
       maxToolIterations: Math.min(maxToolIterations || 5, 10),
       maxTokens: Math.min(maxTokens || 4096, 8192),
-      model: model || 'claude-sonnet-4-20250514',
+      model: model || 'claude-sonnet-4-5',
       allowedTools: allowedTools || DEFAULT_GUARDRAILS.allowedTools,
       rateLimitPerMinute: rateLimitPerMinute || 10,
       summaryOnly: summaryOnly !== false,
