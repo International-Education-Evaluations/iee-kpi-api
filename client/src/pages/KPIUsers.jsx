@@ -110,7 +110,8 @@ export default function KPIUsers() {
     if (!userSegs.length) return null;
     const closed  = userSegs.filter(s => !s.isOpen && s.durationMinutes > 0);
     const totalMin = closed.reduce((a,s) => a + (s.durationMinutes||0), 0);
-    const xph     = totalMin > 0 ? closed.length / (totalMin/60) : 0;
+    const unitSum  = closed.reduce((a,s) => a + (s.unitValue ?? 1), 0);
+    const xph     = totalMin > 0 ? unitSum / (totalMin/60) : 0;
     const orders  = new Set(userSegs.map(s=>s.orderSerialNumber).filter(Boolean));
     const totalReports = userSegs.reduce((a,s) => a + (s.reportItemCount||0), 0);
     const errorSegs = userSegs.filter(s => s.isErrorReporting).length;
@@ -145,14 +146,14 @@ export default function KPIUsers() {
       const k = s.segmentStart?.substring(0,10); if (!k) return;
       if (!d[k]) d[k] = { date:k, segs:0, min:0, closed:0, orders:new Set() };
       d[k].segs++;
-      if (!s.isOpen && s.durationMinutes>0) { d[k].min += s.durationMinutes; d[k].closed++; }
+      if (!s.isOpen && s.durationMinutes>0) { d[k].min += s.durationMinutes; d[k].closed++; d[k].unitSum = (d[k].unitSum||0) + (s.unitValue??1); }
       if (s.orderSerialNumber) d[k].orders.add(s.orderSerialNumber);
     });
     return Object.values(d).sort((a,b) => a.date.localeCompare(b.date)).map(d => ({
       ...d,
       orders: d.orders.size,
       avg: d.closed ? Math.round(d.min/d.closed*10)/10 : 0,
-      xph: d.min>0 ? Math.round(d.closed/(d.min/60)*10)/10 : 0,
+      xph: d.min>0 ? Math.round((d.unitSum||d.closed)/(d.min/60)*10)/10 : 0,
       label: fmtDate(d.date),
     }));
   }, [userSegs]);
@@ -174,7 +175,7 @@ export default function KPIUsers() {
       avg:    d.closed ? Math.round(d.totalMin/d.closed*10)/10 : null,
       median: getMedian(d.durations),
       hrs:    Math.round(d.totalMin/60*10)/10,
-      xph:    d.totalMin>0 ? Math.round(d.closed/(d.totalMin/60)*10)/10 : null,
+      xph:    d.totalMin>0 ? Math.round((d.unitSum||d.closed)/(d.totalMin/60)*10)/10 : null,
       pct:    userSegs.length ? Math.round(d.count/userSegs.length*100) : 0,
     })).sort((a,b) => b.count-a.count);
   }, [userSegs]);
@@ -207,10 +208,10 @@ export default function KPIUsers() {
       const mon = new Date(d); mon.setDate(d.getDate() - d.getDay() + 1);
       const k = mon.toISOString().substring(0,10);
       if (!w[k]) w[k] = { week:k, segs:0, min:0 };
-      w[k].segs++; w[k].min += s.durationMinutes;
+      w[k].segs++; w[k].min += s.durationMinutes; w[k].unitSum = (w[k].unitSum||0) + (s.unitValue??1);
     });
     return Object.values(w).sort((a,b)=>a.week.localeCompare(b.week)).map(w=>({
-      ...w, xph: w.min>0 ? Math.round(w.segs/(w.min/60)*10)/10 : 0, label: fmtDate(w.week),
+      ...w, xph: w.min>0 ? Math.round((w.unitSum||w.segs)/(w.min/60)*10)/10 : 0, label: fmtDate(w.week),
     }));
   }, [userSegs]);
 

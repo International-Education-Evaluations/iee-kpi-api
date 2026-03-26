@@ -21,13 +21,20 @@ export function DataProvider({ children }) {
     setKpiLoading(true);
     try {
       // ── Fix 3: fetch users + user-levels in parallel, don't block segments ──
-      const [usersData, lvlData] = await Promise.all([
+      const [usersData, lvlData, benchData] = await Promise.all([
         api('/data/users').catch(() => ({ users: [] })),
         api('/config/user-levels').catch(() => ({ levels: [] })),
+        api('/config/benchmarks').catch(() => ({ benchmarks: [] })),
       ]);
 
       const userList = usersData.users || [];
       setUsers(userList);
+
+      // Build xphUnit map from benchmarks: statusSlug → xphUnit (Orders|Credentials|Reports)
+      const xphUnitBySlug = {};
+      for (const b of (benchData.benchmarks || [])) {
+        if (b.status) xphUnitBySlug[b.status] = b.xphUnit || 'Orders';
+      }
 
       // Build lookup maps
       // Build lookup maps — always prefer workerUserId (V1 integer) over email.
@@ -83,7 +90,16 @@ export function DataProvider({ children }) {
         if (v1Id && levelByV1Id[v1Id])  level = levelByV1Id[v1Id];
         else if (email && levelByEmail[email]) level = levelByEmail[email];
 
-        return { ...s, departmentName: dept, userLevel: level };
+        // Compute unitValue based on xphUnit for this status:
+        // Orders = 1 per segment, Credentials = credentialCount, Reports = reportItemCount
+        const xphUnit = xphUnitBySlug[s.statusSlug] || 'Orders';
+        const unitValue = xphUnit === 'Credentials'
+          ? (s.credentialCount || 0)
+          : xphUnit === 'Reports'
+            ? (s.reportItemCount || 0)
+            : 1;
+
+        return { ...s, departmentName: dept, userLevel: level, xphUnit, unitValue };
       });
 
       setKpiSegs(disambiguateWorkers(enriched));

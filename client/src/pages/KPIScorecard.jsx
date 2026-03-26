@@ -160,7 +160,7 @@ export default function KPIScorecard() {
       r.closed++;
       const bucket = classify(s);
       if (bucket === 'In-Range') r.inRange++;
-      if (s.durationMinutes > 0) { r.totalMin += s.durationMinutes; r.xphNumer++; r.xphDenom += s.durationMinutes / 60; }
+      if (s.durationMinutes > 0) { r.totalMin += s.durationMinutes; r.xphNumer += (s.unitValue ?? 1); r.xphDenom += s.durationMinutes / 60; }
       const t = getXphTarget(s);
       if (t != null) r.xphTargets.push(t);
       if (s.orderSerialNumber) r.orders.add(s.orderSerialNumber);
@@ -185,7 +185,7 @@ export default function KPIScorecard() {
       const r = m[key];
       r.segs++; r.cnt++;
       if (classify(s) === 'In-Range') r.inRange++;
-      if (s.durationMinutes > 0) r.totalMin += s.durationMinutes;
+      if (s.durationMinutes > 0) { r.totalMin += s.durationMinutes; r.unitSum = (r.unitSum||0) + (s.unitValue??1); }
       if (s._workerId) r.workers.add(s._workerId);
       if (s.orderSerialNumber) r.orders.add(s.orderSerialNumber);
     }
@@ -193,7 +193,7 @@ export default function KPIScorecard() {
       ...r, workers: r.workers.size, orders: r.orders.size,
       inRangePct: r.segs > 0 ? Math.round(r.inRange/r.segs*1000)/10 : 0,
       avgDuration: r.cnt > 0 ? Math.round(r.totalMin/r.cnt*10)/10 : 0,
-      xph: r.totalMin > 0 ? Math.round(r.cnt/(r.totalMin/60)*100)/100 : 0,
+      xph: r.totalMin > 0 ? Math.round((r.unitSum||r.cnt)/(r.totalMin/60)*100)/100 : 0,
     }));
   }, [filtered, classify]);
 

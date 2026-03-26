@@ -79,7 +79,7 @@ export default function DeptComparison() {
         r.closed++;
         const b = classify(s);
         if (b === 'In-Range') r.inRange++;
-        if (s.durationMinutes > 0) { r.totalMin += s.durationMinutes; r.xphNumer++; r.xphDenom += s.durationMinutes / 60; }
+        if (s.durationMinutes > 0) { r.totalMin += s.durationMinutes; r.xphNumer += (s.unitValue ?? 1); r.xphDenom += s.durationMinutes / 60; }
       }
       if (s.orderSerialNumber) r.orders.add(s.orderSerialNumber);
       if (s._workerId) r.workers.add(s._workerId);

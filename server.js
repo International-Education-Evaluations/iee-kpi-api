@@ -968,6 +968,14 @@ app.get('/kpi-classify', async (req, res) => {
         bucketCode = 5;
       }
 
+      // Compute xphUnit and unitValue for this segment
+      const xphUnit = benchmark?.xphUnit || 'Orders'; // Orders | Credentials | Reports
+      const unitValue = xphUnit === 'Credentials'
+        ? (seg.credentialCount || 0)
+        : xphUnit === 'Reports'
+          ? (seg.reportItemCount || 0)
+          : 1; // Orders: always 1 per segment
+
       return {
         ...seg,
         bucket,
@@ -975,6 +983,8 @@ app.get('/kpi-classify', async (req, res) => {
         userLevel,
         departmentName,
         xphTarget,
+        xphUnit,
+        unitValue,
         benchmarkStatus: benchmark ? seg.statusSlug : null,
         thresholds: benchmark ? { excludeShortMin, inRangeMin, inRangeMax, excludeLongMax } : null
       };
@@ -1065,7 +1075,8 @@ app.get('/credential-counts', async (req, res) => {
       {
         $match: {
           active: true,
-          createdAt: { $gte: cutoff },  // date-scope prevents unbounded credential fetch
+          // Note: we do NOT filter by createdAt here because V1-imported credentials
+          // have old createdAt dates even on recent orders. Scope is by parent order only.
           $or: [{ deletedAt: null }, { deletedAt: { $exists: false } }]
         }
       },
@@ -2267,30 +2278,118 @@ app.get('/config/benchmarks/statuses', async (req, res) => {
 // AI CHATBOT — Claude API proxy with live data access
 // ═══════════════════════════════════════════════════════════
 
-const DEFAULT_SYSTEM_PROMPT = `You are an IEE Operations data analyst assistant. You have access to live data from IEE's KPI, QC, and Queue systems.
+const DEFAULT_SYSTEM_PROMPT = `You are the IEE Operations Intelligence Assistant — a senior data analyst embedded inside the IEE Ops Dashboard. You have direct access to live operational data through your tools and you use it to give precise, actionable answers.
 
-When users ask questions about data, use the provided tools to fetch current information. Always cite specific numbers and be precise.
+## WHO YOU ARE
+You think like a senior ops analyst who has worked at IEE for years. You understand the full order lifecycle, you know which statuses belong to which teams, you know what good vs bad XpH looks like by department, and you know where common bottlenecks occur. When you see a number, you interpret it — you do not just repeat it.
 
-Available data:
-- KPI segments: processing time per worker per status per order
-- QC events: quality control errors with accountability
-- Queue snapshot: live view of orders waiting in each status
-- Queue wait summary: historical wait time analysis
-- User list: staff roster with departments
+## YOUR TOOLS
+Always call tools before answering any question that involves current data. Never guess or use stale knowledge when a tool can give you the real number.
 
-Key terminology:
-- XpH = items per hour (productivity metric)
-- In-Range = worker met their benchmark target
-- Out-of-Range = below benchmark
-- Fixed It = QC reviewer corrected error in place
-- Kick It Back = order returned to responsible team
-- Segment = one processing status a worker spent time in
+- fetch_kpi_summary: Worker performance, XpH, In-Range %, segment counts, duration analysis
+- fetch_qc_summary: QC error rates, Kick Back vs Fixed It, accountable users, issue types by department
+- fetch_queue_snapshot: Live order counts per status, aging buckets (>24h />48h />72h), entered today
+- fetch_queue_wait_summary: Historical wait times (P50/P75/P90) per status over configurable window
+- fetch_user_list: Staff roster with department assignments and worker lookup
+- fetch_worker_pattern: Deep dive on one worker — day-by-day activity, hours, status breakdown
+- fetch_anomaly_scan: XpH drops, stuck orders, unattributed segments, data quality flags
+- fetch_order_demand: Order arrival patterns, peak hours/days, SLA distributions, bottleneck statuses
+- fetch_staffing_model: Required concurrent staff by hour, weighted team XpH, peak staffing needs by hour
 
-All timestamps are in US Eastern time. Data covers the last 60 days for KPI/QC and configurable window for queue analysis.
+## HOW TO ANSWER
 
-Departments: Data Entry, Digital Fulfillment, Digital Records, Document Management, Evaluation, Translations, Customer Support.
+Lead with the direct answer. State the number or conclusion first, then explain. Never say "Let me look that up" — just call the tool and respond with the result.
 
-Be direct, use numbers, and flag any data quality concerns you notice.`;
+Be specific. "Digital Records Processing has XpH 4.1 — at Wednesday 6pm demand you need 13 concurrent staff" is better than "staffing depends on several factors."
+
+Show your math for calculations. For staffing: state formula, inputs, result. For comparisons: show both numbers and the delta. For trends: show the direction and magnitude.
+
+Flag anomalies proactively. If you pull data and notice something the user did not ask about — a worker with a 60% XpH drop, 1,600 orders aged >72h, a kick-back rate spiking — mention it at the end. A good analyst surfaces issues without being asked.
+
+Be honest about data limitations. Small sample (< 50 segments): say so. Only 7 weeks of data and day-of-week patterns may not be stable: say so. Never present uncertain data with false confidence.
+
+## DEPARTMENT CONTEXT
+
+IEE processes credential evaluation and translation orders. The departments and their primary statuses:
+
+Digital Records: Digital Records Received, Digital Records Processing, Digital Records Review Processing, Digital Records Review
+Evaluation: Verified/Awaiting Evaluation, Initial Evaluation, Awaiting Evaluation Review, Evaluation Review, Eval Prep Processing, Evaluation Prep
+Digital Fulfillment: Digital Fulfillment (final delivery)
+Document Management: Document Mgmt Hold, Document Intake, Document Processing
+Customer Support: Customer Support escalations and hold statuses
+Translations: Translation Prep, Translation Review and related statuses
+Data Entry: Data Entry and related intake statuses
+
+When a user asks about a specific department, filter your analysis to that department only. Never blend departments unless explicitly asked for system-wide or comparative analysis.
+
+If department is ambiguous, ask one short question before pulling data: "Which department? (Digital Records / Evaluation / Digital Fulfillment / Document Management / Translations / Customer Support / Data Entry / All)"
+
+## ORDER LIFECYCLE
+
+Orders flow: payment received → Digital Records processing → Evaluation → Digital Fulfillment → Completed.
+
+Hold statuses (On-Hold) pause the SLA clock. Waiting statuses = order sitting in queue unassigned. Processing statuses = worker actively working it.
+
+Important context for queue analysis:
+- Documentation Needed / Awaiting Documents = customer has not submitted required docs. Not an ops bottleneck — ops cannot act on these.
+- Financial Hold / Awaiting Payment = billing issue, not ops-controlled.
+- Orders >72h in a Waiting status = operational concern requiring staffing or routing action.
+- Evaluation Prep / Verified/Awaiting Evaluation with high aging = Evaluation team capacity issue.
+
+## METRICS REFERENCE
+
+XpH = unit-processed per hour. The unit depends on the status: Orders (1 per segment), Credentials (credential count per order), or Reports (report item count). This is configured per-status in Configuration > Benchmarks. Always check the xphUnit when interpreting XpH — a Data Entry worker at 3 XpH means 3 credentials/hr, not 3 orders/hr.
+Healthy ranges by status type:
+- High-volume simple statuses (Digital Records Processing, Initial Review): 4–8 XpH is healthy
+- Complex evaluation statuses (Initial Evaluation, Evaluation Review): 1–3 XpH is normal
+- Flag if a worker drops >30% week-over-week
+
+In-Range % = percentage of closed segments where duration fell within the configured benchmark window.
+- System-wide healthy target: 70%+
+- Below 50% for a status: investigate benchmark calibration or training gap
+- Above 95%: benchmark may be too wide, not capturing real quality signal
+
+5-Bucket classification for every closed segment:
+- Exclude Short: too fast, likely a system error or accidental re-open
+- OOR Short: faster than benchmark minimum (check if quality was maintained)
+- In-Range: within target window (goal state)
+- OOR Long: slower than benchmark maximum (check for blockers or complexity)
+- Exclude Long: unreasonably long, likely left open overnight or over weekend
+
+QC metrics:
+- Fixed-It rate = QC reviewer corrected the error in place (fast resolution)
+- Kick-Back rate = order returned to responsible team for rework (slower, more expensive)
+- A rising kick-back rate in a department = systemic training or process issue, not a one-off
+- Accountable user = the worker assigned when the error occurred, not the QC reviewer
+
+## STAFFING CALCULATIONS
+
+When asked how many staff a team needs:
+1. Call fetch_staffing_model with the department filter
+2. Formula: Required staff = ceil(avg orders arriving at hour H / team XpH for that department)
+3. Always add 20-30% buffer for breaks, context switching, and variance
+4. State: base requirement, buffer, and final recommendation
+5. Identify the peak hour and peak day specifically
+
+Example format: "At peak (Wed 6pm), Digital Records averages 46 order arrivals/hr with XpH of 4.1. Base staff needed: ceil(46/4.1) = 12. With 25% buffer: 15 concurrent staff recommended."
+
+## RESPONSE FORMAT
+
+- Bold key numbers and conclusions
+- Use tables when comparing multiple workers, statuses, or departments side by side
+- For queue questions: always include aging breakdown, not just totals
+- Keep responses focused on the department or question asked
+- End every substantive response with one "Watch out:" or "Recommendation:" line if the data reveals something actionable
+
+## CONSTRAINTS
+
+Never fabricate numbers. If a tool returns empty data, say "No data returned — [reason]."
+Never present system-wide XpH when asked about a department.
+Never say "I do not have access to that" when a tool exists for it.
+Never give generic advice without citing the specific metric that indicates the problem.
+Do not ask clarifying questions you can answer yourself from the data.
+
+Go-live date: February 7, 2026. Data before this date is V1 historical import — treat with caution for trend analysis. All times are US Eastern.`
 
 // —— GET /ai/system-prompt ————————————————————————————————
 app.get('/ai/system-prompt', async (req, res) => {
@@ -2422,10 +2521,11 @@ app.post('/ai/chat', aiRateLimit, async (req, res) => {
     const tools = [
       {
         name: 'fetch_kpi_summary',
-        description: 'Fetch KPI segment summary. Returns aggregated counts and avg durations by status and by worker. Max 90 days. Does NOT return individual segment rows — only summaries.',
+        description: 'Fetch complete KPI summary with unit-aware XpH (Orders/Credentials/Reports per hour), segment counts, and worker rankings. Always pass dept when user asks about a specific department.',
         input_schema: {
           type: 'object',
           properties: {
+            dept: { type: 'string', description: 'Department filter: Digital Records, Evaluation, Data Entry, Digital Fulfillment, Document Management, Translations, Customer Support. Omit for all.' },
             days: { type: 'number', description: 'Days to look back (max 90, default 60).' }
           }
         }
@@ -2463,34 +2563,33 @@ app.post('/ai/chat', aiRateLimit, async (req, res) => {
       {
         name: 'fetch_worker_pattern',
         description: 'Fetch a specific worker\'s activity pattern for the last N days. Pass the worker name or email. Returns their segments grouped by day with status breakdown, total hours, and patterns. Use for questions like "What did Deana do last week?" or "Show me John\'s work pattern."',
-        input_schema: {
-          type: 'object',
-          properties: {
-            worker: { type: 'string', description: 'Worker name or email (partial match supported).' },
-            days: { type: 'number', description: 'Days to look back (max 90, default 7).' }
-          },
-          required: ['worker']
-        }
-      },
+        input_schema: { type: 'object', properties: {
+          worker: { type: 'string', description: 'Worker name or email (required)' },
+          days: { type: 'number', description: 'Days to look back (default 14)' }
+        } }
+      },,
       {
         name: 'fetch_anomaly_scan',
         description: 'Scan for data anomalies and inconsistencies. Returns workers with unusual patterns: zero-activity days during work hours, abnormally high/low segment counts, segments with impossible durations, orders stuck in processing for extended periods, workers with no QC events despite high volume. Use when asked about discrepancies, suspicious patterns, or data quality.',
-        input_schema: {
-          type: 'object',
-          properties: {
-            days: { type: 'number', description: 'Days to scan (max 30, default 7).' }
-          }
-        }
-      },
+        input_schema: { type: 'object', properties: {
+          dept: { type: 'string', description: 'Department filter for targeted anomaly scan.' },
+          days: { type: 'number', description: 'Days to scan (default 7, max 30)' }
+        } }
+      },,
       {
         name: 'fetch_order_demand',
-        description: 'Fetch order arrival demand patterns and SLA analysis from the staffing forecast data. Returns: daily order volume trend, peak hours and peak days of the week, order counts by hour/day heatmap, SLA turnaround distributions (P50/P75/P90) by order type and process time, bottleneck statuses with high queue wait times, and recommended SLA targets. Use for questions about order volume, when orders arrive, how long orders take, SLA performance, bottlenecks, or staffing needs.',
-        input_schema: { type: 'object', properties: {} }
+        description: 'Fetch order arrival demand patterns and SLA analysis. Returns avg daily orders, peak hours/days, volume by day-of-week, SLA distributions, bottleneck statuses. Pass dept for department-filtered demand.',
+        input_schema: { type: 'object', properties: {
+          dept: { type: 'string', description: 'Department filter e.g. Digital Records, Evaluation. Omit for system-wide.' },
+          days: { type: 'number', description: 'Days to look back (default 60)' }
+        } }
       },
       {
         name: 'fetch_staffing_model',
-        description: 'Fetch the staffing model — how many concurrent staff are needed at each hour based on order arrival demand and team XpH throughput. Returns required staff per hour, XpH (throughput) per status, weighted team XpH, and per-status staffing calculations. Use for questions about how many people are needed, shift planning, peak staffing hours, or throughput by status.',
-        input_schema: { type: 'object', properties: {} }
+        description: 'Fetch staffing model: required concurrent staff by hour based on order demand and team XpH. Returns peak hour, staff-by-hour, weighted team XpH, and XpH per status. ALWAYS pass dept when user asks about a specific team — system-wide numbers will be misleading.',
+        input_schema: { type: 'object', properties: {
+          dept: { type: 'string', description: 'REQUIRED for dept-specific staffing. e.g. Digital Records, Evaluation, Data Entry. Without this, system-wide demand is used which overstates staffing needs.' }
+        } }
       }
     ];
 
@@ -2538,35 +2637,77 @@ app.post('/ai/chat', aiRateLimit, async (req, res) => {
           switch (toolBlock.name) {
             case 'fetch_kpi_summary': {
               const days = Math.min(toolBlock.input?.days || 60, AI_MAX_DAYS);
-              // Fetch ONE page only — summarize, never return raw rows
-              const kpi = await internalFetch(`/kpi-segments?days=${days}&page=1&pageSize=${AI_PAGE_SIZE}`);
-              const segments = kpi.segments || [];
+              const dept = toolBlock.input?.dept || '';
+
+              // Fetch all pages in parallel so AI sees complete data, not a 1.3% sample
+              const deptParam = dept ? `&dept=${encodeURIComponent(dept)}` : '';
+              const first = await internalFetch(`/kpi-segments?days=${days}&page=1&pageSize=10000${deptParam}`);
+              const totalPages = first.totalPages || 1;
+              let rest = [];
+              if (totalPages > 1) {
+                rest = await Promise.all(
+                  Array.from({ length: totalPages - 1 }, (_, i) =>
+                    internalFetch(`/kpi-segments?days=${days}&page=${i+2}&pageSize=10000${deptParam}`)
+                  )
+                );
+              }
+              const segments = [first, ...rest].flatMap(d => d.segments || []);
+
+              // Load benchmarks for xphUnit resolution
+              const benchDb = await getConfigDb();
+              const benchDocs = await benchDb.collection('dashboard_benchmarks').find({}, { projection:{ status:1, xphUnit:1 } }).toArray();
+              const xphUnitMap = {};
+              for (const b of benchDocs) if (b.status) xphUnitMap[b.status] = b.xphUnit || 'Orders';
+
+              // Aggregate by status with unit-aware XpH
               const byStatus = {};
               const byWorker = {};
+              let inRangeCount = 0, closedCount = 0;
+
               for (const s of segments) {
                 const st = s.statusName || s.statusSlug;
-                if (!byStatus[st]) byStatus[st] = { count: 0, totalMin: 0, closed: 0 };
-                byStatus[st].count++;
-                if (!s.isOpen && s.durationMinutes > 0) { byStatus[st].totalMin += s.durationMinutes; byStatus[st].closed++; }
+                const xphUnit = xphUnitMap[s.statusSlug] || 'Orders';
+                const unitVal = xphUnit === 'Credentials' ? (s.credentialCount||0)
+                              : xphUnit === 'Reports'     ? (s.reportItemCount||0) : 1;
 
-                const w = s.workerName || 'UNATTRIBUTED';
-                if (!byWorker[w]) byWorker[w] = { count: 0, totalMin: 0, closed: 0, email: s.workerEmail };
-                byWorker[w].count++;
-                if (!s.isOpen && s.durationMinutes > 0) { byWorker[w].totalMin += s.durationMinutes; byWorker[w].closed++; }
+                if (!byStatus[st]) byStatus[st] = { slug:s.statusSlug, count:0, totalMin:0, closed:0, unitSum:0, inRange:0, xphUnit };
+                byStatus[st].count++;
+                if (!s.isOpen && s.durationMinutes > 0) {
+                  byStatus[st].totalMin += s.durationMinutes;
+                  byStatus[st].closed++;
+                  byStatus[st].unitSum += unitVal;
+                }
+
+                const wKey = s.workerEmail || s.workerName || 'UNATTRIBUTED';
+                if (!byWorker[wKey]) byWorker[wKey] = { name:s.workerName||wKey, email:s.workerEmail, dept:s.departmentName||dept, count:0, totalMin:0, closed:0, unitSum:0, inRangeCount:0 };
+                byWorker[wKey].count++;
+                if (!s.isOpen && s.durationMinutes > 0) {
+                  byWorker[wKey].totalMin += s.durationMinutes;
+                  byWorker[wKey].closed++;
+                  byWorker[wKey].unitSum += unitVal;
+                  closedCount++;
+                }
               }
 
               result = {
-                note: `Summary of first ${segments.length} segments out of ${kpi.totalCount} total (${days} day window). Data is aggregated — no raw rows returned.`,
-                totalSegments: kpi.totalCount,
-                sampleSize: segments.length,
-                orderCount: kpi.orderCount,
+                note: `Complete ${days}-day KPI summary${dept ? ' for ' + dept : ' across all departments'}. ${segments.length.toLocaleString()} segments analysed.`,
+                totalSegments: segments.length,
+                dept: dept || 'All',
                 days,
                 byStatus: Object.entries(byStatus).map(([status, d]) => ({
-                  status, segments: d.count, avgMin: d.closed ? Math.round(d.totalMin/d.closed*10)/10 : null
-                })).sort((a,b) => b.segments - a.segments).slice(0, 20),
-                topWorkers: Object.entries(byWorker).map(([worker, d]) => ({
-                  worker, email: d.email, segments: d.count, avgMin: d.closed ? Math.round(d.totalMin/d.closed*10)/10 : null
-                })).sort((a,b) => b.segments - a.segments).slice(0, 20)
+                  status,
+                  xphUnit: d.xphUnit,
+                  segments: d.count,
+                  closed: d.closed,
+                  xph: d.totalMin > 0 ? Math.round(d.unitSum / (d.totalMin/60) * 100) / 100 : null,
+                  avgMin: d.closed ? Math.round(d.totalMin/d.closed*10)/10 : null,
+                })).sort((a,b) => b.segments - a.segments).slice(0, 25),
+                topWorkers: Object.entries(byWorker).map(([, d]) => ({
+                  name: d.name, email: d.email, dept: d.dept,
+                  segments: d.count, closed: d.closed,
+                  xph: d.totalMin > 0 ? Math.round(d.unitSum / (d.totalMin/60) * 100) / 100 : null,
+                  avgMin: d.closed ? Math.round(d.totalMin/d.closed*10)/10 : null,
+                })).sort((a,b) => b.segments - a.segments).slice(0, 30),
               };
               break;
             }
@@ -2596,140 +2737,273 @@ app.post('/ai/chat', aiRateLimit, async (req, res) => {
             }
             case 'fetch_worker_pattern': {
               const workerQuery = toolBlock.input?.worker || '';
-              const days = Math.min(toolBlock.input?.days || 7, AI_MAX_DAYS);
-              const kpi = await internalFetch(`/kpi-segments?days=${days}&page=1&pageSize=${AI_PAGE_SIZE}`);
-              const segments = (kpi.segments || []).filter(s => {
-                const wn = (s.workerName || '').toLowerCase();
-                const we = (s.workerEmail || '').toLowerCase();
-                const q = workerQuery.toLowerCase();
-                return wn.includes(q) || we.includes(q);
-              });
-              // Group by day
+              const days = Math.min(toolBlock.input?.days || 14, AI_MAX_DAYS);
+              if (!workerQuery) { result = { error: 'worker name or email required' }; break; }
+
+              // Fetch all pages then filter — worker may appear on any page
+              const firstW = await internalFetch(`/kpi-segments?days=${days}&page=1&pageSize=10000`);
+              const totalPagesW = firstW.totalPages || 1;
+              let restW = [];
+              if (totalPagesW > 1) {
+                restW = await Promise.all(
+                  Array.from({ length: totalPagesW - 1 }, (_, i) =>
+                    internalFetch(`/kpi-segments?days=${days}&page=${i+2}&pageSize=10000`)
+                  )
+                );
+              }
+              const allSegs = [firstW, ...restW].flatMap(d => d.segments || []);
+              const q = workerQuery.toLowerCase();
+              const segments = allSegs.filter(s =>
+                (s.workerName||'').toLowerCase().includes(q) ||
+                (s.workerEmail||'').toLowerCase().includes(q)
+              );
+
+              // Load benchmarks for xphUnit
+              const bDb = await getConfigDb();
+              const bDocs = await bDb.collection('dashboard_benchmarks').find({}, { projection:{ status:1, xphUnit:1 } }).toArray();
+              const xUnitMap = {};
+              for (const b of bDocs) if (b.status) xUnitMap[b.status] = b.xphUnit || 'Orders';
+
               const byDay = {};
-              segments.forEach(s => {
-                const d = s.segmentStart?.substring(0, 10) || 'unknown';
-                if (!byDay[d]) byDay[d] = { date: d, count: 0, totalMin: 0, statuses: {}, orders: new Set() };
-                byDay[d].count++;
-                if (!s.isOpen && s.durationMinutes > 0) byDay[d].totalMin += s.durationMinutes;
+              const byStatus = {};
+              for (const s of segments) {
+                const day = s.segmentStart?.substring(0, 10) || 'unknown';
+                if (!byDay[day]) byDay[day] = { date:day, count:0, totalMin:0, unitSum:0, statuses:{}, orders:new Set() };
+                byDay[day].count++;
+                const xUnit = xUnitMap[s.statusSlug] || 'Orders';
+                const uVal = xUnit === 'Credentials' ? (s.credentialCount||0)
+                           : xUnit === 'Reports'     ? (s.reportItemCount||0) : 1;
+                if (!s.isOpen && s.durationMinutes > 0) {
+                  byDay[day].totalMin += s.durationMinutes;
+                  byDay[day].unitSum += uVal;
+                }
                 const st = s.statusName || s.statusSlug;
-                byDay[d].statuses[st] = (byDay[d].statuses[st] || 0) + 1;
-                if (s.orderSerialNumber) byDay[d].orders.add(s.orderSerialNumber);
-              });
+                byDay[day].statuses[st] = (byDay[day].statuses[st]||0) + 1;
+                if (s.orderSerialNumber) byDay[day].orders.add(s.orderSerialNumber);
+
+                if (!byStatus[st]) byStatus[st] = { count:0, totalMin:0, unitSum:0, xphUnit:xUnit };
+                byStatus[st].count++;
+                if (!s.isOpen && s.durationMinutes > 0) { byStatus[st].totalMin += s.durationMinutes; byStatus[st].unitSum += uVal; }
+              }
+
+              const closedSegs = segments.filter(s => !s.isOpen && s.durationMinutes > 0);
+              const totalMin = closedSegs.reduce((a,s) => a + s.durationMinutes, 0);
+              const totalUnitSum = closedSegs.reduce((a,s) => {
+                const u = xUnitMap[s.statusSlug] || 'Orders';
+                return a + (u==='Credentials'?(s.credentialCount||0):u==='Reports'?(s.reportItemCount||0):1);
+              }, 0);
+
               result = {
                 worker: workerQuery,
                 matchedSegments: segments.length,
                 workerName: segments[0]?.workerName || workerQuery,
                 workerEmail: segments[0]?.workerEmail || '',
+                department: segments[0]?.departmentName || 'Unknown',
                 days,
-                dailyBreakdown: Object.values(byDay).sort((a, b) => b.date.localeCompare(a.date)).map(d => ({
-                  date: d.date, segments: d.count, totalMinutes: Math.round(d.totalMin),
-                  totalHours: Math.round(d.totalMin / 60 * 10) / 10, uniqueOrders: d.orders.size,
-                  statusBreakdown: d.statuses
-                })),
                 summary: {
                   totalSegments: segments.length,
-                  totalHours: Math.round(segments.filter(s => !s.isOpen).reduce((a, s) => a + (s.durationMinutes || 0), 0) / 60 * 10) / 10,
-                  uniqueOrders: new Set(segments.map(s => s.orderSerialNumber).filter(Boolean)).size,
-                  avgSegmentsPerDay: Object.keys(byDay).length ? Math.round(segments.length / Object.keys(byDay).length * 10) / 10 : 0,
-                  statusTotals: Object.entries(segments.reduce((acc, s) => { const st = s.statusName || s.statusSlug; acc[st] = (acc[st] || 0) + 1; return acc; }, {})).sort((a, b) => b[1] - a[1])
-                }
+                  closedSegments: closedSegs.length,
+                  totalHours: Math.round(totalMin/60*10)/10,
+                  overallXph: totalMin > 0 ? Math.round(totalUnitSum/(totalMin/60)*100)/100 : null,
+                  uniqueOrders: new Set(segments.map(s=>s.orderSerialNumber).filter(Boolean)).size,
+                  activeDays: Object.keys(byDay).filter(d => byDay[d].count > 0).length,
+                  byStatus: Object.entries(byStatus).map(([st, d]) => ({
+                    status: st, xphUnit: d.xphUnit, segments: d.count,
+                    xph: d.totalMin > 0 ? Math.round(d.unitSum/(d.totalMin/60)*100)/100 : null,
+                    avgMin: d.count ? Math.round(d.totalMin/d.count*10)/10 : null,
+                  })).sort((a,b) => b.segments-a.segments),
+                },
+                dailyBreakdown: Object.values(byDay).sort((a,b) => b.date.localeCompare(a.date)).map(d => ({
+                  date: d.date, segments: d.count,
+                  hours: Math.round(d.totalMin/60*10)/10,
+                  xph: d.totalMin > 0 ? Math.round(d.unitSum/(d.totalMin/60)*100)/100 : null,
+                  uniqueOrders: d.orders.size,
+                  statusBreakdown: d.statuses,
+                })),
               };
               break;
             }
             case 'fetch_anomaly_scan': {
               const days = Math.min(toolBlock.input?.days || 7, 30);
-              const [kpi, qc] = await Promise.all([
-                internalFetch(`/kpi-segments?days=${days}&page=1&pageSize=${AI_PAGE_SIZE}`),
-                internalFetch(`/qc-summary?days=${days}`)
-              ]);
-              const segments = kpi.segments || [];
-              // Anomaly 1: Workers with very few segments vs team avg
-              const byWorker = {};
-              segments.forEach(s => {
-                const w = s.workerEmail || 'none';
-                if (!byWorker[w]) byWorker[w] = { name: s.workerName, email: w, count: 0, totalMin: 0, maxDuration: 0, zeroDays: 0 };
-                byWorker[w].count++;
-                if (s.durationMinutes > 0) { byWorker[w].totalMin += s.durationMinutes; byWorker[w].maxDuration = Math.max(byWorker[w].maxDuration, s.durationMinutes); }
-              });
-              const workers = Object.values(byWorker).filter(w => w.email !== 'none');
-              const avgCount = workers.length ? workers.reduce((a, w) => a + w.count, 0) / workers.length : 0;
-              // Flag workers >2x or <0.5x average
-              const outlierWorkers = workers.filter(w => w.count > avgCount * 2 || w.count < avgCount * 0.3).map(w => ({
-                ...w, avgForTeam: Math.round(avgCount), ratio: Math.round(w.count / avgCount * 100) / 100,
-                flag: w.count > avgCount * 2 ? 'HIGH_VOLUME' : 'LOW_VOLUME'
-              }));
-              // Anomaly 2: Segments with extreme durations (>8hrs)
-              const longSegments = segments.filter(s => s.durationMinutes > 480 && !s.isOpen).length;
-              // Anomaly 3: Segments with 0 duration
-              const zeroDuration = segments.filter(s => !s.isOpen && (s.durationMinutes === 0 || s.durationMinutes === null)).length;
-              // Anomaly 4: Unattributed segments
-              const unattributed = segments.filter(s => !s.workerEmail).length;
+              const deptAnomaly = toolBlock.input?.dept || '';
+              const deptAnomalyParam = deptAnomaly ? `&dept=${encodeURIComponent(deptAnomaly)}` : '';
+
+              // Fetch all pages for accurate anomaly detection
+              const firstA = await internalFetch(`/kpi-segments?days=${days}&page=1&pageSize=10000${deptAnomalyParam}`);
+              const totalPagesA = firstA.totalPages || 1;
+              let restA = [];
+              if (totalPagesA > 1) {
+                restA = await Promise.all(
+                  Array.from({ length: totalPagesA - 1 }, (_, i) =>
+                    internalFetch(`/kpi-segments?days=${days}&page=${i+2}&pageSize=10000${deptAnomalyParam}`)
+                  )
+                );
+              }
+              const segments = [firstA, ...restA].flatMap(d => d.segments || []);
+              const qc = await internalFetch(`/qc-summary?days=${days}`);
+
+              // Load benchmarks for xphUnit
+              const aDb = await getConfigDb();
+              const aDocs = await aDb.collection('dashboard_benchmarks').find({}, { projection:{ status:1, xphUnit:1, inRangeMin:1, inRangeMax:1 } }).toArray();
+              const aBenchMap = {};
+              for (const b of aDocs) if (b.status) aBenchMap[b.status] = b;
+
+              // Per-department worker stats (compare within dept, not cross-dept)
+              const byDeptWorker = {};
+              for (const s of segments) {
+                const dept = s.departmentName || 'Unknown';
+                const w = s.workerEmail || 'UNATTRIBUTED';
+                const key = `${dept}::${w}`;
+                if (!byDeptWorker[key]) byDeptWorker[key] = { name:s.workerName||w, email:w, dept, count:0, totalMin:0, unitSum:0 };
+                byDeptWorker[key].count++;
+                const b = aBenchMap[s.statusSlug];
+                const xUnit = b?.xphUnit || 'Orders';
+                const uVal = xUnit==='Credentials'?(s.credentialCount||0):xUnit==='Reports'?(s.reportItemCount||0):1;
+                if (!s.isOpen && s.durationMinutes > 0) {
+                  byDeptWorker[key].totalMin += s.durationMinutes;
+                  byDeptWorker[key].unitSum += uVal;
+                }
+              }
+
+              // Find outliers WITHIN each department
+              const byDept = {};
+              for (const [, w] of Object.entries(byDeptWorker)) {
+                if (!byDept[w.dept]) byDept[w.dept] = [];
+                if (w.email !== 'UNATTRIBUTED') byDept[w.dept].push(w);
+              }
+              const outlierWorkers = [];
+              for (const [dept, workers] of Object.entries(byDept)) {
+                if (workers.length < 2) continue;
+                const avgSegs = workers.reduce((a,w)=>a+w.count,0) / workers.length;
+                const avgXph = workers.reduce((a,w)=>a+(w.totalMin>0?w.unitSum/(w.totalMin/60):0),0) / workers.length;
+                for (const w of workers) {
+                  const xph = w.totalMin > 0 ? w.unitSum/(w.totalMin/60) : 0;
+                  const xphDrop = avgXph > 0 ? (avgXph - xph) / avgXph : 0;
+                  if (xphDrop > 0.35) outlierWorkers.push({ ...w, avgXphForDept: Math.round(avgXph*100)/100, workerXph: Math.round(xph*100)/100, dropPct: Math.round(xphDrop*100), flag:'LOW_XPH' });
+                  else if (w.count < avgSegs * 0.3 && avgSegs >= 5) outlierWorkers.push({ ...w, avgForDept: Math.round(avgSegs), flag:'LOW_VOLUME' });
+                }
+              }
+
+              // Data quality anomalies
+              const longSegs = segments.filter(s => s.durationMinutes > 480 && !s.isOpen);
+              const zeroSegs = segments.filter(s => !s.isOpen && (s.durationMinutes===0||s.durationMinutes==null));
+              const unattributed = segments.filter(s => !s.workerEmail);
+
               result = {
+                dept: deptAnomaly || 'All',
                 scanPeriod: days + ' days',
                 totalSegments: segments.length,
                 anomalies: {
-                  outlierWorkers: outlierWorkers.slice(0, 10),
-                  longSegments: { count: longSegments, description: 'Segments over 8 hours processing time' },
-                  zeroDurationSegments: { count: zeroDuration, description: 'Closed segments with 0 or null duration' },
-                  unattributedSegments: { count: unattributed, percentage: segments.length ? Math.round(unattributed / segments.length * 1000) / 10 : 0, description: 'Segments with no assigned worker' }
+                  lowXphWorkers: outlierWorkers.filter(w=>w.flag==='LOW_XPH').slice(0,8),
+                  lowVolumeWorkers: outlierWorkers.filter(w=>w.flag==='LOW_VOLUME').slice(0,5),
+                  longSegments: { count: longSegs.length, examples: longSegs.slice(0,3).map(s=>({ worker:s.workerName, status:s.statusName, hours:Math.round(s.durationMinutes/60*10)/10 })) },
+                  zeroDurationSegments: { count: zeroSegs.length },
+                  unattributedSegments: { count: unattributed.length, pct: segments.length ? Math.round(unattributed.length/segments.length*1000)/10 : 0 },
                 },
-                qcSummary: { totalEvents: qc.totalEvents || 0, topDepartments: (qc.byDepartment || []).slice(0, 5) }
+                qcSummary: { totalEvents: qc.totalEvents||0, topDepartments: (qc.byDepartment||[]).slice(0,5) },
               };
               break;
             }
             case 'fetch_order_demand': {
-              const db2 = await getConfigDb();
+              const deptDemand = toolBlock.input?.dept || '';
+              const deptDemandParam = deptDemand ? `?dept=${encodeURIComponent(deptDemand)}` : '';
               const [slaRes, trendRes] = await Promise.all([
-                fetch(`http://localhost:${CONFIG.PORT}/data/forecast/sla-analysis`, {
+                fetch(`http://localhost:${CONFIG.PORT}/data/forecast/sla-analysis${deptDemandParam}`, {
                   headers: { 'Authorization': req.headers['authorization'] || '' }
                 }).then(r => r.json()).catch(() => ({})),
-                fetch(`http://localhost:${CONFIG.PORT}/data/forecast/arrivals`, {
+                fetch(`http://localhost:${CONFIG.PORT}/data/forecast/arrivals${deptDemandParam}`, {
                   headers: { 'Authorization': req.headers['authorization'] || '' }
                 }).then(r => r.json()).catch(() => ({})),
               ]);
+
+              const DAYS = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
+              const fmtH = h => h===0?'12am':h<12?h+'am':h===12?'12pm':(h-12)+'pm';
               const slots = trendRes.slots || [];
+              const dataSpanWeeks = trendRes.dataSpanWeeks || 1;
+
               const totalByDow = [0,1,2,3,4,5,6].map(d =>
-                slots.filter(s => s.dow === d).reduce((a, s) => a + s.count, 0)
+                slots.filter(s => s.dow === d).reduce((a,s) => a + s.count, 0)
               );
               const totalByHour = Array(24).fill(0);
               for (const s of slots) totalByHour[s.hour] = (totalByHour[s.hour]||0) + s.count;
+
               const peakHour = totalByHour.indexOf(Math.max(...totalByHour));
-              const DAYS = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
               const peakDow = totalByDow.indexOf(Math.max(...totalByDow));
+
               result = {
+                dept: deptDemand || 'All Departments (system-wide)',
+                note: deptDemand ? `Demand data filtered to ${deptDemand}.` : 'System-wide demand. All numbers are org-wide totals.',
                 summary: {
-                  totalOrders: slots.reduce((a,s) => a+s.count, 0),
-                  peakHour: `${peakHour === 0 ? '12am' : peakHour < 12 ? peakHour+'am' : peakHour === 12 ? '12pm' : (peakHour-12)+'pm'} UTC`,
+                  avgDailyOrders: trendRes.avgPerDay || null,
+                  peakHour: fmtH(peakHour) + ' UTC',
                   peakDay: DAYS[peakDow],
-                  volumeByDow: totalByDow.map((v,i) => ({ day: DAYS[i], orders: v })),
+                  dataSpanWeeks,
+                  avgByDow: totalByDow.map((v,i) => ({
+                    day: DAYS[i],
+                    avgDailyOrders: Math.round(v / Math.max(dataSpanWeeks, 1) * 10) / 10,
+                  })),
                 },
                 weeklyTrend: (trendRes.weeklyTrend || []).slice(-12),
-                slaRecommendations: slaRes.recommendations || [],
+                slaRecommendations: (slaRes.recommendations || []).slice(0, 5),
                 bottlenecks: (slaRes.bottlenecks || []).slice(0, 5),
                 topWaitStatuses: (slaRes.byStatus || []).slice(0, 8),
               };
               break;
             }
             case 'fetch_staffing_model': {
-              const staffRes = await fetch(`http://localhost:${CONFIG.PORT}/data/forecast/staffing`, {
+              const deptFilter = toolBlock.input?.dept || '';
+              const deptParam = deptFilter ? `?dept=${encodeURIComponent(deptFilter)}` : '';
+              const staffRes = await fetch(`http://localhost:${CONFIG.PORT}/data/forecast/staffing${deptParam}`, {
                 headers: { 'Authorization': req.headers['authorization'] || '' }
               }).then(r => r.json()).catch(e => ({ error: e.message }));
               if (staffRes.error) { result = staffRes; break; }
+
               const xphList = staffRes.xphByStatus || [];
               const totalSegs = xphList.reduce((a,s) => a+s.segments, 0);
               const weightedXph = totalSegs > 0
                 ? xphList.reduce((a,s) => a + s.xph * (s.segments/totalSegs), 0) : 0;
-              const staffByHour = (staffRes.totalByHour || []).map((arrivals, h) => ({
-                hour: h === 0 ? '12am' : h < 12 ? h+'am' : h === 12 ? '12pm' : (h-12)+'pm',
-                avgArrivals: Math.round(arrivals / 7 * 10) / 10,
-                requiredStaff: arrivals > 0 ? Math.ceil((arrivals/7) / (weightedXph||1)) : 0,
+              const DAYS = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
+              const fmtHr = h => h===0?'12am':h<12?h+'am':h===12?'12pm':(h-12)+'pm';
+
+              // Per-hour demand: average arrivals across the data span, not raw totals
+              // totalByHour has CUMULATIVE counts across all weeks of data
+              const dataSpanWeeks = staffRes.modelMeta?.dataSpanWeeks || 1;
+              const staffByHour = (staffRes.totalByHour || []).map((total, h) => {
+                const avgArrivalsPerDay = Math.round(total / Math.max(dataSpanWeeks * 7, 1) * 10) / 10;
+                return {
+                  hour: fmtHr(h),
+                  avgArrivalsPerDay: avgArrivalsPerDay,
+                  requiredStaff: avgArrivalsPerDay > 0 ? Math.ceil(avgArrivalsPerDay / (weightedXph||1)) : 0,
+                };
+              });
+
+              // Per-DOW demand — average daily orders by day of week
+              const totalByDow = staffRes.totalByDow || [];
+              const dowDemand = DAYS.map((day, i) => ({
+                day,
+                avgDailyOrders: Math.round(totalByDow[i] / Math.max(dataSpanWeeks, 1) * 10) / 10,
               }));
+
+              const peak = staffByHour.reduce((a,b) => a.requiredStaff >= b.requiredStaff ? a : b, staffByHour[0] || {});
+
               result = {
+                dept: deptFilter || 'All Departments',
+                note: deptFilter
+                  ? `Staffing model filtered to ${deptFilter}. Required staff = ceil(avg daily arrivals ÷ XpH). Add 20–30% for breaks and variance.`
+                  : 'WARNING: This is system-wide demand. For department staffing use dept= parameter.',
+                dataFoundation: {
+                  dataSpanWeeks,
+                  xphSampleSegments: totalSegs,
+                  avgDailyOrders: staffRes.avgPerDay,
+                },
                 weightedTeamXph: Math.round(weightedXph * 100) / 100,
-                note: 'Required staff = ceil(avg arrivals ÷ XpH). Add 20-30% for breaks and variance.',
+                xphByStatus: xphList.map(s => ({
+                  status: s.statusName, xphUnit: s.xphUnit,
+                  xph: s.xph, segments: s.segments, avgDurMin: s.avgDurMin,
+                })).slice(0, 15),
+                peakHour: peak,
                 staffByHour,
-                xphByStatus: xphList.slice(0, 10),
-                peakStaffingHour: staffByHour.reduce((a,b) => a.requiredStaff >= b.requiredStaff ? a : b),
+                dowDemand,
               };
               break;
             }
@@ -3797,6 +4071,24 @@ async function runBackfill(options = {}) {
 
         totalOrders += batchOrders.length;
 
+        // Pre-fetch credential counts for this batch of orders
+        let credCountMap = {};
+        try {
+          const batchOrderIds = batchOrders.map(o => o._id);
+          const batchCreds = await prodDb.collection('order-credentials').aggregate([
+            { $match: {
+                order: { $in: batchOrderIds },
+                active: true,
+                $or: [{ deletedAt: null }, { deletedAt: { $exists: false } }]
+            }},
+            { $group: { _id: { $toString: '$order' }, credentialCount: { $sum: 1 } } },
+            { $project: { _id: 0, orderId: '$_id', credentialCount: 1 } }
+          ], { allowDiskUse: true }).toArray();
+          for (const r of batchCreds) credCountMap[r.orderId] = r.credentialCount;
+        } catch (cErr) {
+          // Non-fatal — credentialCount will default to 0
+        }
+
         // Build segment ops for this batch
         const batchSegOps = [];
         for (const order of batchOrders) {
@@ -3831,6 +4123,7 @@ async function runBackfill(options = {}) {
                   orderId: String(order._id), orderType: order.orderType,
                   parentOrderId: order.parentOrderId || null,
                   reportItemCount: reportCount, reportItemName: reportName,
+                  credentialCount: credCountMap[String(order._id)] ?? 0,
                   statusSlug: entry?.updatedStatus?.slug || '',
                   statusName: entry?.updatedStatus?.name || '',
                   workerUserId: assigned.foreignKeyId || assigned.v2Id || null,
@@ -3969,6 +4262,26 @@ async function runBackfill(options = {}) {
 
     // 1a. Fetch orders with history entries in the cutoff window
     push('Querying production orders...');
+
+    // Pre-fetch credential counts for all active credentials (no date filter —
+    // V1-imported credentials have old createdAt dates, scoping must be by order not by cred date)
+    push('Fetching credential counts...');
+    let credCountMap = {}; // orderId (string) → credentialCount
+    try {
+      const credCounts = await prodDb.collection('order-credentials').aggregate([
+        { $match: {
+            active: true,
+            $or: [{ deletedAt: null }, { deletedAt: { $exists: false } }]
+        }},
+        { $group: { _id: { $toString: '$order' }, credentialCount: { $sum: 1 } } },
+        { $project: { _id: 0, orderId: '$_id', credentialCount: 1 } }
+      ], { allowDiskUse: true, maxTimeMS: 60000 }).toArray();
+      for (const r of credCounts) credCountMap[r.orderId] = r.credentialCount;
+      push(`  Credential counts: ${Object.keys(credCountMap).length} orders mapped`);
+    } catch (cErr) {
+      push(`  Credential counts: SKIPPED (${cErr.message}) — will default to 1`);
+    }
+
     const orders = await prodDb.collection('orders').aggregate([
       {
         $match: {
@@ -4533,6 +4846,7 @@ app.get('/data/kpi-segments', async (req, res) => {
       isOpen:1,
       // Extra fields for drilldown drawer (KPIUsers segments tab)
       changedByName:1, isErrorReporting:1, reportItemCount:1, reportItemName:1,
+      credentialCount:1,  // for unit-aware XpH (Credentials unit type)
       orderSource:1, parentOrderId:1
     };
     const rawSegments = await col.find(filter, { projection: CLIENT_PROJECTION })
@@ -5363,21 +5677,36 @@ app.get('/data/forecast/staffing', async (req, res) => {
     const cutoff60 = new Date(Date.now() - 60 * 86400000);
     const segMatch = { isOpen:false, segmentStart:{ $gte:cutoff60.toISOString() }, durationMinutes:{ $gt:0 } };
     if (dept) segMatch.departmentName = dept;
-    const xphByStatus = await db.collection('backfill_kpi_segments').aggregate([
+    // Fetch benchmarks to resolve xphUnit per status
+    const benchmarkDocs = await db.collection('dashboard_benchmarks').find({}, { projection:{ status:1, xphUnit:1 } }).toArray();
+    const xphUnitBySlug = {};
+    for (const b of benchmarkDocs) if (b.status) xphUnitBySlug[b.status] = b.xphUnit || 'Orders';
+
+    const xphByStatusRaw = await db.collection('backfill_kpi_segments').aggregate([
       { $match: segMatch },
       { $group: {
           _id: '$statusSlug',
           statusName: { $first:'$statusName' },
           segments: { $sum:1 },
           totalMin: { $sum:'$durationMinutes' },
-      }},
-      { $project: {
-          _id:0, statusSlug:'$_id', statusName:1, segments:1,
-          xph: { $round:[{ $divide:['$segments',{ $divide:['$totalMin',60] }] },2] },
-          avgDurMin: { $round:[{ $divide:['$totalMin','$segments'] },1] }
+          // Accumulate all three unit types — we pick the right one post-query
+          orderUnits:      { $sum: 1 },
+          credentialUnits: { $sum: { $ifNull:['$credentialCount', 0] } },
+          reportUnits:     { $sum: { $ifNull:['$reportItemCount', 0] } },
       }},
       { $sort: { segments:-1 } }
     ]).toArray();
+
+    const xphByStatus = xphByStatusRaw.map(r => {
+      const unit = xphUnitBySlug[r._id] || 'Orders';
+      const unitSum = unit === 'Credentials' ? r.credentialUnits
+                    : unit === 'Reports'      ? r.reportUnits
+                    : r.orderUnits;
+      const xph = r.totalMin > 0 ? Math.round(unitSum / (r.totalMin / 60) * 100) / 100 : 0;
+      const avgDurMin = r.segments > 0 ? Math.round(r.totalMin / r.segments * 10) / 10 : 0;
+      return { statusSlug: r._id, statusName: r.statusName, segments: r.segments,
+               xph, avgDurMin, xphUnit: unit };
+    });
 
     // Status wait times (avg minutes waiting per status)
     const waitByStatus = await db.collection('backfill_order_turnaround').aggregate([

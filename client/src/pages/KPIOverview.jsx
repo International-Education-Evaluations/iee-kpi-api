@@ -141,11 +141,12 @@ export default function KPIOverview() {
       const k=s.statusName||s.statusSlug||'Unknown';
       if(!m[k])m[k]={status:k,slug:s.statusSlug||'',count:0,totalMin:0,closed:0,open:0,durations:[],workers:new Set()};
       m[k].count++;
-      if(!s.isOpen&&s.durationMinutes>0){m[k].totalMin+=s.durationMinutes;m[k].closed++;m[k].durations.push(s.durationMinutes);}
+      if(!s.isOpen&&s.durationMinutes>0){m[k].totalMin+=s.durationMinutes;m[k].closed++;m[k].unitSum=(m[k].unitSum||0)+(s.unitValue??1);m[k].durations.push(s.durationMinutes);}
       if(s.isOpen)m[k].open++;
       if(s._workerId)m[k].workers.add(s._workerId);
     });
     return Object.values(m).map(d=>({...d,avg:d.closed?Math.round(d.totalMin/d.closed*10)/10:null,
+      xph:d.totalMin>0?Math.round((d.unitSum||d.closed)/(d.totalMin/60)*10)/10:null,
       median:getMedian(d.durations),hrs:Math.round(d.totalMin/60*10)/10,
       pct:filtered.length?Math.round(d.count/filtered.length*100):0,workers:d.workers.size})).sort((a,b)=>b.count-a.count);
   },[filtered]);
@@ -157,12 +158,12 @@ export default function KPIOverview() {
       if(!m[k])m[k]={worker:s.displayName||s.workerName||'UNATTRIBUTED',workerId:k,dept:s.departmentName||'',count:0,totalMin:0,closed:0,open:0,orders:new Set()};
       const b=m[k]; b.count++;
       if(!b.dept&&s.departmentName)b.dept=s.departmentName;
-      if(!s.isOpen&&s.durationMinutes>0){b.totalMin+=s.durationMinutes;b.closed++;}
+      if(!s.isOpen&&s.durationMinutes>0){b.totalMin+=s.durationMinutes;b.closed++;b.unitSum=(b.unitSum||0)+(s.unitValue??1);}
       if(s.isOpen)b.open++;
       if(s.orderSerialNumber)b.orders.add(s.orderSerialNumber);
     });
     return Object.values(m).map(d=>({...d,orders:d.orders.size,avg:d.closed?Math.round(d.totalMin/d.closed*10)/10:null,
-      hrs:Math.round(d.totalMin/60*10)/10,xph:d.totalMin>0?Math.round(d.closed/(d.totalMin/60)*10)/10:null})).sort((a,b)=>b.count-a.count);
+      hrs:Math.round(d.totalMin/60*10)/10,xph:d.totalMin>0?Math.round(d.unitSum/(d.totalMin/60)*10)/10:null})).sort((a,b)=>b.count-a.count);
   },[filtered]);
 
   const daily = useMemo(()=>{
