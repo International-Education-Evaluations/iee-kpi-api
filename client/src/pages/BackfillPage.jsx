@@ -12,6 +12,7 @@ export default function BackfillPage() {
   const [mode, setMode] = useState('incremental');
   const [dateFrom, setDateFrom] = useState('');
   const [dateTo, setDateTo] = useState('');
+  const [fullDays, setFullDays] = useState(365);
 
   useEffect(() => { load(); const t = setInterval(load, 10000); return () => clearInterval(t); }, []);
 
@@ -30,7 +31,7 @@ export default function BackfillPage() {
   const triggerBackfill = async () => {
     setRunning(true);
     const body = {};
-    if (mode === 'full') { body.full = true; body.days = settings?.days || 90; }
+    if (mode === 'full') { body.full = true; body.days = fullDays || settings?.days || 365; }
     else if (mode === 'range') { body.dateFrom = dateFrom; body.dateTo = dateTo; }
     // incremental = empty body
     try { await api('/backfill/run', { method: 'POST', body: JSON.stringify(body) }); }
@@ -120,8 +121,17 @@ export default function BackfillPage() {
           </div>
         </div>}
 
-        {mode === 'full' && <div className="mb-4 p-3 bg-red-50 border border-red-200 rounded-lg">
-          <p className="text-xs text-red-600">Full refresh will delete all existing backfill data and re-fetch from production. Use only if data is corrupted or for initial setup.</p>
+        {mode === 'full' && <div className="mb-4 p-3 bg-red-50 border border-red-200 rounded-lg space-y-3">
+          <p className="text-xs text-red-600 font-medium">Full refresh deletes all existing backfill data and re-fetches from production. This runs in monthly batches.</p>
+          <div className="flex items-center gap-3">
+            <label className="text-xs text-red-700 font-semibold whitespace-nowrap">Days to backfill:</label>
+            <input type="number" min={30} max={730} step={30} value={fullDays}
+              onChange={e => setFullDays(Math.max(30, Math.min(730, parseInt(e.target.value)||365)))}
+              className="w-24 px-2 py-1 text-sm border border-red-200 rounded bg-white text-ink-900 font-mono" />
+            <span className="text-xs text-red-500">
+              = {Math.ceil(fullDays / 30)} monthly batches · ~{Math.round(fullDays / 30 * 0.5 * 10) / 10} min est.
+            </span>
+          </div>
         </div>}
 
         <button onClick={triggerBackfill} disabled={running || (mode === 'range' && !dateFrom)}

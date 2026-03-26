@@ -1517,9 +1517,9 @@ app.get('/indexes', async (req, res) => {
         reason: 'Speeds up the main KPI segments aggregation pipeline'
       },
       {
-        database: 'orders', collection: 'order-credentials', name: 'credential_count_query',
-        keys: { order: 1, active: 1, createdAt: 1, deletedAt: 1 },
-        reason: 'Speeds up credential count grouping per order (date-scoped in v4.0)'
+        database: 'orders', collection: 'order-credentials', name: 'credential_count_query_v2',
+        keys: { active: 1, order: 1 },
+        reason: 'Speeds up credential count grouping per order — filters active first then groups by order'
       },
       {
         database: 'orders', collection: 'order-discussion', name: 'qc_events_query_v4',
@@ -2278,118 +2278,29 @@ app.get('/config/benchmarks/statuses', async (req, res) => {
 // AI CHATBOT — Claude API proxy with live data access
 // ═══════════════════════════════════════════════════════════
 
-const DEFAULT_SYSTEM_PROMPT = `You are the IEE Operations Intelligence Assistant — a senior data analyst embedded inside the IEE Ops Dashboard. You have direct access to live operational data through your tools and you use it to give precise, actionable answers.
+const DEFAULT_SYSTEM_PROMPT = `You are the IEE Operations Intelligence Assistant — a senior data analyst with direct access to live data via tools.
 
-## WHO YOU ARE
-You think like a senior ops analyst who has worked at IEE for years. You understand the full order lifecycle, you know which statuses belong to which teams, you know what good vs bad XpH looks like by department, and you know where common bottlenecks occur. When you see a number, you interpret it — you do not just repeat it.
+RULES:
+- Always call a tool before answering questions about current data. Never guess.
+- Lead with the number or conclusion, then explain.
+- For dept questions: always pass dept= to tools. If dept is ambiguous, ask first.
+- Show your math for staffing calculations: ceil(arrivals/hr ÷ XpH) + 20-30% buffer.
+- Flag anomalies you notice even if not asked. End every substantive response with "Watch out:" or "Recommendation:" if data warrants it.
+- Never invent numbers. If a tool returns empty data, say so.
+- XpH = unit/hr where unit = Orders (1/seg), Credentials (credentialCount/seg), or Reports (reportItemCount/seg) — set per-status in Configuration > Benchmarks.
+- Staffing model WARNING: always pass dept= or the numbers are system-wide and will massively overstate headcount needs.
+- Data before 2026-02-07 is V1 historical import — treat trend analysis with caution.
 
-## YOUR TOOLS
-Always call tools before answering any question that involves current data. Never guess or use stale knowledge when a tool can give you the real number.
+DEPARTMENTS: Digital Records | Evaluation | Digital Fulfillment | Document Management | Customer Support | Translations | Data Entry
 
-- fetch_kpi_summary: Worker performance, XpH, In-Range %, segment counts, duration analysis
-- fetch_qc_summary: QC error rates, Kick Back vs Fixed It, accountable users, issue types by department
-- fetch_queue_snapshot: Live order counts per status, aging buckets (>24h />48h />72h), entered today
-- fetch_queue_wait_summary: Historical wait times (P50/P75/P90) per status over configurable window
-- fetch_user_list: Staff roster with department assignments and worker lookup
-- fetch_worker_pattern: Deep dive on one worker — day-by-day activity, hours, status breakdown
-- fetch_anomaly_scan: XpH drops, stuck orders, unattributed segments, data quality flags
-- fetch_order_demand: Order arrival patterns, peak hours/days, SLA distributions, bottleneck statuses
-- fetch_staffing_model: Required concurrent staff by hour, weighted team XpH, peak staffing needs by hour
+ORDER LIFECYCLE: payment → Digital Records → Evaluation → Digital Fulfillment → Completed
+- Documentation Needed / Awaiting Documents = customer hasn't submitted docs (not ops bottleneck)
+- Financial Hold = billing issue, not ops
+- Orders >72h in Waiting status = ops concern
 
-## HOW TO ANSWER
+XPH BENCHMARKS: Simple statuses (DR Processing, Initial Review) healthy at 4-8 XpH. Complex evaluation statuses healthy at 1-3 XpH. Flag if worker drops >30% week-over-week.
 
-Lead with the direct answer. State the number or conclusion first, then explain. Never say "Let me look that up" — just call the tool and respond with the result.
-
-Be specific. "Digital Records Processing has XpH 4.1 — at Wednesday 6pm demand you need 13 concurrent staff" is better than "staffing depends on several factors."
-
-Show your math for calculations. For staffing: state formula, inputs, result. For comparisons: show both numbers and the delta. For trends: show the direction and magnitude.
-
-Flag anomalies proactively. If you pull data and notice something the user did not ask about — a worker with a 60% XpH drop, 1,600 orders aged >72h, a kick-back rate spiking — mention it at the end. A good analyst surfaces issues without being asked.
-
-Be honest about data limitations. Small sample (< 50 segments): say so. Only 7 weeks of data and day-of-week patterns may not be stable: say so. Never present uncertain data with false confidence.
-
-## DEPARTMENT CONTEXT
-
-IEE processes credential evaluation and translation orders. The departments and their primary statuses:
-
-Digital Records: Digital Records Received, Digital Records Processing, Digital Records Review Processing, Digital Records Review
-Evaluation: Verified/Awaiting Evaluation, Initial Evaluation, Awaiting Evaluation Review, Evaluation Review, Eval Prep Processing, Evaluation Prep
-Digital Fulfillment: Digital Fulfillment (final delivery)
-Document Management: Document Mgmt Hold, Document Intake, Document Processing
-Customer Support: Customer Support escalations and hold statuses
-Translations: Translation Prep, Translation Review and related statuses
-Data Entry: Data Entry and related intake statuses
-
-When a user asks about a specific department, filter your analysis to that department only. Never blend departments unless explicitly asked for system-wide or comparative analysis.
-
-If department is ambiguous, ask one short question before pulling data: "Which department? (Digital Records / Evaluation / Digital Fulfillment / Document Management / Translations / Customer Support / Data Entry / All)"
-
-## ORDER LIFECYCLE
-
-Orders flow: payment received → Digital Records processing → Evaluation → Digital Fulfillment → Completed.
-
-Hold statuses (On-Hold) pause the SLA clock. Waiting statuses = order sitting in queue unassigned. Processing statuses = worker actively working it.
-
-Important context for queue analysis:
-- Documentation Needed / Awaiting Documents = customer has not submitted required docs. Not an ops bottleneck — ops cannot act on these.
-- Financial Hold / Awaiting Payment = billing issue, not ops-controlled.
-- Orders >72h in a Waiting status = operational concern requiring staffing or routing action.
-- Evaluation Prep / Verified/Awaiting Evaluation with high aging = Evaluation team capacity issue.
-
-## METRICS REFERENCE
-
-XpH = unit-processed per hour. The unit depends on the status: Orders (1 per segment), Credentials (credential count per order), or Reports (report item count). This is configured per-status in Configuration > Benchmarks. Always check the xphUnit when interpreting XpH — a Data Entry worker at 3 XpH means 3 credentials/hr, not 3 orders/hr.
-Healthy ranges by status type:
-- High-volume simple statuses (Digital Records Processing, Initial Review): 4–8 XpH is healthy
-- Complex evaluation statuses (Initial Evaluation, Evaluation Review): 1–3 XpH is normal
-- Flag if a worker drops >30% week-over-week
-
-In-Range % = percentage of closed segments where duration fell within the configured benchmark window.
-- System-wide healthy target: 70%+
-- Below 50% for a status: investigate benchmark calibration or training gap
-- Above 95%: benchmark may be too wide, not capturing real quality signal
-
-5-Bucket classification for every closed segment:
-- Exclude Short: too fast, likely a system error or accidental re-open
-- OOR Short: faster than benchmark minimum (check if quality was maintained)
-- In-Range: within target window (goal state)
-- OOR Long: slower than benchmark maximum (check for blockers or complexity)
-- Exclude Long: unreasonably long, likely left open overnight or over weekend
-
-QC metrics:
-- Fixed-It rate = QC reviewer corrected the error in place (fast resolution)
-- Kick-Back rate = order returned to responsible team for rework (slower, more expensive)
-- A rising kick-back rate in a department = systemic training or process issue, not a one-off
-- Accountable user = the worker assigned when the error occurred, not the QC reviewer
-
-## STAFFING CALCULATIONS
-
-When asked how many staff a team needs:
-1. Call fetch_staffing_model with the department filter
-2. Formula: Required staff = ceil(avg orders arriving at hour H / team XpH for that department)
-3. Always add 20-30% buffer for breaks, context switching, and variance
-4. State: base requirement, buffer, and final recommendation
-5. Identify the peak hour and peak day specifically
-
-Example format: "At peak (Wed 6pm), Digital Records averages 46 order arrivals/hr with XpH of 4.1. Base staff needed: ceil(46/4.1) = 12. With 25% buffer: 15 concurrent staff recommended."
-
-## RESPONSE FORMAT
-
-- Bold key numbers and conclusions
-- Use tables when comparing multiple workers, statuses, or departments side by side
-- For queue questions: always include aging breakdown, not just totals
-- Keep responses focused on the department or question asked
-- End every substantive response with one "Watch out:" or "Recommendation:" line if the data reveals something actionable
-
-## CONSTRAINTS
-
-Never fabricate numbers. If a tool returns empty data, say "No data returned — [reason]."
-Never present system-wide XpH when asked about a department.
-Never say "I do not have access to that" when a tool exists for it.
-Never give generic advice without citing the specific metric that indicates the problem.
-Do not ask clarifying questions you can answer yourself from the data.
-
-Go-live date: February 7, 2026. Data before this date is V1 historical import — treat with caution for trend analysis. All times are US Eastern.`
+All times US Eastern.`
 
 // —— GET /ai/system-prompt ————————————————————————————————
 app.get('/ai/system-prompt', async (req, res) => {
@@ -2493,6 +2404,15 @@ const aiRateLimit = rateLimit({ windowMs: 60000, max: 10, message: { error: 'AI 
 // —— POST /ai/chat —————————————————————————————————————————
 // Proxies to Claude API with internal data tools
 app.post('/ai/chat', aiRateLimit, async (req, res) => {
+  // Memory guard: defer AI chat if backfill is running and memory is high
+  const chatMemMB = Math.round(process.memoryUsage().rss / 1024 / 1024);
+  if (backfillRunning && chatMemMB > 420) {
+    return res.status(503).json({
+      error: 'A data sync is running in the background. Please try again in 2–3 minutes.',
+      retryAfter: 120
+    });
+  }
+
   try {
     if (!CONFIG.CLAUDE_API_KEY) {
       return res.status(500).json({ error: 'Claude API key not configured' });
@@ -3930,53 +3850,59 @@ async function runOrderArrivalBackfill(prodDb, configDb, push) {
     // departmentName seen in segments for that order (the team that worked it most).
     push('  Enriching turnaround with department names...');
     try {
-      // Department lives in backfill_users (keyed by v1Id).
-      // Segments have workerUserId = v1Id but NOT departmentName directly.
-      // Join path: turnaround.orderSerialNumber → segments.orderSerialNumber
-      //            → segments.workerUserId → users.v1Id → users.departmentName
-      // We take the most frequent (workerUserId, departmentName) pair per order.
+      // Load backfill_users into memory as a Map: String(v1Id) → departmentName
+      // This is faster than a MongoDB $lookup + $toString on every doc
+      const userDeptDocs = await configDb.collection('backfill_users')
+        .find({ v1Id: { $exists: true, $ne: null }, departmentName: { $exists: true, $ne: null } },
+              { projection: { v1Id: 1, departmentName: 1 } }).toArray();
+      const deptByV1Id = new Map();
+      for (const u of userDeptDocs) {
+        if (u.v1Id && u.departmentName) deptByV1Id.set(String(u.v1Id), u.departmentName);
+      }
+      push(`    Loaded ${deptByV1Id.size} users with department assignments`);
 
-      const deptByOrder = await configDb.collection('backfill_kpi_segments').aggregate([
-        // Step 1: get distinct (orderSerialNumber, workerUserId) with frequency
-        { $match: { orderSerialNumber: { $exists:true, $ne:null }, workerUserId: { $exists:true, $ne:null } } },
-        { $group: { _id: { order:'$orderSerialNumber', uid:'$workerUserId' }, count:{ $sum:1 } } },
-        { $sort: { count:-1 } },
-        { $group: { _id:'$_id.order', workerUserId:{ $first:'$_id.uid' } } },
-        // Step 2: lookup departmentName from backfill_users via v1Id
-        { $lookup: {
-            from: 'backfill_users',
-            let: { uid: '$workerUserId' },
-            pipeline: [
-              { $match: { $expr: { $eq: [{ $toString:'$v1Id' }, { $toString:'$$uid' }] } } },
-              { $project: { _id:0, departmentName:1 } }
-            ],
-            as: 'user'
-        }},
-        { $project: {
-            _id:1,
-            departmentName: { $ifNull: [{ $arrayElemAt:['$user.departmentName',0] }, null] }
-        }},
-        { $match: { departmentName: { $ne: null } } }
-      ]).toArray();
-
-      if (deptByOrder.length > 0) {
-        const deptOps = deptByOrder.map(r => ({
-          updateOne: {
-            filter: { orderSerialNumber: r._id },
-            update: { $set: { departmentName: r.departmentName } }
-          }
-        }));
-        for (let i = 0; i < deptOps.length; i += 2000) {
-          await turnCol.bulkWrite(deptOps.slice(i, i + 2000), { ordered: false });
-        }
-        push(`  Enriched ${deptByOrder.length} orders with department names`);
-        await turnCol.createIndex({ departmentName:1 }, { background:true }).catch(()=>{});
-        await turnCol.createIndex({ departmentName:1, createdAt:-1 }, { background:true }).catch(()=>{});
+      if (deptByV1Id.size === 0) {
+        push('  Dept enrichment: 0 users with v1Id found — run user sync first');
       } else {
-        push('  Dept enrichment: 0 matches (backfill_users may not have v1Id populated yet)');
+        // Find the dominant workerUserId per orderSerialNumber from segments
+        const workerByOrder = await configDb.collection('backfill_kpi_segments').aggregate([
+          { $match: { orderSerialNumber: { $exists:true, $ne:null }, workerUserId: { $exists:true, $ne:null } } },
+          { $group: { _id: { order:'$orderSerialNumber', uid:'$workerUserId' }, count:{ $sum:1 } } },
+          { $sort: { count:-1 } },
+          { $group: { _id:'$_id.order', workerUserId:{ $first:'$_id.uid' } } }
+        ], { allowDiskUse: true }).toArray();
+        push(`    Found ${workerByOrder.length} orders with worker assignments`);
+
+        // Join in JS using the in-memory Map
+        const deptOps = [];
+        let matched = 0, unmatched = 0;
+        for (const r of workerByOrder) {
+          const dept = deptByV1Id.get(String(r.workerUserId));
+          if (dept) {
+            deptOps.push({ updateOne: {
+              filter: { orderSerialNumber: r._id },
+              update: { $set: { departmentName: dept } }
+            }});
+            matched++;
+          } else {
+            unmatched++;
+          }
+        }
+        push(`    Matched: ${matched} orders | Unmatched workerUserId: ${unmatched}`);
+
+        if (deptOps.length > 0) {
+          for (let i = 0; i < deptOps.length; i += 2000) {
+            await turnCol.bulkWrite(deptOps.slice(i, i + 2000), { ordered: false });
+          }
+          push(`  ✓ Enriched ${deptOps.length} turnaround records with departmentName`);
+          await turnCol.createIndex({ departmentName:1 }, { background:true }).catch(()=>{});
+          await turnCol.createIndex({ departmentName:1, createdAt:-1 }, { background:true }).catch(()=>{});
+        } else {
+          push('  Dept enrichment: 0 ops generated — check v1Id alignment between segments and users');
+        }
       }
     } catch (dErr) {
-      push(`  Dept enrichment: SKIPPED (${dErr.message})`);
+      push(`  Dept enrichment: FAILED — ${dErr.message}`);
     }
 
     // Rebuild arrival heatmap from turnaround collection
@@ -4474,6 +4400,10 @@ async function runBackfill(options = {}) {
     await segCol.createIndex({ orderType: 1 }).catch(() => {});
     await segCol.createIndex({ segmentStart: -1 }).catch(() => {});
     await segCol.createIndex({ isOpen: 1 }).catch(() => {});
+    // Compound indexes for common filtered queries
+    await segCol.createIndex({ departmentName: 1, segmentStart: -1 }).catch(() => {});
+    await segCol.createIndex({ workerEmail: 1, segmentStart: -1 }).catch(() => {});
+    await segCol.createIndex({ statusSlug: 1, segmentStart: -1 }).catch(() => {});
 
     push(`Segments: ${upsertedSegs} new, ${updatedSegs} updated, ${segOps.length} processed`);
 
@@ -4889,17 +4819,23 @@ app.get('/data/kpi-segments', async (req, res) => {
     // Use a single find() — avoids separate countDocuments() round trip.
     // We fetch pageSize+1 docs to detect if there are more pages.
     // This is safe because pageSize is capped at 10000 and dataset is ~95k rows.
+    // Two-tier projection: summary fields always sent, drilldown fields only when requested
+    const drilldown = req.query.drilldown === '1';
     const CLIENT_PROJECTION = {
+      // Core fields — needed for all KPI calculations
       orderSerialNumber:1, orderId:1, orderType:1,
       statusSlug:1, statusName:1,
       workerUserId:1, workerName:1, workerEmail:1,
-      segmentStart:1, segmentEnd:1,
-      durationMinutes:1, durationSeconds:1,
-      isOpen:1,
-      // Extra fields for drilldown drawer (KPIUsers segments tab)
-      changedByName:1, isErrorReporting:1, reportItemCount:1, reportItemName:1,
-      credentialCount:1,  // for unit-aware XpH (Credentials unit type)
-      orderSource:1, parentOrderId:1
+      segmentStart:1, durationMinutes:1, isOpen:1,
+      reportItemCount:1,  // Reports unit XpH
+      credentialCount:1,  // Credentials unit XpH
+      departmentName:1,   // For dept filtering
+      ...(drilldown ? {
+        // Drilldown-only fields — fetched separately when user opens detail tabs
+        segmentEnd:1, durationSeconds:1,
+        changedByName:1, isErrorReporting:1, reportItemName:1,
+        orderSource:1, parentOrderId:1
+      } : {})
     };
     const rawSegments = await col.find(filter, { projection: CLIENT_PROJECTION })
       .sort({ segmentStart: -1 })

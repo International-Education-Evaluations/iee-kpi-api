@@ -65,14 +65,14 @@ export function DataProvider({ children }) {
       // cb= cache-bust: forces unique URLs so browser/proxy never deduplicates
       // parallel requests or returns a cached 304 for a different page
       const cb = Date.now();
-      const first = await api(`/data/kpi-segments?page=1&pageSize=10000&cb=${cb}`);
+      const first = await api(`/data/kpi-segments?page=1&pageSize=10000&drilldown=1&cb=${cb}`);
       const totalPages = first.totalPages || 1;
 
       let rest = [];
       if (totalPages > 1) {
         rest = await Promise.all(
           Array.from({ length: totalPages - 1 }, (_, i) =>
-            api(`/data/kpi-segments?page=${i + 2}&pageSize=10000&cb=${cb}`)
+            api(`/data/kpi-segments?page=${i + 2}&pageSize=10000&drilldown=1&cb=${cb}`)
           )
         );
       }
