@@ -81,9 +81,9 @@ function UserLevels() {
 
   useEffect(()=>{(async()=>{setLoading(true);try{const[ur,lr]=await Promise.all([api('/users'),api('/config/user-levels').catch(()=>({levels:[]}))]);setUsers(ur.users||[]);const m={};for(const l of(lr.levels||[]))m[l.email?.toLowerCase()]=l.level;setLevels(m);}catch(e){console.error(e);}setLoading(false);})();},[]);
 
-  const update=async(u,lv)=>{const em=(u.email||'').toLowerCase();setSaving(em);try{await api('/config/user-levels',{method:'PUT',body:JSON.stringify({email:em,name:u.fullName||'',department:u.departmentName||'',level:lv||null,changedBy:getUser()?.name})});setLevels(p=>({...p,[em]:lv||null}));}catch(e){alert('Failed: '+e.message);}setSaving(null);};
+  const update=async(u,lv)=>{const em=(u.email||'').toLowerCase();setSaving(em);try{await api('/config/user-levels',{method:'PUT',body:JSON.stringify({email:em,name:u.fullName||'',department:u.department||'',level:lv||null,changedBy:getUser()?.name})});setLevels(p=>({...p,[em]:lv||null}));}catch(e){alert('Failed: '+e.message);}setSaving(null);};
 
-  const fl=users.filter(u=>{if(!filter)return true;const s=filter.toLowerCase();return(u.fullName||'').toLowerCase().includes(s)||(u.email||'').toLowerCase().includes(s)||(u.departmentName||'').toLowerCase().includes(s);});
+  const fl=users.filter(u=>{if(!filter)return true;const s=filter.toLowerCase();return(u.fullName||'').toLowerCase().includes(s)||(u.email||'').toLowerCase().includes(s)||(u.department||'').toLowerCase().includes(s);});
 
   if(loading) return <Skel rows={10} cols={5} />;
   return (
@@ -93,7 +93,7 @@ function UserLevels() {
       </div>
       <div className="card-surface overflow-hidden"><div className="overflow-x-auto max-h-[550px] overflow-y-auto"><table className="tbl w-full"><thead className="sticky top-0 z-10"><tr><th>Name</th><th>Email</th><th>Department</th><th className="text-center">Level</th></tr></thead>
         <tbody>{fl.slice(0,100).map((u,i)=>{const em=(u.email||'').toLowerCase();const cl=levels[em]||'';const sv=saving===em;return(
-          <tr key={i}><td className="font-medium text-ink-900">{u.fullName||'—'}</td><td className="font-mono text-[11px]">{u.email||'—'}</td><td className="text-sm">{u.departmentName||'—'}</td>
+          <tr key={i}><td className="font-medium text-ink-900">{u.fullName||'—'}</td><td className="font-mono text-[11px]">{u.email||'—'}</td><td className="text-sm">{u.department||'—'}</td>
           <td className="text-center"><select value={cl} onChange={e=>update(u,e.target.value)} disabled={sv} className={`px-1.5 py-0.5 bg-white border rounded text-xs text-center font-mono ${sv?'border-amber-500 text-amber-600':cl?'border-emerald-600/40 text-emerald-600':'border-surface-200 text-ink-400'}`}>{['','L0','L1','L2','L3','L4','L5'].map(l=><option key={l} value={l}>{l||'—'}</option>)}</select></td></tr>);})}</tbody></table></div>
       {fl.length>100&&<div className="px-4 py-1.5 text-[10px] text-ink-500 border-t border-surface-200">Showing 100 of {fl.length}</div>}</div>
     </div>

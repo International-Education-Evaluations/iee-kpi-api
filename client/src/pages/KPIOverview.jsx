@@ -1,9 +1,9 @@
 import React, { useEffect, useState, useMemo } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, Cell } from 'recharts';
-import { Card, Table, Section, Pills, Skel, FilterBar, FilterSelect, FilterInput, FilterReset, fmt, fmtI, disambiguateWorkers } from '../components/UI';
+import { Card, Table, Section, Pills, Skel, FilterBar, FilterSelect, FilterInput, FilterReset, fmt, fmtI } from '../components/UI';
 import DashboardGrid, { Widget } from '../components/DashboardGrid';
-import { api } from '../hooks/useApi';
+import { useData } from '../hooks/useData';
 
 const TT = { contentStyle:{ background:'#ffffff', border:'1px solid #e2e8f0', borderRadius:8, color:'#0f172a', fontSize:12, boxShadow:'0 4px 12px rgba(0,0,0,0.08)' } };
 const BUCKET_COLORS = { 'Exclude Short':'#94a3b8', 'Out-of-Range Short':'#F57F17', 'In-Range':'#16a34a', 'Out-of-Range Long':'#E65100', 'Exclude Long':'#B71C1C', 'Unclassified':'#cbd5e1', 'Open':'#3b82f6' };
@@ -19,9 +19,7 @@ const DEFAULT_LAYOUT = [
 ];
 
 export default function KPIOverview() {
-  const [segs, setSegs] = useState([]);
-  const [classified, setClassified] = useState(null);
-  const [loading, setLoading] = useState(true);
+  const { kpiSegs: segs, classified, kpiLoading: loading, loadKpi } = useData();
   const [view, setView] = useState('status');
   const [fType, setFType] = useState('');
   const [fFrom, setFFrom] = useState('');
@@ -29,17 +27,7 @@ export default function KPIOverview() {
   const [fWorker, setFWorker] = useState('');
   const nav = useNavigate();
 
-  useEffect(() => { load(); }, []);
-  async function load() {
-    setLoading(true);
-    try {
-      let all = [], p = 1, more = true;
-      while (more) { const d = await api(`/data/kpi-segments?days=60&page=${p}&pageSize=5000`); all = all.concat(d.segments||[]); more = d.hasMore; p++; }
-      setSegs(disambiguateWorkers(all));
-      try { const c = await api('/kpi-classify?days=60&page=1&pageSize=5000'); setClassified(c); } catch {}
-    } catch (e) { console.error(e); }
-    setLoading(false);
-  }
+  useEffect(() => { loadKpi(); }, [loadKpi]);
 
   const workers = useMemo(() => {
     const m = {};

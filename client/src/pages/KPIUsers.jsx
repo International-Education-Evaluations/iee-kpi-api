@@ -1,9 +1,9 @@
 import React, { useEffect, useState, useMemo } from 'react';
 import { useSearchParams } from 'react-router-dom';
 import { BarChart, Bar, LineChart, Line, XAxis, YAxis, Tooltip, ResponsiveContainer } from 'recharts';
-import { Card, Table, Section, Skel, FilterBar, FilterSelect, FilterInput, fmt, fmtI, disambiguateWorkers } from '../components/UI';
+import { Card, Table, Section, Skel, FilterBar, FilterSelect, FilterInput, fmt, fmtI } from '../components/UI';
 import DashboardGrid, { Widget } from '../components/DashboardGrid';
-import { api } from '../hooks/useApi';
+import { useData } from '../hooks/useData';
 const TT={contentStyle:{background:'#ffffff',border:'1px solid #e2e8f0',borderRadius:8,color:'#0f172a',fontSize:12,boxShadow:'0 4px 12px rgba(0,0,0,0.08)'}};
 
 const DEFAULT_LAYOUT = [
@@ -15,31 +15,21 @@ const DEFAULT_LAYOUT = [
 ];
 
 export default function KPIUsers() {
-  const [segs, setSegs] = useState([]);
-  const [workers, setWorkers] = useState([]);
-  const [loading, setLoading] = useState(true);
+  const { kpiSegs: segs, kpiLoading: loading, loadKpi } = useData();
   const [sp] = useSearchParams();
   const [sel, setSel] = useState(sp.get('worker') || '');
   const [fFrom, setFFrom] = useState('');
   const [fTo, setFTo] = useState('');
   const [fStatus, setFStatus] = useState('');
 
-  useEffect(() => { load(); }, []);
+  useEffect(() => { loadKpi(); }, [loadKpi]);
   useEffect(() => { if (sp.get('worker')) setSel(sp.get('worker')); }, [sp]);
 
-  async function load() {
-    setLoading(true);
-    try {
-      let all=[], p=1, more=true;
-      while(more){const d=await api(`/data/kpi-segments?days=60&page=${p}&pageSize=5000`);all=all.concat(d.segments||[]);more=d.hasMore;p++;}
-      const dis = disambiguateWorkers(all);
-      setSegs(dis);
-      const m={};
-      dis.forEach(s=>{if(s._workerId) m[s._workerId]=s.displayName||s.workerName;});
-      setWorkers(Object.entries(m).map(([v,l])=>({value:v,label:l})).sort((a,b)=>a.label.localeCompare(b.label)));
-    } catch(e){console.error(e);}
-    setLoading(false);
-  }
+  const workers = useMemo(() => {
+    const m={};
+    segs.forEach(s=>{if(s._workerId) m[s._workerId]=s.displayName||s.workerName;});
+    return Object.entries(m).map(([v,l])=>({value:v,label:l})).sort((a,b)=>a.label.localeCompare(b.label));
+  }, [segs]);
 
   const userSegs = useMemo(() => {
     if(!sel) return [];

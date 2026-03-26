@@ -38,7 +38,12 @@ export default function DashboardGrid({ pageId, defaultLayout, children }) {
     }, 1000);
   }, [pageId, editing]);
 
-  const onLayoutChange = (currentLayout, allLayouts) => { setLayouts(allLayouts); saveLayout(allLayouts); };
+  const onLayoutChange = (currentLayout, allLayouts) => {
+    if (!editing) return; // Don't update state when locked
+    setLayouts(allLayouts);
+    saveLayout(allLayouts);
+  };
+
   const resetLayout = async () => {
     setLayouts({ lg: defaultLayout });
     try { await api(`/user/layout/${pageId}`, { method: 'PUT', body: JSON.stringify({ layout: { lg: defaultLayout } }) }); } catch {}
@@ -75,8 +80,8 @@ export default function DashboardGrid({ pageId, defaultLayout, children }) {
 export function Widget({ children, title, className = '' }) {
   return (
     <div className={`card-surface overflow-hidden h-full flex flex-col ${className}`}>
-      {title && <div className="widget-handle px-4 py-2.5 text-xs font-semibold text-ink-500 cursor-move border-b border-surface-200 select-none shrink-0 bg-surface-50">
-        {title}
+      {title && <div className="widget-handle px-4 py-2.5 text-xs font-semibold text-ink-500 border-b border-surface-200 select-none shrink-0 bg-surface-50">
+        {typeof title === 'string' ? title : title}
       </div>}
       <div className="flex-1 p-4 overflow-auto min-h-0">{children}</div>
     </div>

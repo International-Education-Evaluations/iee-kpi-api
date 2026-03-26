@@ -33,35 +33,35 @@ if (!BASE_URL || !TOKEN) {
 // ─── BENCHMARKS (XpH targets per level) ───────────────────────
 // From GAS v5.0 BENCHMARKS constant — confirmed values
 const BENCHMARKS = [
-  { team: 'Customer Support',    status: 'initial-review',                    xphUnit: 'Orders',      levels: { L0: null, L1: null, L2: 7,    L3: 7,    L4: null, L5: null } },
-  { team: 'Data Entry',          status: 'eval-prep-processing',              xphUnit: 'Credentials', levels: { L0: null, L1: 2.5,  L2: 2.8,  L3: 3,    L4: null, L5: null } },
-  { team: 'Digital Fulfillment', status: 'digital-fulfillment-processing',    xphUnit: 'Orders',      levels: { L0: null, L1: null, L2: 8,    L3: 9,    L4: null, L5: null } },
-  { team: 'Digital Records',     status: 'digital-records-processing',        xphUnit: 'Orders',      levels: { L0: null, L1: 5,    L2: 6,    L3: 7,    L4: null, L5: null } },
-  { team: 'Digital Records',     status: 'digital-records-review-processing', xphUnit: 'Orders',      levels: { L0: null, L1: 5,    L2: 6,    L3: 7,    L4: null, L5: null } },
-  { team: 'Document Management', status: 'document-processing',               xphUnit: 'Orders',      levels: { L0: null, L1: null, L2: 5,    L3: 6,    L4: null, L5: null } },
-  { team: 'Document Management', status: 'shipment-processing',               xphUnit: 'Orders',      levels: { L0: null, L1: null, L2: 7,    L3: 8.5,  L4: null, L5: null } },
-  { team: 'Document Management', status: 'verification-processing',           xphUnit: 'Orders',      levels: { L0: null, L1: null, L2: 6,    L3: 8,    L4: null, L5: null } },
-  { team: 'Evaluation',          status: 'senior-evaluation-review',          xphUnit: 'Reports',     levels: { L0: null, L1: null, L2: 3.32, L3: 3.32, L4: 3.62, L5: 4.6  } },
-  { team: 'Evaluation',          status: 'initial-evaluation',                xphUnit: 'Reports',     levels: { L0: 1.22, L1: 1.41, L2: 1.53, L3: 1.53, L4: null, L5: null } },
-  { team: 'Translations',        status: 'translation-prep',                  xphUnit: 'Orders',      levels: { L0: null, L1: 4,    L2: 4,    L3: null, L4: null, L5: null } },
-  { team: 'Translations',        status: 'translation-review',                xphUnit: 'Orders',      levels: { L0: null, L1: 3,    L2: 3,    L3: null, L4: null, L5: null } },
+  { team: 'Customer Support',    status: 'initial-review',                    xphUnit: 'Orders',      l0: null, l1: null, l2: 7,    l3: 7,    l4: null, l5: null },
+  { team: 'Data Entry',          status: 'eval-prep-processing',              xphUnit: 'Credentials', l0: null, l1: 2.5,  l2: 2.8,  l3: 3,    l4: null, l5: null },
+  { team: 'Digital Fulfillment', status: 'digital-fulfillment-processing',    xphUnit: 'Orders',      l0: null, l1: null, l2: 8,    l3: 9,    l4: null, l5: null },
+  { team: 'Digital Records',     status: 'digital-records-processing',        xphUnit: 'Orders',      l0: null, l1: 5,    l2: 6,    l3: 7,    l4: null, l5: null },
+  { team: 'Digital Records',     status: 'digital-records-review-processing', xphUnit: 'Orders',      l0: null, l1: 5,    l2: 6,    l3: 7,    l4: null, l5: null },
+  { team: 'Document Management', status: 'document-processing',               xphUnit: 'Orders',      l0: null, l1: null, l2: 5,    l3: 6,    l4: null, l5: null },
+  { team: 'Document Management', status: 'shipment-processing',               xphUnit: 'Orders',      l0: null, l1: null, l2: 7,    l3: 8.5,  l4: null, l5: null },
+  { team: 'Document Management', status: 'verification-processing',           xphUnit: 'Orders',      l0: null, l1: null, l2: 6,    l3: 8,    l4: null, l5: null },
+  { team: 'Evaluation',          status: 'senior-evaluation-review',          xphUnit: 'Reports',     l0: null, l1: null, l2: 3.32, l3: 3.32, l4: 3.62, l5: 4.6  },
+  { team: 'Evaluation',          status: 'initial-evaluation',                xphUnit: 'Reports',     l0: 1.22, l1: 1.41, l2: 1.53, l3: 1.53, l4: null, l5: null },
+  { team: 'Translations',        status: 'translation-prep',                  xphUnit: 'Orders',      l0: null, l1: 4,    l2: 4,    l3: null, l4: null, l5: null },
+  { team: 'Translations',        status: 'translation-review',                xphUnit: 'Orders',      l0: null, l1: 3,    l2: 3,    l3: null, l4: null, l5: null },
 ];
 
 // ─── PRODUCTION HOURS (net hours per day per level) ───────────
 // From GAS v5.0 PRODUCTION_HOURS_DATA constant
 const PRODUCTION_HOURS = [
-  { team: 'Customer Support',    status: 'initial-review',                    levels: { L0: null, L1: null, L2: 1.5,  L3: 1.5,  L4: null, L5: null } },
-  { team: 'Data Entry',          status: 'eval-prep-processing',              levels: { L0: null, L1: null, L2: 8.5,  L3: 8.5,  L4: null, L5: null } },
-  { team: 'Digital Fulfillment', status: 'digital-fulfillment-processing',    levels: { L0: null, L1: null, L2: 6.5,  L3: 6.5,  L4: null, L5: null } },
-  { team: 'Digital Records',     status: 'digital-records-processing',        levels: { L0: null, L1: 6,    L2: 5,    L3: 5,    L4: null, L5: null } },
-  { team: 'Digital Records',     status: 'digital-records-review-processing', levels: { L0: null, L1: 6,    L2: 5,    L3: 5,    L4: null, L5: null } },
-  { team: 'Document Management', status: 'document-processing',               levels: { L0: null, L1: null, L2: 5,    L3: 5,    L4: null, L5: null } },
-  { team: 'Document Management', status: 'shipment-processing',               levels: { L0: null, L1: null, L2: 5,    L3: 5,    L4: null, L5: null } },
-  { team: 'Document Management', status: 'verification-processing',           levels: { L0: null, L1: null, L2: 5,    L3: 5,    L4: null, L5: null } },
-  { team: 'Evaluation',          status: 'senior-evaluation-review',          levels: { L0: null, L1: null, L2: 5.7,  L3: 5.7,  L4: 5.7,  L5: 5.7  } },
-  { team: 'Evaluation',          status: 'initial-evaluation',                levels: { L0: 6.4,  L1: 6.4,  L2: 6.4,  L3: 6.4,  L4: null, L5: null } },
-  { team: 'Translations',        status: 'translation-prep',                  levels: { L0: null, L1: 5,    L2: 5,    L3: null, L4: null, L5: null } },
-  { team: 'Translations',        status: 'translation-review',                levels: { L0: null, L1: null, L2: null, L3: null, L4: null, L5: null } },
+  { team: 'Customer Support',    status: 'initial-review',                    l0: null, l1: null, l2: 1.5,  l3: 1.5,  l4: null, l5: null },
+  { team: 'Data Entry',          status: 'eval-prep-processing',              l0: null, l1: null, l2: 8.5,  l3: 8.5,  l4: null, l5: null },
+  { team: 'Digital Fulfillment', status: 'digital-fulfillment-processing',    l0: null, l1: null, l2: 6.5,  l3: 6.5,  l4: null, l5: null },
+  { team: 'Digital Records',     status: 'digital-records-processing',        l0: null, l1: 6,    l2: 5,    l3: 5,    l4: null, l5: null },
+  { team: 'Digital Records',     status: 'digital-records-review-processing', l0: null, l1: 6,    l2: 5,    l3: 5,    l4: null, l5: null },
+  { team: 'Document Management', status: 'document-processing',               l0: null, l1: null, l2: 5,    l3: 5,    l4: null, l5: null },
+  { team: 'Document Management', status: 'shipment-processing',               l0: null, l1: null, l2: 5,    l3: 5,    l4: null, l5: null },
+  { team: 'Document Management', status: 'verification-processing',           l0: null, l1: null, l2: 5,    l3: 5,    l4: null, l5: null },
+  { team: 'Evaluation',          status: 'senior-evaluation-review',          l0: null, l1: null, l2: 5.7,  l3: 5.7,  l4: 5.7,  l5: 5.7  },
+  { team: 'Evaluation',          status: 'initial-evaluation',                l0: 6.4,  l1: 6.4,  l2: 6.4,  l3: 6.4,  l4: null, l5: null },
+  { team: 'Translations',        status: 'translation-prep',                  l0: null, l1: 5,    l2: 5,    l3: null, l4: null, l5: null },
+  { team: 'Translations',        status: 'translation-review',                l0: null, l1: null, l2: null, l3: null, l4: null, l5: null },
 ];
 
 // ─── USER LEVELS (V1 ID → Level) ─────────────────────────────

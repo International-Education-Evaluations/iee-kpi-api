@@ -1,6 +1,7 @@
 import React from 'react';
 import { BrowserRouter, Routes, Route, Navigate, Outlet } from 'react-router-dom';
 import { isAuth, isAdmin, isManagerPlus } from './hooks/useApi';
+import { DataProvider } from './hooks/useData';
 import Sidebar from './components/Sidebar';
 import LoginPage from './pages/LoginPage';
 import InvitePage from './pages/InvitePage';
@@ -20,10 +21,12 @@ import BackfillPage from './pages/BackfillPage';
 function AuthGuard() {
   if (!isAuth()) return <Navigate to="/login" replace />;
   return (
-    <div className="flex min-h-screen bg-surface-100">
-      <Sidebar />
-      <main className="ml-56 flex-1 p-6 overflow-auto min-h-screen"><Outlet /></main>
-    </div>
+    <DataProvider>
+      <div className="flex min-h-screen bg-surface-100">
+        <Sidebar />
+        <main className="ml-56 flex-1 p-6 overflow-auto min-h-screen"><Outlet /></main>
+      </div>
+    </DataProvider>
   );
 }
 function AdminGuard() { if (!isAdmin()) return <Navigate to="/" replace />; return <Outlet />; }

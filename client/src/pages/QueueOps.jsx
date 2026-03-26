@@ -2,7 +2,7 @@ import React, { useEffect, useState, useMemo } from 'react';
 import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer } from 'recharts';
 import { Card, Table, Section, Pills, Skel, FilterBar, FilterSelect, fmt, fmtI } from '../components/UI';
 import DashboardGrid, { Widget } from '../components/DashboardGrid';
-import { api } from '../hooks/useApi';
+import { useData } from '../hooks/useData';
 const TT={contentStyle:{background:'#ffffff',border:'1px solid #e2e8f0',borderRadius:8,color:'#0f172a',fontSize:12,boxShadow:'0 4px 12px rgba(0,0,0,0.08)'}};
 
 const DEFAULT_LAYOUT = [
@@ -13,14 +13,11 @@ const DEFAULT_LAYOUT = [
 ];
 
 export default function QueueOps() {
-  const [snap, setSnap] = useState(null);
-  const [wait, setWait] = useState(null);
-  const [loading, setLoading] = useState(true);
+  const { queueSnap: snap, queueWait: wait, queueLoading: loading, loadQueue, forceRefreshQueue } = useData();
   const [view, setView] = useState('snapshot');
   const [fWait, setFWait] = useState('');
 
-  useEffect(()=>{load();},[]);
-  async function load(){setLoading(true);try{const[s,w]=await Promise.all([api('/queue-snapshot'),api('/queue-wait-summary?days=450')]);setSnap(s);setWait(w);}catch(e){console.error(e);}setLoading(false);}
+  useEffect(() => { loadQueue(); }, [loadQueue]);
 
   const sm=useMemo(()=>{if(!snap) return null;const w=(snap.snapshot||[]).filter(s=>s.isWaitingStatus);return{active:snap.totalActiveOrders||0,waiting:snap.waitingOrders||0,proc:snap.processingOrders||0,o24:w.reduce((a,s)=>a+(s.over24h||0),0),o72:w.reduce((a,s)=>a+(s.over72h||0),0),today:(snap.snapshot||[]).reduce((a,s)=>a+(s.enteredToday||0),0)};},[snap]);
 
@@ -29,15 +26,21 @@ export default function QueueOps() {
 
   const aging=useMemo(()=>snapRows.filter(s=>s.isWaitingStatus).slice(0,10).map(s=>({status:s.statusName?.replace('Awaiting ','Aw. ')||'',lt24:s.orderCount-(s.over24h||0),'24-48':(s.over24h||0)-(s.over48h||0),'48-72':(s.over48h||0)-(s.over72h||0),gt72:s.over72h||0})),[snapRows]);
 
+  const refreshLabel = snap?._backfilledAt
+    ? `Last: ${new Date(snap._backfilledAt).toLocaleTimeString()} (cached)`
+    : snap?.refreshedAt
+      ? `Last: ${new Date(snap.refreshedAt).toLocaleTimeString()} (live)`
+      : '';
+
   return (
     <div className="space-y-3">
-      <div><h1 className="text-xl font-display font-bold text-ink-900">Queue Operations</h1><p className="text-xs text-ink-400 mt-0.5">Live queue snapshot + historical wait analysis</p></div>
+      <div><h1 className="text-xl font-display font-bold text-ink-900">Queue Operations</h1><p className="text-xs text-ink-400 mt-0.5">Queue snapshot updates every 5 min via backfill · {refreshLabel}</p></div>
 
       <DashboardGrid pageId="queue-ops" defaultLayout={DEFAULT_LAYOUT}>
         <div key="header">
           <div className="flex items-center justify-between h-full">
             <Pills tabs={[{key:'snapshot',label:'Live Snapshot'},{key:'history',label:'Wait Summary (2024+)'}]} active={view} onChange={setView} />
-            <button onClick={load} className="text-xs text-brand-600 hover:text-brand-700 font-semibold">↻ Refresh</button>
+            <button onClick={forceRefreshQueue} className="text-xs text-brand-600 hover:text-brand-700 font-semibold">↻ Force Live Refresh</button>
           </div>
         </div>
 
@@ -69,9 +72,31 @@ export default function QueueOps() {
         <div key="table">
           <Widget title={view === 'snapshot' ? 'All Active Statuses' : 'Wait Summary by Status'}>
             {view==='snapshot' ?
-              <Table cols={[{key:'statusName',label:'Status',w:200},{key:'orderCount',label:'Orders',right:true,render:v=>fmtI(v)},{key:'evaluationCount',label:'Eval',right:true,render:v=>fmtI(v)},{key:'translationCount',label:'Trans',right:true,render:v=>fmtI(v)},{key:'medianWaitHours',label:'Median hr',right:true,render:v=>fmt(v)},{key:'over24h',label:'>24h',right:true,render:v=><span className={v>0?'text-amber-600 font-semibold':''}>{fmtI(v)}</span>},{key:'over48h',label:'>48h',right:true,render:v=><span className={v>0?'text-orange-600 font-semibold':''}>{fmtI(v)}</span>},{key:'over72h',label:'>72h',right:true,render:v=><span className={v>0?'text-red-600 font-bold':''}>{fmtI(v)}</span>},{key:'enteredToday',label:'Today',right:true,render:v=>fmtI(v)}]} rows={snapRows} />
+              <Table cols={[
+                {key:'statusName',label:'Status',w:200},
+                {key:'statusType',label:'Type',w:100,render:v=><span className={`badge ${v==='Processing'?'badge-info':v==='Holding'||v==='Waiting'?'badge-warning':'badge-neutral'}`}>{v}</span>},
+                {key:'orderCount',label:'Orders',right:true,render:v=>fmtI(v)},
+                {key:'evaluationCount',label:'Eval',right:true,render:v=>fmtI(v)},
+                {key:'translationCount',label:'Trans',right:true,render:v=>fmtI(v)},
+                {key:'medianWaitHours',label:'Median hr',right:true,render:v=>fmt(v)},
+                {key:'over24h',label:'>24h',right:true,render:v=><span className={v>0?'text-amber-600 font-semibold':''}>{fmtI(v)}</span>},
+                {key:'over48h',label:'>48h',right:true,render:v=><span className={v>0?'text-orange-600 font-semibold':''}>{fmtI(v)}</span>},
+                {key:'over72h',label:'>72h',right:true,render:v=><span className={v>0?'text-red-600 font-bold':''}>{fmtI(v)}</span>},
+                {key:'enteredToday',label:'Today',right:true,render:v=>fmtI(v)}
+              ]} rows={snapRows} />
             :
-              <Table cols={[{key:'statusName',label:'Status',w:200},{key:'totalVolume',label:'Volume',right:true,render:v=>fmtI(v)},{key:'completedCount',label:'Done',right:true,render:v=>fmtI(v)},{key:'openCount',label:'Open',right:true,render:v=>fmtI(v)},{key:'medianWaitHours',label:'Median hr',right:true,render:v=>fmt(v)},{key:'avgWaitHours',label:'Avg hr',right:true,render:v=>fmt(v)},{key:'p75WaitHours',label:'P75',right:true,render:v=>fmt(v)},{key:'p90WaitHours',label:'P90',right:true,render:v=>fmt(v)},{key:'over24h',label:'>24h',right:true,render:v=><span className={v>0?'text-amber-600':''}>{fmtI(v)}</span>},{key:'over72h',label:'>72h',right:true,render:v=><span className={v>0?'text-red-600 font-bold':''}>{fmtI(v)}</span>}]} rows={waitRows} />
+              <Table cols={[
+                {key:'statusName',label:'Status',w:200},
+                {key:'totalVolume',label:'Volume',right:true,render:v=>fmtI(v)},
+                {key:'completedCount',label:'Done',right:true,render:v=>fmtI(v)},
+                {key:'openCount',label:'Open',right:true,render:v=>fmtI(v)},
+                {key:'medianWaitHours',label:'Median hr',right:true,render:v=>fmt(v)},
+                {key:'avgWaitHours',label:'Avg hr',right:true,render:v=>fmt(v)},
+                {key:'p75WaitHours',label:'P75',right:true,render:v=>fmt(v)},
+                {key:'p90WaitHours',label:'P90',right:true,render:v=>fmt(v)},
+                {key:'over24h',label:'>24h',right:true,render:v=><span className={v>0?'text-amber-600':''}>{fmtI(v)}</span>},
+                {key:'over72h',label:'>72h',right:true,render:v=><span className={v>0?'text-red-600 font-bold':''}>{fmtI(v)}</span>}
+              ]} rows={waitRows} />
             }
           </Widget>
         </div>

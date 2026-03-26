@@ -2,7 +2,7 @@ import React, { useEffect, useState, useMemo } from 'react';
 import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, PieChart, Pie, Cell } from 'recharts';
 import { Card, Table, Section, Pills, FilterBar, FilterSelect, FilterReset, Skel, fmt, fmtI, fmtP } from '../components/UI';
 import DashboardGrid, { Widget } from '../components/DashboardGrid';
-import { api } from '../hooks/useApi';
+import { useData } from '../hooks/useData';
 const TT={contentStyle:{background:'#ffffff',border:'1px solid #e2e8f0',borderRadius:8,color:'#0f172a',fontSize:12,boxShadow:'0 4px 12px rgba(0,0,0,0.08)'}};
 const COLORS=['#00aeef','#16a34a','#d97706','#ea580c','#9333ea','#0891b2','#dc2626'];
 
@@ -12,23 +12,23 @@ const DEFAULT_LAYOUT = [
   { i: 'byDept', x: 0, y: 3, w: 6, h: 5, minW: 4, minH: 3 },
   { i: 'pie', x: 6, y: 3, w: 6, h: 5, minW: 4, minH: 3 },
   { i: 'breakdown', x: 0, y: 8, w: 12, h: 7, minW: 6, minH: 4 },
+  { i: 'eventLog', x: 0, y: 15, w: 12, h: 8, minW: 8, minH: 5 },
 ];
 
 export default function QCOverview() {
-  const [events, setEvents] = useState([]);
-  const [loading, setLoading] = useState(true);
+  const { qcEvents: events, qcLoading: loading, loadQc } = useData();
   const [view, setView] = useState('dept');
   const [fDept, setFDept] = useState('');
   const [fType, setFType] = useState('');
   const [fErr, setFErr] = useState('');
 
-  useEffect(() => { load(); }, []);
-  async function load() { setLoading(true); try { const d=await api('/data/qc-events?days=60&includeHtml=false&includeText=false'); setEvents(d.events||[]); } catch(e){console.error(e);} setLoading(false); }
+  useEffect(() => { loadQc(); }, [loadQc]);
 
   const filtered = useMemo(()=>events.filter(e=>{
     if(fDept&&e.departmentName!==fDept) return false;
     if(fType&&e.orderType!==fType) return false;
-    if(fErr&&e.errorType!==fErr) return false;
+    if(fErr==='i_fixed_it'&&!e.isFixedIt) return false;
+    if(fErr==='kick_it_back'&&!e.isKickItBack) return false;
     return true;
   }),[events,fDept,fType,fErr]);
 
@@ -44,11 +44,20 @@ export default function QCOverview() {
 
   const byUser=useMemo(()=>{const d={};filtered.forEach(e=>{const k=(e.accountableName||'').trim()||'(unattr)';const dept=e.departmentName||'';const key=k+'||'+dept;if(!d[key])d[key]={user:k,dept,total:0,fi:0,kb:0,issues:new Set()};d[key].total++;if(e.isFixedIt)d[key].fi++;if(e.isKickItBack)d[key].kb++;if(e.issueName)d[key].issues.add(e.issueName);});return Object.values(d).map(d=>({...d,issues:d.issues.size})).sort((a,b)=>b.total-a.total).slice(0,30);},[filtered]);
 
+  // Event log — most recent first, limited to 200
+  const eventLog = useMemo(() => {
+    return filtered.slice().sort((a,b) => (b.qcCreatedAt||'').localeCompare(a.qcCreatedAt||'')).slice(0, 200).map(e => ({
+      ...e,
+      date: e.qcCreatedAt ? new Date(e.qcCreatedAt).toLocaleDateString() : '—',
+      outcome: e.isFixedIt ? 'Fixed It' : e.isKickItBack ? 'Kick Back' : '—',
+    }));
+  }, [filtered]);
+
   const clearF=()=>{setFDept('');setFType('');setFErr('');};
 
   return (
     <div className="space-y-3">
-      <div><h1 className="text-xl font-display font-bold text-ink-900">QC Overview</h1><p className="text-xs text-ink-400 mt-0.5">Quality control events · Last 60 days</p></div>
+      <div><h1 className="text-xl font-display font-bold text-ink-900">QC Overview</h1><p className="text-xs text-ink-400 mt-0.5">Quality control events · Last 60 days · {events.length} total events</p></div>
 
       <DashboardGrid pageId="qc-overview" defaultLayout={DEFAULT_LAYOUT}>
         <div key="filters">
@@ -88,12 +97,27 @@ export default function QCOverview() {
 
         <div key="breakdown">
           <Widget title={<div className="flex items-center justify-between w-full">
-            <span>Detail Breakdown</span>
+            <span>Summary Breakdown</span>
             <Pills tabs={[{key:'dept',label:'Department'},{key:'issue',label:'Issue'},{key:'user',label:'User'}]} active={view} onChange={setView} />
           </div>}>
             {view==='dept'&&<Table cols={[{key:'dept',label:'Department',w:160},{key:'total',label:'Events',right:true,render:v=>fmtI(v)},{key:'fi',label:'Fixed',right:true,render:v=>fmtI(v)},{key:'kb',label:'Kick Back',right:true,render:(v)=><span className={v>0?'text-red-600':''}>{fmtI(v)}</span>},{key:'fiP',label:'% Fixed',right:true,render:v=>fmtP(v)},{key:'orders',label:'Orders',right:true,render:v=>fmtI(v)},{key:'users',label:'Users',right:true,render:v=>fmtI(v)}]} rows={byDept} />}
             {view==='issue'&&<Table cols={[{key:'issue',label:'Issue',w:250},{key:'total',label:'Events',right:true,render:v=>fmtI(v)},{key:'fi',label:'Fixed',right:true,render:v=>fmtI(v)},{key:'kb',label:'Kick Back',right:true,render:(v)=><span className={v>0?'text-red-600':''}>{fmtI(v)}</span>}]} rows={byIssue} />}
             {view==='user'&&<Table cols={[{key:'user',label:'User',w:180},{key:'dept',label:'Dept',w:140},{key:'total',label:'Errors',right:true,render:v=>fmtI(v)},{key:'fi',label:'Fixed',right:true,render:v=>fmtI(v)},{key:'kb',label:'Kick Back',right:true,render:(v)=><span className={v>0?'text-red-600':''}>{fmtI(v)}</span>},{key:'issues',label:'Issue Types',right:true,render:v=>fmtI(v)}]} rows={byUser} />}
+          </Widget>
+        </div>
+
+        <div key="eventLog">
+          <Widget title={`QC Event Log — ${eventLog.length} most recent`}>
+            <Table cols={[
+              {key:'date',label:'Date',w:90},
+              {key:'orderSerialNumber',label:'Order',w:120,render:v=>v?<a href={`https://admin.prod.iee.com/orders/${v}?tab=discussion`} target="_blank" rel="noopener" className="text-brand-600 hover:underline font-mono text-[11px]">{v}</a>:'—'},
+              {key:'outcome',label:'Outcome',w:100,render:v=><span className={`badge ${v==='Fixed It'?'badge-success':v==='Kick Back'?'badge-danger':'badge-neutral'}`}>{v}</span>},
+              {key:'accountableName',label:'Accountable',w:150},
+              {key:'departmentName',label:'Department',w:140},
+              {key:'issueName',label:'Issue',w:200},
+              {key:'reporterName',label:'Reporter',w:140},
+              {key:'orderType',label:'Type',w:80,render:v=><span className="capitalize">{v||'—'}</span>},
+            ]} rows={eventLog} />
           </Widget>
         </div>
       </DashboardGrid>

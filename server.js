@@ -572,7 +572,7 @@ app.get('/health', async (req, res) => {
   try {
     const db = await getDb('orders');
     await db.command({ ping: 1 });
-    res.json({ status: 'ok', timestamp: new Date().toISOString(), env: CONFIG.NODE_ENV, version: '5.1' });
+    res.json({ status: 'ok', timestamp: new Date().toISOString(), env: CONFIG.NODE_ENV, version: '5.3' });
   } catch (err) {
     res.status(500).json({ status: 'error', message: err.message });
   }
@@ -3254,28 +3254,48 @@ async function runBackfill(options = {}) {
         }).toArray();
 
         totalQcRaw += batchQc.length;
-        const batchQcOps = batchQc.map(doc => ({
-          updateOne: {
-            filter: { _qcKey: String(doc._id) },
-            update: { $set: {
-              _qcKey: String(doc._id),
-              orderId: doc.order ? String(doc.order) : null,
-              reporterName: doc.user ? [doc.user.firstName, doc.user.lastName].filter(Boolean).join(' ') : null,
-              reporterEmail: doc.user?.email || null,
-              departmentName: doc.department?.name || null,
-              departmentShortName: doc.department?.shortName || null,
-              issueName: doc.issue?.name || null,
-              errorType: doc.errorType || null,
-              errorAssignedToName: doc.errorAssignedTo ? [doc.errorAssignedTo.firstName, doc.errorAssignedTo.lastName].filter(Boolean).join(' ') : null,
-              errorAssignedToEmail: doc.errorAssignedTo?.email || null,
-              categoryName: doc.category?.name || null,
-              text: doc.text || null,
-              qcCreatedAt: doc.createdAt ? toIso(toDate(doc.createdAt)) : null,
-              _backfilledAt: new Date()
-            }},
-            upsert: true
-          }
-        }));
+        // Build order lookup for serial numbers and order types
+        const qcOrderIds = [...new Set(batchQc.map(d => d.order).filter(Boolean))];
+        const qcOrderMap = {};
+        if (qcOrderIds.length > 0) {
+          const qcOrders = await prodDb.collection('orders').find(
+            { _id: { $in: qcOrderIds.map(id => typeof id === 'string' ? new ObjectId(id) : id) } },
+            { projection: { orderSerialNumber: 1, orderType: 1 } }
+          ).toArray();
+          for (const o of qcOrders) qcOrderMap[String(o._id)] = o;
+        }
+
+        const batchQcOps = batchQc.map(doc => {
+          const oid = doc.order ? String(doc.order) : null;
+          const ord = oid ? qcOrderMap[oid] : null;
+          return {
+            updateOne: {
+              filter: { _qcKey: String(doc._id) },
+              update: { $set: {
+                _qcKey: String(doc._id),
+                orderId: oid,
+                orderSerialNumber: ord?.orderSerialNumber || null,
+                orderType: ord?.orderType || null,
+                reporterName: doc.user ? [doc.user.firstName, doc.user.lastName].filter(Boolean).join(' ') : null,
+                reporterEmail: doc.user?.email || null,
+                departmentName: doc.department?.name || null,
+                departmentShortName: doc.department?.shortName || null,
+                issueName: doc.issue?.name || null,
+                issueCustomText: doc.issue?.customText || doc.issue?.issueCustomText || null,
+                errorType: doc.errorType || null,
+                isFixedIt: doc.errorType === 'i_fixed_it',
+                isKickItBack: doc.errorType === 'kick_it_back',
+                accountableName: doc.errorAssignedTo ? [doc.errorAssignedTo.firstName, doc.errorAssignedTo.lastName].filter(Boolean).join(' ') : null,
+                accountableEmail: doc.errorAssignedTo?.email || null,
+                categoryName: doc.category?.name || null,
+                text: doc.text || null,
+                qcCreatedAt: doc.createdAt ? toIso(toDate(doc.createdAt)) : null,
+                _backfilledAt: new Date()
+              }},
+              upsert: true
+            }
+          };
+        });
 
         if (batchQcOps.length > 0) {
           for (let i = 0; i < batchQcOps.length; i += 2000) {
@@ -3487,22 +3507,40 @@ async function runBackfill(options = {}) {
 
     push(`Fetched ${qcRaw.length} QC events from production`);
 
+    // Build order lookup for serial numbers and order types
+    const qcOrderIds = [...new Set(qcRaw.map(d => d.order).filter(Boolean))];
+    const qcOrderMap = {};
+    if (qcOrderIds.length > 0) {
+      const qcOrders = await prodDb.collection('orders').find(
+        { _id: { $in: qcOrderIds.map(id => typeof id === 'string' ? new ObjectId(id) : id) } },
+        { projection: { orderSerialNumber: 1, orderType: 1 } }
+      ).toArray();
+      for (const o of qcOrders) qcOrderMap[String(o._id)] = o;
+    }
+
     const qcOps = qcRaw.map(doc => {
-      const qcKey = String(doc._id); // MongoDB _id is the natural unique key
+      const qcKey = String(doc._id);
+      const oid = doc.order ? String(doc.order) : null;
+      const ord = oid ? qcOrderMap[oid] : null;
       return {
         updateOne: {
           filter: { _qcKey: qcKey },
           update: { $set: {
             _qcKey: qcKey,
-            orderId: doc.order ? String(doc.order) : null,
+            orderId: oid,
+            orderSerialNumber: ord?.orderSerialNumber || null,
+            orderType: ord?.orderType || null,
             reporterName: doc.user ? [doc.user.firstName, doc.user.lastName].filter(Boolean).join(' ') : null,
             reporterEmail: doc.user?.email || null,
             departmentName: doc.department?.name || null,
             departmentShortName: doc.department?.shortName || null,
             issueName: doc.issue?.name || null,
+            issueCustomText: doc.issue?.customText || doc.issue?.issueCustomText || null,
             errorType: doc.errorType || null,
-            errorAssignedToName: doc.errorAssignedTo ? [doc.errorAssignedTo.firstName, doc.errorAssignedTo.lastName].filter(Boolean).join(' ') : null,
-            errorAssignedToEmail: doc.errorAssignedTo?.email || null,
+            isFixedIt: doc.errorType === 'i_fixed_it',
+            isKickItBack: doc.errorType === 'kick_it_back',
+            accountableName: doc.errorAssignedTo ? [doc.errorAssignedTo.firstName, doc.errorAssignedTo.lastName].filter(Boolean).join(' ') : null,
+            accountableEmail: doc.errorAssignedTo?.email || null,
             categoryName: doc.category?.name || null,
             text: doc.text || null,
             qcCreatedAt: doc.createdAt ? toIso(toDate(doc.createdAt)) : null,
@@ -3558,7 +3596,24 @@ async function runBackfill(options = {}) {
     await qcCol.createIndex({ qcCreatedAt: -1 }).catch(() => {});
 
     // ═════════════════════════════════════════════════════════
-    // 3. USERS (always full replace — small dataset, can change)
+    // 3. QUEUE SNAPSHOT (always fresh — captures current state)
+    // ═════════════════════════════════════════════════════════
+
+    push('Capturing queue snapshot...');
+    try {
+      const snapResult = await internalFetch('/queue-snapshot');
+      await configDb.collection('backfill_queue_snapshot').updateOne(
+        { _id: 'current' },
+        { $set: { ...snapResult, _backfilledAt: new Date() } },
+        { upsert: true }
+      );
+      push(`Queue snapshot: ${snapResult.totalActiveOrders || 0} active orders, ${snapResult.statusCount || 0} statuses`);
+    } catch (qErr) {
+      push(`Queue snapshot: SKIPPED (${qErr.message})`);
+    }
+
+    // ═════════════════════════════════════════════════════════
+    // 4. USERS (always full replace — small dataset, can change)
     // ═════════════════════════════════════════════════════════
 
     push('Fetching users...');
@@ -3835,6 +3890,26 @@ app.get('/data/users', async (req, res) => {
     const db = await getConfigDb();
     const users = await db.collection('backfill_users').find({}).sort({ fullName: 1 }).toArray();
     res.json({ count: users.length, source: 'backfill', users });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// —— GET /data/queue-snapshot — Fast read from backfill ——
+// Returns the cached queue snapshot from the last backfill run.
+// Falls back to live /queue-snapshot if no cached data exists.
+app.get('/data/queue-snapshot', async (req, res) => {
+  try {
+    const db = await getConfigDb();
+    const cached = await db.collection('backfill_queue_snapshot').findOne({ _id: 'current' });
+    if (cached) {
+      delete cached._id;
+      res.json({ ...cached, source: 'backfill' });
+    } else {
+      // No cache yet — fall back to live (first-time scenario)
+      const live = await internalFetch('/queue-snapshot');
+      res.json({ ...live, source: 'live-fallback' });
+    }
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
