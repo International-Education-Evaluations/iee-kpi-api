@@ -1903,37 +1903,62 @@ app.post('/auth/users', requireRole('admin'), async (req, res) => {
       req.user?.name);
 
     // Send invite email if requested and SendGrid is configured
-    if (sendInvite && CONFIG.SENDGRID_API_KEY && CONFIG.SENDGRID_INVITE_TEMPLATE_ID) {
-      try {
-        const sgMail = require('@sendgrid/mail');
-        sgMail.setApiKey(CONFIG.SENDGRID_API_KEY);
+    let inviteEmailStatus = null;
+    if (sendInvite) {
+      if (!CONFIG.SENDGRID_API_KEY) {
+        inviteEmailStatus = { sent: false, reason: 'SENDGRID_API_KEY not configured' };
+        console.error('[INVITE] Cannot send invite — SENDGRID_API_KEY missing');
+      } else if (!CONFIG.SENDGRID_INVITE_TEMPLATE_ID) {
+        inviteEmailStatus = { sent: false, reason: 'SENDGRID_INVITE_TEMPLATE_ID not configured' };
+        console.error('[INVITE] Cannot send invite — SENDGRID_INVITE_TEMPLATE_ID missing');
+      } else {
+        try {
+          const dashboardUrl = req.headers.origin || `https://${req.headers.host}`;
+          const inviteUrl = `${dashboardUrl}/invite?token=${inviteToken}`;
 
-        const dashboardUrl = req.headers.origin || `https://${req.headers.host}`;
-        const inviteUrl = `${dashboardUrl}/invite?token=${inviteToken}`;
+          const sgRes = await fetch('https://api.sendgrid.com/v3/mail/send', {
+            method: 'POST',
+            headers: {
+              'Authorization': `Bearer ${CONFIG.SENDGRID_API_KEY}`,
+              'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({
+              personalizations: [{
+                to: [{ email: user.email }],
+                dynamic_template_data: {
+                  recipient_name: user.name.split(' ')[0],
+                  sender_name: req.user?.name || 'Operations',
+                  role: user.role,
+                  invite_url: inviteUrl,
+                  expires_in: '7 days',
+                  dashboard_url: dashboardUrl
+                }
+              }],
+              from: { email: CONFIG.SENDGRID_FROM_EMAIL, name: 'IEE Ops Dashboard' },
+              template_id: CONFIG.SENDGRID_INVITE_TEMPLATE_ID
+            })
+          });
 
-        await sgMail.send({
-          to: user.email,
-          from: CONFIG.SENDGRID_FROM_EMAIL,
-          templateId: CONFIG.SENDGRID_INVITE_TEMPLATE_ID,
-          dynamicTemplateData: {
-            recipient_name: user.name.split(' ')[0],
-            sender_name: req.user?.name || 'Operations',
-            role: user.role,
-            invite_url: inviteUrl,
-            expires_in: '7 days',
-            dashboard_url: dashboardUrl
+          if (!sgRes.ok) {
+            const errBody = await sgRes.text();
+            inviteEmailStatus = { sent: false, reason: `SendGrid ${sgRes.status}: ${errBody}` };
+            console.error(`[INVITE] SendGrid error for ${user.email}:`, sgRes.status, errBody);
+          } else {
+            inviteEmailStatus = { sent: true };
+            console.log(`[INVITE] Sent invite email to ${user.email}`);
           }
-        });
-        console.log(`[INVITE] Sent invite email to ${user.email}`);
-      } catch (emailErr) {
-        console.error(`[INVITE] Failed to send invite email:`, emailErr.message);
-        // Don't fail the request — user is created, email just didn't send
+        } catch (emailErr) {
+          inviteEmailStatus = { sent: false, reason: emailErr.message };
+          console.error(`[INVITE] Failed to send invite email:`, emailErr.message);
+          // Don't fail the request — user is created, email just didn't send
+        }
       }
     }
 
     res.json({
       success: true,
       invited: !!sendInvite,
+      inviteEmail: inviteEmailStatus,
       user: { id: result.insertedId, email: user.email, name: user.name, role: user.role, apiKey, isPending: user.isPending }
     });
   } catch (err) {
@@ -2005,27 +2030,53 @@ app.post('/auth/resend-invite', requireRole('admin'), async (req, res) => {
       { $set: { inviteToken, inviteExpiresAt, updatedAt: new Date() } }
     );
 
-    if (CONFIG.SENDGRID_API_KEY && CONFIG.SENDGRID_INVITE_TEMPLATE_ID) {
-      const sgMail = require('@sendgrid/mail');
-      sgMail.setApiKey(CONFIG.SENDGRID_API_KEY);
+    if (!CONFIG.SENDGRID_API_KEY || !CONFIG.SENDGRID_INVITE_TEMPLATE_ID) {
+      const reason = !CONFIG.SENDGRID_API_KEY ? 'SENDGRID_API_KEY not configured' : 'SENDGRID_INVITE_TEMPLATE_ID not configured';
+      console.error(`[INVITE] Cannot resend invite to ${user.email} — ${reason}`);
+      await auditLog('resend_invite', 'dashboard_users', { email: user.email }, req.user?.name);
+      return res.json({ success: true, inviteEmail: { sent: false, reason } });
+    }
+
+    try {
       const dashboardUrl = req.headers.origin || `https://${req.headers.host}`;
-      await sgMail.send({
-        to: user.email,
-        from: CONFIG.SENDGRID_FROM_EMAIL,
-        templateId: CONFIG.SENDGRID_INVITE_TEMPLATE_ID,
-        dynamicTemplateData: {
-          recipient_name: user.name.split(' ')[0],
-          sender_name: req.user?.name || 'Operations',
-          role: user.role,
-          invite_url: `${dashboardUrl}/invite?token=${inviteToken}`,
-          expires_in: '7 days',
-          dashboard_url: dashboardUrl
-        }
+      const sgRes = await fetch('https://api.sendgrid.com/v3/mail/send', {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${CONFIG.SENDGRID_API_KEY}`,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          personalizations: [{
+            to: [{ email: user.email }],
+            dynamic_template_data: {
+              recipient_name: user.name.split(' ')[0],
+              sender_name: req.user?.name || 'Operations',
+              role: user.role,
+              invite_url: `${dashboardUrl}/invite?token=${inviteToken}`,
+              expires_in: '7 days',
+              dashboard_url: dashboardUrl
+            }
+          }],
+          from: { email: CONFIG.SENDGRID_FROM_EMAIL, name: 'IEE Ops Dashboard' },
+          template_id: CONFIG.SENDGRID_INVITE_TEMPLATE_ID
+        })
       });
+
+      if (!sgRes.ok) {
+        const errBody = await sgRes.text();
+        console.error(`[INVITE] SendGrid error on resend for ${user.email}:`, sgRes.status, errBody);
+        await auditLog('resend_invite', 'dashboard_users', { email: user.email }, req.user?.name);
+        return res.json({ success: true, inviteEmail: { sent: false, reason: `SendGrid ${sgRes.status}: ${errBody}` } });
+      }
+      console.log(`[INVITE] Resent invite email to ${user.email}`);
+    } catch (emailErr) {
+      console.error(`[INVITE] Failed to resend invite email:`, emailErr.message);
+      await auditLog('resend_invite', 'dashboard_users', { email: user.email }, req.user?.name);
+      return res.json({ success: true, inviteEmail: { sent: false, reason: emailErr.message } });
     }
 
     await auditLog('resend_invite', 'dashboard_users', { email: user.email }, req.user?.name);
-    res.json({ success: true });
+    res.json({ success: true, inviteEmail: { sent: true } });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -3135,6 +3186,89 @@ app.post('/email/send-now', requireRole('admin', 'manager'), async (req, res) =>
 // ═══════════════════════════════════════════════════════════
 
 let backfillRunning = false;
+let backfillLastRunEnd = 0; // epoch ms — anchors next-run calculation to run completion, not wall clock
+
+// ── User sync state — decoupled from main backfill cycle ──
+// Users change infrequently (HR ops, not order ops). Syncing 150k docs every
+// 2 minutes costs ~35s and 200MB RSS for zero benefit. Run independently.
+let userSyncRunning = false;
+let userSyncLastRunAt = 0; // epoch ms
+const USER_SYNC_INTERVAL_MS = 60 * 60 * 1000; // 60 minutes default
+
+async function runUserSync(configDb, push) {
+  if (userSyncRunning) {
+    push('User sync: skipped (already running)');
+    return { count: null, skipped: true };
+  }
+
+  const now = Date.now();
+  const timeSinceSync = now - userSyncLastRunAt;
+
+  // Skip if synced recently and this is an incremental run (not forced)
+  if (timeSinceSync < USER_SYNC_INTERVAL_MS && !push._forceUserSync) {
+    const minsAgo = Math.round(timeSinceSync / 60000);
+    push(`User sync: skipped (last synced ${minsAgo}m ago — next sync in ${Math.round((USER_SYNC_INTERVAL_MS - timeSinceSync) / 60000)}m)`);
+    return { count: null, skipped: true };
+  }
+
+  userSyncRunning = true;
+  try {
+    push('User sync: fetching from production...');
+    const userDb = await getDb('user');
+    const users = await userDb.collection('user').find(
+      { deletedAt: null },
+      { projection: { firstName: 1, middleName: 1, lastName: 1, email: 1, type: 1, active: 1, department: 1, v1Id: 1, legacyId: 1, foreignKeyId: 1 } }
+    ).toArray();
+
+    const userDocs = users.map(u => ({
+      v2Id: String(u._id),
+      v1Id: u.v1Id || u.legacyId || u.foreignKeyId || null,
+      fullName: [u.firstName, u.middleName, u.lastName].filter(Boolean).join(' ').trim(),
+      email: u.email, type: u.type, isActive: u.active !== false,
+      departmentName: u.department?.name || null,
+      departmentId: u.department?.legacyId || u.department?.foreignKeyId || null,
+      _backfilledAt: new Date()
+    }));
+
+    if (userDocs.length === 0) {
+      push('User sync: WARNING — 0 users returned from production, skipping write to avoid data loss');
+      userSyncRunning = false;
+      return { count: 0, skipped: true };
+    }
+
+    // ── Staging swap: write to temp collection, then rename atomically ──
+    // This eliminates the read gap from deleteMany → insertMany.
+    // backfill_users is never empty during the swap.
+    const stagingName = 'backfill_users_staging';
+    const stagingCol = configDb.collection(stagingName);
+
+    // Drop staging if leftover from a previous failed run
+    await stagingCol.drop().catch(() => {}); // ignore if not exists
+
+    // Write all docs to staging
+    await stagingCol.insertMany(userDocs, { ordered: false });
+
+    // Build indexes on staging before swap (cheaper than post-swap rebuild)
+    await stagingCol.createIndex({ email: 1 }).catch(() => {});
+    await stagingCol.createIndex({ v1Id: 1 }).catch(() => {});
+
+    // Atomic rename: staging → backfill_users
+    // dropTarget: true drops the existing backfill_users as part of the rename (single op)
+    await configDb.renameCollection(stagingName, 'backfill_users', { dropTarget: true });
+
+    userSyncLastRunAt = Date.now();
+    userSyncRunning = false;
+    push(`User sync: ${userDocs.length} users written via staging swap`);
+    return { count: userDocs.length, skipped: false };
+
+  } catch (err) {
+    userSyncRunning = false;
+    push(`User sync: ERROR — ${err.message}`);
+    // Drop staging on error to avoid stale data next run
+    await configDb.collection('backfill_users_staging').drop().catch(() => {});
+    return { count: null, skipped: true, error: err.message };
+  }
+}
 
 async function runBackfill(options = {}) {
   if (backfillRunning) return { error: 'Backfill already in progress' };
@@ -3420,7 +3554,15 @@ async function runBackfill(options = {}) {
 
     // 1b. Also fetch orders that have open segments in our backfill
     //     (they may have closed since last run, even if outside the 2hr buffer)
-    const openSegments = await segCol.find({ isOpen: true }, { projection: { orderId: 1 } }).toArray();
+    // Cap at 200 most-recent open segments to prevent unbounded growth of this query.
+    // Orders are sorted by segmentStart descending so stale/old open segments
+    // (likely data anomalies) are naturally deprioritized.
+    const OPEN_SEGMENT_RECHECK_LIMIT = 200;
+    const openSegments = await segCol
+      .find({ isOpen: true }, { projection: { orderId: 1, segmentStart: 1 } })
+      .sort({ segmentStart: -1 })
+      .limit(OPEN_SEGMENT_RECHECK_LIMIT)
+      .toArray();
     const openOrderIds = [...new Set(openSegments.map(s => s.orderId))];
     let openOrders = [];
     if (openOrderIds.length > 0 && !isFullRefresh) {
@@ -3657,32 +3799,14 @@ async function runBackfill(options = {}) {
     }
 
     // ═════════════════════════════════════════════════════════
-    // 4. USERS (always full replace — small dataset, can change)
+    // 4. USERS — decoupled sync (60-minute cadence, staging swap)
     // ═════════════════════════════════════════════════════════
-
-    push('Fetching users...');
-    const userDb = await getDb('user');
-    const users = await userDb.collection('user').find(
-      { deletedAt: null },
-      { projection: { firstName: 1, middleName: 1, lastName: 1, email: 1, type: 1, active: 1, department: 1, v1Id: 1, legacyId: 1, foreignKeyId: 1 } }
-    ).toArray();
-
-    const userDocs = users.map(u => ({
-      v2Id: String(u._id),
-      v1Id: u.v1Id || u.legacyId || u.foreignKeyId || null,
-      fullName: [u.firstName, u.middleName, u.lastName].filter(Boolean).join(' ').trim(),
-      email: u.email, type: u.type, isActive: u.active !== false,
-      departmentName: u.department?.name || null,
-      departmentId: u.department?.legacyId || u.department?.foreignKeyId || null,
-      _backfilledAt: new Date()
-    }));
-
-    await usrCol.deleteMany({});
-    if (userDocs.length > 0) await usrCol.insertMany(userDocs, { ordered: false });
-    await usrCol.createIndex({ email: 1 }).catch(() => {});
-    await usrCol.createIndex({ v1Id: 1 }).catch(() => {});
-
-    push(`Users: ${userDocs.length} (full replace)`);
+    // Users don't change at KPI frequency. Running a 150k-doc full replace
+    // every 2 minutes costs ~35s and spikes RSS by ~200MB for no benefit.
+    // Full refresh and forced user sync bypass the interval guard.
+    const _push = push;
+    _push._forceUserSync = isFullRefresh || !!options.forceUserSync;
+    const userSyncResult = await runUserSync(configDb, _push);
 
     // ═════════════════════════════════════════════════════════
     // 4. METADATA + HISTORY
@@ -3710,7 +3834,8 @@ async function runBackfill(options = {}) {
         qcProcessed: qcRawCount,
         qcNew: upsertedQc,
         qcTotal: totalQc,
-        users: userDocs.length,
+        users: userSyncResult.count ?? null,
+        userSyncSkipped: userSyncResult.skipped ?? false,
         openSegments: openCount
       },
       log
@@ -3728,11 +3853,13 @@ async function runBackfill(options = {}) {
 
     push(`Done in ${(elapsed/1000).toFixed(1)}s — ${upsertedSegs} new segs, ${updatedSegs} updated, ${upsertedQc} new QC, ${totalSegs} total`);
     backfillRunning = false;
+    backfillLastRunEnd = Date.now(); // anchor next-run window to completion, not wall clock
     return metadata;
 
   } catch (err) {
     push(`ERROR: ${err.message}`);
     backfillRunning = false;
+    backfillLastRunEnd = Date.now(); // record end even on error so scheduler doesn't tight-loop
     try {
       const configDb = await getConfigDb();
       await configDb.collection('backfill_metadata').updateOne(
@@ -3752,7 +3879,7 @@ async function runBackfill(options = {}) {
 //   {}                                 — incremental (only new since last run)
 app.post('/backfill/run', requireRole('admin'), async (req, res) => {
   try {
-    const { days, full, dateFrom, dateTo } = req.body;
+    const { days, full, dateFrom, dateTo, forceUserSync } = req.body;
     if (backfillRunning) return res.status(409).json({ error: 'Backfill already in progress' });
 
     const opts = {
@@ -3760,6 +3887,7 @@ app.post('/backfill/run', requireRole('admin'), async (req, res) => {
       full: !!full,
       dateFrom: dateFrom || null,
       dateTo: dateTo || null,
+      forceUserSync: !!forceUserSync, // bypass 60-min user sync interval for this run
       triggeredBy: req.user?.name || 'admin'
     };
 
@@ -3843,7 +3971,7 @@ app.get('/backfill/settings', async (req, res) => {
 });
 
 // —— GET /backfill/next — Lightweight status for dashboard widget ——
-// Returns: isRunning, lastRunAt, nextRunAt, enabled, intervalMin
+// Returns: isRunning, lastRunAt, nextRunAt, enabled, intervalMin, userSync
 app.get('/backfill/next', async (req, res) => {
   try {
     const db = await getConfigDb();
@@ -3857,12 +3985,35 @@ app.get('/backfill/next', async (req, res) => {
     const lastRunDurationSec = status?.lastRunDurationSec || null;
     const isRunning = backfillRunning;
 
+    // nextRunAt anchored to run-end (backfillLastRunEnd), not run-start
+    // Falls back to lastRunAt-based estimate if process restarted (lastRunEnd = 0)
     let nextRunAt = null;
-    if (enabled && lastRunAt && !isRunning) {
-      nextRunAt = new Date(new Date(lastRunAt).getTime() + intervalMin * 60 * 1000).toISOString();
+    if (enabled && !isRunning) {
+      const anchor = backfillLastRunEnd > 0
+        ? backfillLastRunEnd
+        : (lastRunAt ? new Date(lastRunAt).getTime() : 0);
+      if (anchor > 0) {
+        nextRunAt = new Date(anchor + intervalMin * 60 * 1000).toISOString();
+      }
     }
 
-    res.json({ enabled, intervalMin, isRunning, lastRunAt, lastRunDurationSec, nextRunAt });
+    // User sync state for admin visibility
+    const userSyncMinsAgo = userSyncLastRunAt > 0
+      ? Math.round((Date.now() - userSyncLastRunAt) / 60000)
+      : null;
+    const userSyncNextInMins = userSyncLastRunAt > 0
+      ? Math.max(0, Math.round((USER_SYNC_INTERVAL_MS - (Date.now() - userSyncLastRunAt)) / 60000))
+      : 0;
+
+    res.json({
+      enabled, intervalMin, isRunning, lastRunAt, lastRunDurationSec, nextRunAt,
+      userSync: {
+        lastSyncMinsAgo: userSyncMinsAgo,
+        nextSyncInMins: userSyncNextInMins,
+        isRunning: userSyncRunning,
+        intervalMin: USER_SYNC_INTERVAL_MS / 60000
+      }
+    });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -3986,34 +4137,47 @@ app.get('/data/queue-snapshot', async (req, res) => {
 });
 
 // ── Backfill auto-scheduler ─────────────────────────────
+// Fires every 60s to check whether a run is due.
+// IMPORTANT: interval eligibility is anchored to backfillLastRunEnd (run completion),
+// not lastRunAt (run start). This guarantees a full cooldown period between runs
+// even when runs take 30+ seconds, preventing back-to-back execution under load.
+let _schedulerSkipUntil = 0; // epoch ms — mandatory cooldown after a memory-skip
+
 function startBackfillScheduler() {
   setInterval(async () => {
     try {
+      // Enforce mandatory post-skip cooldown (90s) before re-checking memory
+      if (Date.now() < _schedulerSkipUntil) return;
+
       const db = await getConfigDb();
       const settings = await db.collection('backfill_metadata').findOne({ _id: 'settings' });
       if (!settings?.enabled) return; // disabled by default — must be explicitly enabled
 
       const intervalMs = (settings.autoRefreshMinutes || 5) * 60 * 1000;
-      const status = await db.collection('backfill_metadata').findOne({ _id: 'status' });
-      const lastRun = status?.lastRunAt ? new Date(status.lastRunAt).getTime() : 0;
 
-      // Memory safety: skip if RSS > 400MB (Railway hobby = 512MB)
+      // Memory guard: lowered to 300MB (was 400MB) to leave more headroom on 512MB Railway.
+      // After a skip, enforce a 90s cooldown so GC has time to run before next check.
       const memMB = Math.round(process.memoryUsage().rss / 1024 / 1024);
-      if (memMB > 400) {
-        console.log(`[BACKFILL-CRON] Skipped — memory too high (${memMB}MB RSS). Waiting for GC.`);
+      if (memMB > 300) {
+        _schedulerSkipUntil = Date.now() + 90_000; // 90s mandatory cooldown
+        console.log(`[BACKFILL-CRON] Skipped — memory too high (${memMB}MB RSS). Cooldown 90s.`);
         return;
       }
 
-      if (Date.now() - lastRun >= intervalMs && !backfillRunning) {
-        console.log(`[BACKFILL-CRON] Auto-backfill triggered (interval: ${settings.autoRefreshMinutes}min, mem: ${memMB}MB)`);
+      // Anchor to run-end, not run-start.
+      // If a run takes 37s and interval is 2min, next eligible fire is 2min after
+      // the run *finished*, not 2min after it started.
+      const timeSinceEnd = Date.now() - backfillLastRunEnd;
+      if (timeSinceEnd >= intervalMs && !backfillRunning) {
+        console.log(`[BACKFILL-CRON] Auto-backfill triggered (interval: ${settings.autoRefreshMinutes}min, mem: ${memMB}MB, cooldown: ${Math.round(timeSinceEnd/1000)}s since last end)`);
         runBackfill({ days: settings.days || 90, triggeredBy: 'auto-scheduler' });
       }
     } catch (err) {
       console.error('[BACKFILL-CRON] Error:', err.message);
     }
-  }, 60000); // Check every 60 seconds (was 15s — no need to poll MongoDB that aggressively)
+  }, 60000); // Poll every 60s
 
-  console.log('Backfill auto-scheduler started (checks every 60s, disabled by default)');
+  console.log('Backfill auto-scheduler started (checks every 60s, run-end-anchored, disabled by default)');
 }
 
 
