@@ -751,11 +751,12 @@ app.get('/kpi-classify', async (req, res) => {
     const segData = await internalFetch(`/kpi-segments?days=${days}&page=${page}&pageSize=${pageSize}`);
     const segments = segData.segments || [];
 
-    // 2. Fetch benchmarks + user levels from config DB
+    // 2. Fetch benchmarks + user levels + backfill users from config DB
     const db = await getConfigDb();
-    const [benchmarks, userLevels] = await Promise.all([
+    const [benchmarks, userLevels, backfillUsers] = await Promise.all([
       db.collection('dashboard_benchmarks').find({}).toArray(),
-      db.collection('dashboard_user_levels').find({}).toArray()
+      db.collection('dashboard_user_levels').find({}).toArray(),
+      db.collection('backfill_users').find({}).toArray()
     ]);
 
     // Index benchmarks by status slug
@@ -764,16 +765,37 @@ app.get('/kpi-classify', async (req, res) => {
       benchmarkMap[b.status] = b;
     }
 
-    // Index user levels by email
-    const levelMap = {};
+    // Index user levels by email AND by v1Id
+    const levelByEmail = {};
+    const levelByV1Id = {};
     for (const u of userLevels) {
-      if (u.email) levelMap[u.email.toLowerCase()] = u.level;
+      if (u.email) levelByEmail[u.email.toLowerCase()] = u.level;
+      if (u.v1Id) levelByV1Id[String(u.v1Id)] = u.level;
+    }
+
+    // Index backfill users by v1Id and email for department resolution
+    const deptByV1Id = {};
+    const deptByEmail = {};
+    for (const u of backfillUsers) {
+      if (u.v1Id && u.departmentName) deptByV1Id[String(u.v1Id)] = u.departmentName;
+      if (u.email && u.departmentName) deptByEmail[u.email.toLowerCase()] = u.departmentName;
     }
 
     // 3. Classify each segment
     const classified = segments.map(seg => {
       const benchmark = benchmarkMap[seg.statusSlug] || benchmarkMap[seg.statusName] || null;
-      const userLevel = seg.workerEmail ? (levelMap[seg.workerEmail.toLowerCase()] || null) : null;
+
+      // Level resolution: workerUserId (v1Id) first, then email
+      const workerId = seg.workerUserId ? String(seg.workerUserId) : null;
+      const workerEmail = seg.workerEmail ? seg.workerEmail.toLowerCase() : null;
+      const userLevel = (workerId ? levelByV1Id[workerId] : null)
+        || (workerEmail ? levelByEmail[workerEmail] : null)
+        || null;
+
+      // Department resolution: workerUserId first, then email
+      const departmentName = (workerId ? deptByV1Id[workerId] : null)
+        || (workerEmail ? deptByEmail[workerEmail] : null)
+        || null;
 
       // Default thresholds if benchmark exists but thresholds aren't set
       const excludeShortMin = benchmark?.excludeShortMin ?? 0.5;   // < 30 seconds
@@ -822,6 +844,7 @@ app.get('/kpi-classify', async (req, res) => {
         bucket,
         bucketCode,
         userLevel,
+        departmentName,
         xphTarget,
         benchmarkStatus: benchmark ? seg.statusSlug : null,
         thresholds: benchmark ? { excludeShortMin, inRangeMin, inRangeMax, excludeLongMax } : null
@@ -3542,20 +3565,23 @@ async function runBackfill(options = {}) {
     const userDb = await getDb('user');
     const users = await userDb.collection('users').find(
       { deletedAt: null },
-      { projection: { firstName: 1, middleName: 1, lastName: 1, email: 1, type: 1, active: 1, department: 1 } }
+      { projection: { firstName: 1, middleName: 1, lastName: 1, email: 1, type: 1, active: 1, department: 1, v1Id: 1, legacyId: 1, foreignKeyId: 1 } }
     ).toArray();
 
     const userDocs = users.map(u => ({
       v2Id: String(u._id),
+      v1Id: u.v1Id || u.legacyId || u.foreignKeyId || null,
       fullName: [u.firstName, u.middleName, u.lastName].filter(Boolean).join(' ').trim(),
       email: u.email, type: u.type, isActive: u.active !== false,
       departmentName: u.department?.name || null,
+      departmentId: u.department?.legacyId || u.department?.foreignKeyId || null,
       _backfilledAt: new Date()
     }));
 
     await usrCol.deleteMany({});
     if (userDocs.length > 0) await usrCol.insertMany(userDocs, { ordered: false });
     await usrCol.createIndex({ email: 1 }).catch(() => {});
+    await usrCol.createIndex({ v1Id: 1 }).catch(() => {});
 
     push(`Users: ${userDocs.length} (full replace)`);
 
