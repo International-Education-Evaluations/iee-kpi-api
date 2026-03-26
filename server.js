@@ -2423,7 +2423,7 @@ app.post(`/ai/chat`, aiRateLimit, async (req, res) => {
       return res.status(500).json({ error: 'Claude API key not configured' });
     }
 
-    const { messages, context } = req.body;
+    let { messages, context } = req.body;
     if (!messages?.length) return res.status(400).json({ error: 'messages required' });
 
     // Get system prompt
@@ -5708,8 +5708,12 @@ app.get('/data/forecast/arrivals', async (req, res) => {
 app.get('/data/forecast/staffing', async (req, res) => {
   try {
     const db = await getConfigDb();
-    const dept = req.query.dept || ''; // optional department filter
+    const dept = req.query.dept || '';
     const deptFilter = dept ? { departmentName: dept } : {};
+    // Hard timeout — prevents Railway 503 on slow aggregations
+    res.setTimeout(25000, () => {
+      if (!res.headersSent) res.status(503).json({ error: 'Staffing forecast timed out — try again in a moment.' });
+    });
 
     // Arrival heatmap — filter by dept if specified, collapse to dow-hour
     let rawArrivals = await db.collection('backfill_order_arrivals').find(dept ? { dept } : {}).toArray();
@@ -5777,30 +5781,8 @@ app.get('/data/forecast/staffing', async (req, res) => {
     for (const s of arrivals) totalByHour[s.hour] = (totalByHour[s.hour]||0) + s.count;
     const maxHourVol = Math.max(...totalByHour, 1);
 
-    // Overall demand stats — count directly from turnaround collection for accuracy.
-    // Summing heatmap slot counts is unreliable (slots aggregate across dept keys).
-    const totalOrders = await db.collection('backfill_order_turnaround')
-      .countDocuments(deptFilter);
-
-    // avgPerDay: divide total by actual data span in days (not hardcoded 180).
-    // GO_LIVE is 2026-02-07 — we only have data since then (~47 days at launch).
-    // Using a hardcoded denominator would understate the true daily rate.
-    const GO_LIVE = new Date('2026-02-07T00:00:00.000Z');
-    const spanStart = earliestDoc?.createdAt
-      ? new Date(Math.max(new Date(earliestDoc.createdAt).getTime(), GO_LIVE.getTime()))
-      : GO_LIVE;
-    const spanDaysActual = Math.max(1, Math.round((Date.now() - spanStart.getTime()) / 86400000));
-    const avgPerDay = Math.round(totalOrders / spanDaysActual * 10) / 10;
-
-    // Get departments from backfill_order_turnaround — this is always populated
-    // even before backfill_order_arrivals is rebuilt with per-dept heatmap slots
-    const departments = await db.collection('backfill_order_turnaround')
-      .distinct('departmentName')
-      .then(d => d.filter(Boolean).sort())
-      .catch(() => []);
-
-    // Model metadata for transparency panel
-    const [earliestDoc, latestDoc, totalSegments] = await Promise.all([
+    // Model metadata + totalOrders — run together so earliestDoc is available for avgPerDay calc
+    const [earliestDoc, latestDoc, totalSegments, totalOrders] = await Promise.all([
       db.collection('backfill_order_turnaround').findOne(
         { createdAt:{ $exists:true }, ...deptFilter },
         { sort:{ createdAt:1 }, projection:{ createdAt:1 } }
@@ -5813,7 +5795,16 @@ app.get('/data/forecast/staffing', async (req, res) => {
         dept ? { departmentName:dept, isOpen:false, segmentStart:{ $gte:cutoff60.toISOString() } }
              : { isOpen:false, segmentStart:{ $gte:cutoff60.toISOString() } }
       ),
+      db.collection('backfill_order_turnaround').countDocuments(deptFilter),
     ]);
+
+    // avgPerDay: divide total by actual data span since GO_LIVE (not hardcoded 180)
+    const GO_LIVE = new Date('2026-02-07T00:00:00.000Z');
+    const spanStart = earliestDoc?.createdAt
+      ? new Date(Math.max(new Date(earliestDoc.createdAt).getTime(), GO_LIVE.getTime()))
+      : GO_LIVE;
+    const spanDaysActual = Math.max(1, Math.round((Date.now() - spanStart.getTime()) / 86400000));
+    const avgPerDay = Math.round(totalOrders / spanDaysActual * 10) / 10;
 
     const earliestDate = earliestDoc?.createdAt || null;
     const latestDate   = latestDoc?.createdAt   || null;
@@ -5822,22 +5813,30 @@ app.get('/data/forecast/staffing', async (req, res) => {
       : 0;
     const dataSpanWeeks = Math.round(dataSpanDays / 7 * 10) / 10;
 
+    // Get departments from backfill_order_turnaround
+    const departments = await db.collection('backfill_order_turnaround')
+      .distinct('departmentName')
+      .then(d => d.filter(Boolean).sort())
+      .catch(() => []);
+
     // Per-DOW sample counts — how many distinct calendar days exist for each day-of-week
-    // Used to assess heatmap pattern stability (need ≥8 weeks per dow for confidence)
+    // Single aggregation instead of 7 separate queries — avoids 7x full collection scans
     const totalByDow = [0,1,2,3,4,5,6].map(d =>
       arrivals.filter(s => s.dow === d).reduce((a,s) => a + s.count, 0)
     );
-    // Estimate distinct weeks per dow from order turnaround data
-    const dowSampleWeeks = await Promise.all([0,1,2,3,4,5,6].map(async (dow) => {
-      // Count distinct ISO weeks that have data for this dow
-      const docs = await db.collection('backfill_order_turnaround').aggregate([
-        { $match: { createdAt:{ $exists:true }, ...deptFilter,
-            $expr:{ $eq:[{ $subtract:[{ $dayOfWeek:'$createdAt' },1] }, dow] } } },
-        { $group: { _id: { $dateToString:{ format:'%G-W%V', date:'$createdAt' } } } },
-        { $count: 'weeks' }
-      ]).toArray();
-      return docs[0]?.weeks || 0;
-    }));
+    const dowWeekDocs = await db.collection('backfill_order_turnaround').aggregate([
+      { $match: { createdAt: { $exists: true }, ...deptFilter } },
+      { $group: {
+          _id: {
+            dow: { $subtract: [{ $dayOfWeek: '$createdAt' }, 1] },
+            week: { $dateToString: { format: '%G-W%V', date: '$createdAt' } }
+          }
+      }},
+      { $group: { _id: '$_id.dow', weeks: { $sum: 1 } } }
+    ]).toArray();
+    const dowWeekMap = {};
+    for (const d of dowWeekDocs) dowWeekMap[d._id] = d.weeks;
+    const dowSampleWeeks = [0,1,2,3,4,5,6].map(d => dowWeekMap[d] || 0);
 
     const modelMeta = {
       earliestDate,
