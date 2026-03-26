@@ -3740,28 +3740,31 @@ async function runOrderArrivalBackfill(prodDb, configDb, push, opts = {}) {
     const arrCol    = configDb.collection('backfill_order_arrivals');
     const turnCol   = configDb.collection('backfill_order_turnaround');
 
-    // Go-live date: 2026-02-07 — orders before this date are V1 historical imports
-    // with original createdAt dates that don't represent real post-launch demand.
-    // 2026-02-06 was the V1→V2 migration date. All historical V1 orders were imported
-    // that day with createdAt stamped as 2026-02-06, creating a massive artificial spike.
-    // Real organic orders start from 2026-02-07 onward.
-    const GO_LIVE = new Date('2026-02-07T00:00:00.000Z');
+    // Data floor: 2025-01-01 — oldest data we trust for demand/staffing analysis.
+    // Pre-2025 data exists but is fragile (low volume, system changes, inconsistent fields).
+    // Separate from the migration spike: 2026-02-06 had 123,490 bulk-imported V1 historical
+    // orders all stamped that single day — those are excluded by the $ne filter below,
+    // not by this floor date.
+    const DATA_FLOOR = new Date('2025-01-01T00:00:00.000Z');
+    // Feb 6 2026 migration spike bounds — exclude this specific day regardless of cutoff
+    const MIGRATION_DAY_START = new Date('2026-02-06T00:00:00.000Z');
+    const MIGRATION_DAY_END   = new Date('2026-02-07T00:00:00.000Z');
 
-    // On a full refresh: always seed from GO_LIVE regardless of what's in the collection.
+    // On a full refresh: always seed from DATA_FLOOR regardless of what's in the collection.
     // Without this, a stale single record left from a previous partial run causes
     // latest?.createdAt to resolve to today → cutoff = today → only today's orders fetched.
     let cutoff;
     if (opts.forceFullSeed) {
-      cutoff = GO_LIVE;
-      push(`  Arrivals: full seed mode — fetching all orders since GO_LIVE`);
+      cutoff = DATA_FLOOR;
+      push(`  Arrivals: full seed mode — fetching all orders since ${DATA_FLOOR.toISOString().slice(0,10)}`);
     } else {
       const latest   = await turnCol.findOne({}, { sort:{ createdAt:-1 }, projection:{ createdAt:1 } });
       const bufferMs = 30 * 60 * 1000;
       const rawCutoff = latest?.createdAt
         ? new Date(new Date(latest.createdAt).getTime() - bufferMs)
-        : new Date(Date.now() - 180 * 24 * 60 * 60 * 1000);
-      // Enforce go-live floor — never pull pre-launch V1 historical orders
-      cutoff = rawCutoff < GO_LIVE ? GO_LIVE : rawCutoff;
+        : new Date(Date.now() - 500 * 24 * 60 * 60 * 1000);
+      // Enforce data floor — never pull pre-2025 fragile data
+      cutoff = rawCutoff < DATA_FLOOR ? DATA_FLOOR : rawCutoff;
     }
 
     // One-time cleanup: remove any records that were inserted before the isImport filter
@@ -3770,36 +3773,33 @@ async function runOrderArrivalBackfill(prodDb, configDb, push, opts = {}) {
     // We identify them by cross-referencing with production: easier to just purge and
     // rebuild by resetting the cutoff when we detect the collection has suspect data.
     const totalExisting = await turnCol.countDocuments();
-    // Purge stale data: if the collection contains pre-go-live records from
-    // the old V1 historical import backfill, wipe and reseed with correct filter.
-    // Also catch records exactly on the migration date (2026-02-06) which are
-    // V1 historical orders stamped with that date, not real organic demand.
-    const MIGRATION_DATE_END = new Date('2026-02-07T00:00:00.000Z');
-    const hasPreLaunchData = totalExisting > 0 &&
-      await turnCol.countDocuments({ createdAt: { $lt: MIGRATION_DATE_END } }) > 0;
+    // Purge stale data: if the collection contains pre-floor records wipe and reseed.
+    const totalExisting = await turnCol.countDocuments();
+    const hasPreFloorData = totalExisting > 0 &&
+      await turnCol.countDocuments({ createdAt: { $lt: DATA_FLOOR } }) > 0;
 
-    if (hasPreLaunchData) {
-      const preCount = await turnCol.countDocuments({ createdAt: { $lt: MIGRATION_DATE_END } });
-      push(`  Found ${preCount} pre/migration records — purging and re-seeding from 2026-02-07`);
+    if (hasPreFloorData) {
+      const preCount = await turnCol.countDocuments({ createdAt: { $lt: DATA_FLOOR } });
+      push(`  Found ${preCount} pre-floor records (before 2025-01-01) — purging and re-seeding`);
       await turnCol.deleteMany({});
       await arrCol.deleteMany({});
-      cutoff = GO_LIVE; // reseed from go-live date only
+      cutoff = DATA_FLOOR;
     }
 
     push(`  Arrivals: fetching since ${cutoff.toISOString().slice(0,10)}`);
 
     const cursor = ordersCol.find(
       { paymentStatus:'paid', orderType:{ $in:['evaluation','translation'] }, deletedAt:null,
-        // Hard floor: only orders created on or after go-live date (2026-02-06).
-        // This excludes all 52,000 V1 historical orders that were imported with
-        // their original pre-launch createdAt dates during the V1→V2 migration.
-        createdAt: { $gte: GO_LIVE },
+        // Hard floor: only 2025-01-01 onward — pre-2025 data is fragile.
+        // Also exclude Feb 6 2026 migration day (123,490 bulk-imported V1 orders
+        // all stamped that single day — not real organic demand).
+        createdAt: { $gte: DATA_FLOOR, $not: { $gte: MIGRATION_DAY_START, $lt: MIGRATION_DAY_END } },
         $or:[{ createdAt:{ $gte:cutoff } },{ orderPlaced:{ $gte:cutoff } }] },
       { projection:{ orderSerialNumber:1, orderType:1, createdAt:1, orderPlaced:1, paidAt:1,
           orderCompletedAt:1, orderDueDate:1, isUrgent:1, processTime:1,
           orderStatus:1, institution:1, orderStatusHistory:1 },
-        maxTimeMS: 120000 } // 2-minute hard limit — prevents hanging the backfill engine
-    ).batchSize(500); // stream 500 at a time — avoids loading all 180 days into memory at once
+        maxTimeMS: 120000 }
+    ).batchSize(500);
 
     // Process in streaming batches to keep memory bounded
     let totalProcessed = 0;
@@ -4678,7 +4678,7 @@ app.post('/backfill/run', requireRole('admin'), async (req, res) => {
     if (backfillRunning) return res.status(409).json({ error: 'Backfill already in progress' });
 
     const opts = {
-      days: days ? Math.min(Math.max(parseInt(days) || 90, 1), 365) : 90,
+      days: days ? Math.min(Math.max(parseInt(days) || 500, 1), 500) : 500,
       full: !!full,
       dateFrom: dateFrom || null,
       dateTo: dateTo || null,
