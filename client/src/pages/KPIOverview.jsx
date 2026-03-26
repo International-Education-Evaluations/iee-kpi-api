@@ -1,303 +1,337 @@
 import React, { useEffect, useState, useMemo } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, Cell, Legend } from 'recharts';
-import { Card, Table, Section, Pills, Skel, FilterBar, FilterSelect, FilterInput, FilterReset, ChartLegend, TOOLTIP_STYLE, fmt, fmtI, fmtDur, fmtHrs } from '../components/UI';
-import DashboardGrid, { Widget } from '../components/DashboardGrid';
+import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, Cell } from 'recharts';
+import { Card, Table, Pills, FilterBar, FilterSelect, FilterInput, FilterReset, ChartLegend, TOOLTIP_STYLE, fmt, fmtI, fmtDur, fmtHrs } from '../components/UI';
 import { useData } from '../hooks/useData';
 
 const BUCKET_COLORS = { 'Exclude Short':'#94a3b8', 'Out-of-Range Short':'#F57F17', 'In-Range':'#16a34a', 'Out-of-Range Long':'#E65100', 'Exclude Long':'#B71C1C', 'Unclassified':'#cbd5e1', 'Open':'#3b82f6' };
-
-const DEFAULT_LAYOUT = [
-  { i: 'filters', x: 0, y: 0, w: 12, h: 1, static: true },
-  { i: 'cards', x: 0, y: 1, w: 12, h: 2, minH: 2 },
-  { i: 'buckets', x: 0, y: 3, w: 5, h: 4, minW: 3, minH: 3 },
-  { i: 'bucketChart', x: 5, y: 3, w: 7, h: 4, minW: 4, minH: 3 },
-  { i: 'byStatus', x: 0, y: 7, w: 6, h: 5, minW: 4, minH: 3 },
-  { i: 'daily', x: 6, y: 7, w: 6, h: 5, minW: 4, minH: 3 },
-  { i: 'breakdown', x: 0, y: 12, w: 12, h: 6, minW: 6, minH: 4 },
-];
+const ORDER_URL = 'https://admin.prod.iee.com/orders/';
 
 export default function KPIOverview() {
-  const { kpiSegs: segs, classified, kpiLoading: loading, loadKpi } = useData();
+  const { kpiSegs: segs, classifiedSummary, kpiLoading: loading, loadKpi } = useData();
   const [view, setView] = useState('status');
   const [fType, setFType] = useState('');
+  const [fDept, setFDept] = useState('');
   const [fFrom, setFFrom] = useState('');
   const [fTo, setFTo] = useState('');
   const [fWorker, setFWorker] = useState('');
+  const [fStatus, setFStatus] = useState('');
+  const [showSegs, setShowSegs] = useState(false);
   const nav = useNavigate();
 
   useEffect(() => { loadKpi(); }, [loadKpi]);
 
+  // Dropdown options
   const workers = useMemo(() => {
     const m = {};
     segs.forEach(s => { if (s._workerId) m[s._workerId] = s.displayName || s.workerName; });
     return Object.entries(m).map(([v,l]) => ({value:v,label:l})).sort((a,b) => a.label.localeCompare(b.label));
   }, [segs]);
+  const statuses = useMemo(() => [...new Set(segs.map(s => s.statusName || s.statusSlug).filter(Boolean))].sort(), [segs]);
+  const depts = useMemo(() => [...new Set(segs.map(s => s.departmentName).filter(Boolean))].sort(), [segs]);
 
+  // Filtered
   const filtered = useMemo(() => segs.filter(s => {
     if (fType && s.orderType !== fType) return false;
+    if (fDept && s.departmentName !== fDept) return false;
     if (fWorker && s._workerId !== fWorker) return false;
+    if (fStatus && (s.statusName||s.statusSlug) !== fStatus) return false;
     if (fFrom && s.segmentStart && s.segmentStart < fFrom) return false;
     if (fTo && s.segmentStart && s.segmentStart > fTo + 'T23:59:59') return false;
     return true;
-  }), [segs, fType, fFrom, fTo, fWorker]);
+  }), [segs, fType, fDept, fFrom, fTo, fWorker, fStatus]);
 
-  // ── Metrics with week-over-week trend ───────────────────
+  // Metrics
   const metrics = useMemo(() => {
     if (!filtered.length) return null;
     const closed = filtered.filter(s => !s.isOpen && s.durationMinutes > 0);
     const totalMin = closed.reduce((a,s) => a + (s.durationMinutes||0), 0);
-    const total = filtered.length;
-
-    // Week-over-week trend: compare last 7 days vs prior 7 days
     const now = new Date();
     const d7 = new Date(now - 7*86400000).toISOString();
     const d14 = new Date(now - 14*86400000).toISOString();
     const thisWeek = filtered.filter(s => s.segmentStart >= d7).length;
     const lastWeek = filtered.filter(s => s.segmentStart >= d14 && s.segmentStart < d7).length;
     const volTrend = lastWeek > 0 ? Math.round((thisWeek - lastWeek) / lastWeek * 100) : null;
-
+    const inRange = filtered.filter(s => s.bucket === 'In-Range').length;
+    const scorable = closed.length || 1;
     return {
-      total, closed: closed.length, open: filtered.filter(s=>s.isOpen).length,
+      total: filtered.length, closed: closed.length, open: filtered.filter(s=>s.isOpen).length,
       avg: closed.length ? totalMin/closed.length : 0,
       median: getMedian(closed.map(s => s.durationMinutes)),
       hrs: totalMin/60,
       workers: new Set(filtered.map(s=>s._workerId).filter(Boolean)).size,
       orders: new Set(filtered.map(s=>s.orderSerialNumber).filter(Boolean)).size,
+      depts: new Set(filtered.map(s=>s.departmentName).filter(Boolean)).size,
       volTrend,
+      inRangePct: Math.round(inRange / scorable * 1000) / 10,
     };
   }, [filtered]);
 
-  const bucketStats = classified?.classification || null;
-  const bucketChartData = useMemo(() => {
-    if (!bucketStats?.bucketCounts) return [];
-    const order = ['Exclude Short', 'Out-of-Range Short', 'In-Range', 'Out-of-Range Long', 'Exclude Long', 'Unclassified', 'Open'];
-    return order.filter(b => bucketStats.bucketCounts[b]).map(b => ({
-      bucket: b.replace('Out-of-Range ', 'OOR ').replace('Exclude ', 'Excl '),
-      fullName: b,
-      count: bucketStats.bucketCounts[b],
-      fill: BUCKET_COLORS[b]
+  // Bucket data from classified summary or compute from filtered
+  const bucketData = useMemo(() => {
+    const counts = {};
+    filtered.forEach(s => { const b = s.bucket || 'Unclassified'; counts[b] = (counts[b]||0) + 1; });
+    const order = ['Exclude Short','Out-of-Range Short','In-Range','Out-of-Range Long','Exclude Long','Unclassified','Open'];
+    return order.filter(b => counts[b]).map(b => ({
+      bucket: b.replace('Out-of-Range ','OOR ').replace('Exclude ','Excl '), fullName: b,
+      count: counts[b], fill: BUCKET_COLORS[b],
+      pct: filtered.length ? Math.round(counts[b]/filtered.length*1000)/10 : 0,
     }));
-  }, [bucketStats]);
+  }, [filtered]);
 
+  // By Status — full parity with GAS KPI_BY_STATUS
   const byStatus = useMemo(() => {
     const m = {};
     filtered.forEach(s => {
       const k = s.statusName||s.statusSlug||'Unknown';
-      if (!m[k]) m[k] = {status:k,count:0,totalMin:0,closed:0,open:0,durations:[]};
+      if (!m[k]) m[k] = {status:k, slug: s.statusSlug||'', count:0, totalMin:0, closed:0, open:0, durations:[], workers:new Set(), xphUnit:''};
       m[k].count++;
       if (!s.isOpen && s.durationMinutes>0) { m[k].totalMin+=s.durationMinutes; m[k].closed++; m[k].durations.push(s.durationMinutes); }
       if(s.isOpen) m[k].open++;
+      if (s._workerId) m[k].workers.add(s._workerId);
+      if (!m[k].xphUnit && s.xphTarget != null) m[k].xphUnit = 'benchmarked';
     });
     return Object.values(m).map(d=>({
-      ...d,
-      avg: d.closed ? Math.round(d.totalMin/d.closed*10)/10 : null,
-      median: getMedian(d.durations),
-      hrs: Math.round(d.totalMin/60*10)/10,
+      ...d, avg: d.closed ? Math.round(d.totalMin/d.closed*10)/10 : null,
+      median: getMedian(d.durations), hrs: Math.round(d.totalMin/60*10)/10,
       pct: filtered.length ? Math.round(d.count/filtered.length*100) : 0,
+      workers: d.workers.size,
     })).sort((a,b)=>b.count-a.count);
   }, [filtered]);
 
+  // By Worker — full parity with GAS KPI_BY_USER (includes Department!)
   const byWorker = useMemo(() => {
     const m = {};
     filtered.forEach(s => {
       const k = s._workerId||'none';
-      if (!m[k]) m[k] = {worker:s.displayName||s.workerName||'UNATTRIBUTED',workerId:k,count:0,totalMin:0,closed:0,orders:new Set()};
-      m[k].count++;
-      if(!s.isOpen&&s.durationMinutes>0){m[k].totalMin+=s.durationMinutes;m[k].closed++;}
-      if(s.orderSerialNumber) m[k].orders.add(s.orderSerialNumber);
+      if (!m[k]) m[k] = {worker:s.displayName||s.workerName||'UNATTRIBUTED', workerId:k,
+        dept: s.departmentName||'', orderType: '',
+        count:0, totalMin:0, closed:0, open:0, orders:new Set()};
+      const b = m[k];
+      b.count++;
+      if (!b.dept && s.departmentName) b.dept = s.departmentName;
+      if(!s.isOpen&&s.durationMinutes>0){b.totalMin+=s.durationMinutes;b.closed++;}
+      if(s.isOpen) b.open++;
+      if(s.orderSerialNumber) b.orders.add(s.orderSerialNumber);
     });
     return Object.values(m).map(d=>({
-      ...d,
-      orders: d.orders.size,
+      ...d, orders: d.orders.size,
       avg: d.closed ? Math.round(d.totalMin/d.closed*10)/10 : null,
       hrs: Math.round(d.totalMin/60*10)/10,
       xph: d.totalMin > 0 ? Math.round(d.closed / (d.totalMin/60) * 10) / 10 : null,
     })).sort((a,b)=>b.count-a.count);
   }, [filtered]);
 
+  // Daily volume
   const daily = useMemo(() => {
     const m = {};
     filtered.forEach(s => {
-      const d = s.segmentStart?.substring(0,10);
-      if(!d) return;
-      if(!m[d]) m[d]={date:d,count:0,closed:0,totalMin:0};
+      const d = s.segmentStart?.substring(0,10); if(!d) return;
+      if(!m[d]) m[d]={date:d,count:0};
       m[d].count++;
-      if(!s.isOpen&&s.durationMinutes>0){m[d].closed++;m[d].totalMin+=s.durationMinutes;}
     });
-    return Object.values(m).sort((a,b)=>a.date.localeCompare(b.date)).map(d=>({
-      ...d,
-      avg: d.closed ? Math.round(d.totalMin/d.closed*10)/10 : 0,
-      label: formatDateShort(d.date),
-    }));
+    return Object.values(m).sort((a,b)=>a.date.localeCompare(b.date)).map(d=>({...d, label: fmtDate(d.date)}));
   }, [filtered]);
 
-  const clearFilters = () => { setFType(''); setFFrom(''); setFTo(''); setFWorker(''); };
+  // Segment detail rows (most recent 500)
+  const segRows = useMemo(() => {
+    return filtered.slice().sort((a,b) => (b.segmentStart||'').localeCompare(a.segmentStart||'')).slice(0,500);
+  }, [filtered]);
+
+  const clearFilters = () => { setFType(''); setFDept(''); setFFrom(''); setFTo(''); setFWorker(''); setFStatus(''); };
+  const hasFilters = fType || fDept || fWorker || fStatus || fFrom || fTo;
 
   return (
-    <div className="space-y-3">
+    <div className="space-y-4">
       <div>
         <h1 className="text-lg sm:text-xl font-display font-bold text-ink-900">KPI Overview</h1>
-        <p className="text-[11px] text-ink-400 mt-0.5">Processing performance · Last 60 days · {fmtI(segs.length)} segments loaded</p>
+        <p className="text-[11px] text-ink-400 mt-0.5">Processing performance · Last 60 days · {fmtI(segs.length)} segments · {metrics?.depts||0} departments</p>
       </div>
 
-      <DashboardGrid pageId="kpi-overview" defaultLayout={DEFAULT_LAYOUT}>
-        {/* Filters */}
-        <div key="filters">
-          <FilterBar>
-            <FilterSelect label="Order Type" value={fType} onChange={setFType} options={['evaluation','translation']} />
-            <FilterSelect label="Worker" value={fWorker} onChange={setFWorker} options={workers} allLabel="All Workers" />
-            <FilterInput label="From" value={fFrom} onChange={setFFrom} type="date" />
-            <FilterInput label="To" value={fTo} onChange={setFTo} type="date" />
-            {(fType||fWorker||fFrom||fTo) && <FilterReset onClick={clearFilters} />}
-          </FilterBar>
-        </div>
+      {/* Filters */}
+      <FilterBar>
+        <FilterSelect label="Department" value={fDept} onChange={setFDept} options={depts} />
+        <FilterSelect label="Order Type" value={fType} onChange={setFType} options={['evaluation','translation']} />
+        <FilterSelect label="Status" value={fStatus} onChange={setFStatus} options={statuses} />
+        <FilterSelect label="Worker" value={fWorker} onChange={setFWorker} options={workers} allLabel="All Workers" />
+        <FilterInput label="From" value={fFrom} onChange={setFFrom} type="date" />
+        <FilterInput label="To" value={fTo} onChange={setFTo} type="date" />
+        {hasFilters && <FilterReset onClick={clearFilters} />}
+      </FilterBar>
 
-        {/* Metric Cards */}
-        <div key="cards">
-          <Widget title="Key Metrics">
-            <div className="metric-grid">
-              <Card label="Total Segments" value={fmtI(metrics?.total)} loading={loading} trend={metrics?.volTrend} icon="◈" />
-              <Card label="Closed" value={fmtI(metrics?.closed)} color="green" loading={loading} icon="✓" />
-              <Card label="Open" value={fmtI(metrics?.open)} color="amber" loading={loading} icon="◌" />
-              <Card label="Avg Duration" value={fmtDur(metrics?.avg)} color="brand" loading={loading} />
-              <Card label="Median Duration" value={fmtDur(metrics?.median)} color="slate" loading={loading} />
-              <Card label="Workers" value={fmtI(metrics?.workers)} color="plum" loading={loading} />
-              <Card label="Orders" value={fmtI(metrics?.orders)} color="navy" loading={loading} />
+      {/* Metric Cards */}
+      <div className="metric-grid">
+        <Card label="Segments" value={fmtI(metrics?.total)} loading={loading} trend={metrics?.volTrend} />
+        <Card label="Closed" value={fmtI(metrics?.closed)} color="green" loading={loading} />
+        <Card label="Open" value={fmtI(metrics?.open)} color="amber" loading={loading} />
+        <Card label="Avg Duration" value={fmtDur(metrics?.avg)} color="brand" loading={loading} />
+        <Card label="Median" value={fmtDur(metrics?.median)} color="slate" loading={loading} />
+        <Card label="In-Range" value={metrics?.inRangePct != null ? `${metrics.inRangePct}%` : '—'} color="green" loading={loading} />
+        <Card label="Orders" value={fmtI(metrics?.orders)} color="navy" loading={loading} />
+      </div>
+
+      {/* Charts Row */}
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+        {/* 5-Bucket */}
+        <div className="card-surface p-4">
+          <div className="text-xs font-semibold text-ink-600 mb-3">5-Bucket Classification</div>
+          {bucketData.length > 0 ? <div className="space-y-3">
+            <div className="text-center">
+              <div className="text-3xl font-display font-bold text-emerald-600">{metrics?.inRangePct||0}%</div>
+              <div className="text-[11px] text-ink-400">In-Range Rate</div>
             </div>
-          </Widget>
+            <div className="h-3 rounded-full overflow-hidden flex bg-surface-100">
+              {bucketData.map((b,i) => (
+                <div key={i} style={{width:`${b.pct}%`,background:b.fill,minWidth:b.pct>0?'2px':'0'}} className="h-full" title={`${b.fullName}: ${b.pct}%`} />
+              ))}
+            </div>
+            <div className="grid grid-cols-2 sm:grid-cols-3 gap-1 text-[10px] text-ink-500">
+              {bucketData.map(b => (
+                <div key={b.fullName} className="flex items-center gap-1.5">
+                  <span className="w-2 h-2 rounded-sm shrink-0" style={{background:b.fill}} />
+                  {b.bucket}: {fmtI(b.count)} ({b.pct}%)
+                </div>
+              ))}
+            </div>
+            <ResponsiveContainer width="100%" height={160}>
+              <BarChart data={bucketData} margin={{left:0,right:5,bottom:5}}>
+                <XAxis dataKey="bucket" tick={{fill:'#64748b',fontSize:9}} angle={-15} textAnchor="end" height={40} interval={0} />
+                <YAxis tick={{fill:'#64748b',fontSize:10}} tickFormatter={v=>fmtI(v)} />
+                <Tooltip {...TOOLTIP_STYLE} formatter={(v,n,p) => [fmtI(v)+` (${p.payload.pct}%)`, p.payload.fullName]} labelFormatter={()=>''} />
+                <Bar dataKey="count" radius={[4,4,0,0]}>{bucketData.map((d,i) => <Cell key={i} fill={d.fill} />)}</Bar>
+              </BarChart>
+            </ResponsiveContainer>
+          </div> : <div className="text-ink-400 text-xs text-center py-8">No classification data — check benchmarks & thresholds in Settings</div>}
         </div>
 
-        {/* 5-Bucket Classification — visual progress bar */}
-        <div key="buckets">
-          <Widget title="5-Bucket Classification">
-            {bucketStats ? <div className="space-y-3">
-              {/* Hero metric */}
-              <div className="text-center py-2">
-                <div className="text-3xl font-display font-bold text-emerald-600">{bucketStats.inRangePercent}%</div>
-                <div className="text-[11px] text-ink-400 font-medium">In-Range Rate</div>
-              </div>
-              {/* Progress bar */}
-              <div className="h-3 rounded-full overflow-hidden flex bg-surface-100">
-                {[
-                  { pct: bucketStats.excludeShortPercent, color: '#94a3b8' },
-                  { pct: bucketStats.outRangeShortPercent, color: '#F57F17' },
-                  { pct: bucketStats.inRangePercent, color: '#16a34a' },
-                  { pct: bucketStats.outRangeLongPercent, color: '#E65100' },
-                  { pct: bucketStats.excludeLongPercent, color: '#B71C1C' },
-                ].filter(b => b.pct > 0).map((b, i) => (
-                  <div key={i} style={{ width: `${b.pct}%`, background: b.color }} className="h-full transition-all" title={`${b.pct}%`} />
-                ))}
-              </div>
-              {/* Legend grid */}
-              <div className="grid grid-cols-2 gap-1.5 text-[10px]">
-                <div className="flex items-center gap-1.5"><span className="w-2 h-2 rounded-sm bg-amber-600" />Out Short: {bucketStats.outRangeShortPercent}%</div>
-                <div className="flex items-center gap-1.5"><span className="w-2 h-2 rounded-sm" style={{background:'#E65100'}} />Out Long: {bucketStats.outRangeLongPercent}%</div>
-                <div className="flex items-center gap-1.5"><span className="w-2 h-2 rounded-sm bg-slate-400" />Excl Short: {bucketStats.excludeShortPercent||0}%</div>
-                <div className="flex items-center gap-1.5"><span className="w-2 h-2 rounded-sm bg-red-800" />Excl Long: {bucketStats.excludeLongPercent||0}%</div>
-              </div>
-            </div> : <div className="text-ink-400 text-xs p-4 text-center">Configure benchmarks in Settings to enable classification</div>}
-          </Widget>
-        </div>
-
-        {/* Bucket Distribution Chart */}
-        <div key="bucketChart">
-          <Widget title="Bucket Distribution">
-            {bucketChartData.length > 0 ? <>
-              <ResponsiveContainer width="100%" height="85%">
-                <BarChart data={bucketChartData} margin={{left:0,right:10,bottom:5}}>
-                  <XAxis dataKey="bucket" tick={{fill:'#64748b',fontSize:10}} angle={-15} textAnchor="end" height={45} interval={0} />
-                  <YAxis tick={{fill:'#64748b',fontSize:10}} tickFormatter={v=>fmtI(v)} />
-                  <Tooltip {...TOOLTIP_STYLE} formatter={(v,n,p) => [fmtI(v), p.payload.fullName]} labelFormatter={() => ''} />
-                  <Bar dataKey="count" radius={[4,4,0,0]}>
-                    {bucketChartData.map((d,i) => <Cell key={i} fill={d.fill} />)}
-                  </Bar>
-                </BarChart>
-              </ResponsiveContainer>
-            </> : <div className="text-ink-400 text-xs p-4 text-center">Run classification to see bucket distribution</div>}
-          </Widget>
-        </div>
-
-        {/* Segments by Status */}
-        <div key="byStatus">
-          <Widget title="Top Statuses by Volume">
-            {loading ? <Skel rows={6} cols={1} /> :
-            <ResponsiveContainer width="100%" height="90%">
-              <BarChart data={byStatus.slice(0,10)} layout="vertical" margin={{left:5,right:20}}>
+        {/* Status chart */}
+        <div className="card-surface p-4">
+          <div className="text-xs font-semibold text-ink-600 mb-3">Top Statuses by Volume</div>
+          {!loading && byStatus.length > 0 ? (
+            <ResponsiveContainer width="100%" height={Math.max(280, byStatus.slice(0,12).length * 28 + 40)}>
+              <BarChart data={byStatus.slice(0,12)} layout="vertical" margin={{left:5,right:20}}>
                 <XAxis type="number" tick={{fill:'#64748b',fontSize:10}} tickFormatter={v=>fmtI(v)} />
-                <YAxis type="category" dataKey="status" width={140} tick={{fill:'#334155',fontSize:11}} />
-                <Tooltip {...TOOLTIP_STYLE} formatter={(v,n) => {
-                  if (n==='count') return [fmtI(v), 'Segments'];
-                  return [v, n];
-                }} />
+                <YAxis type="category" dataKey="status" width={160} tick={{fill:'#334155',fontSize:10}} />
+                <Tooltip {...TOOLTIP_STYLE} formatter={(v) => [fmtI(v), 'Segments']} />
                 <Bar dataKey="count" fill="#00aeef" radius={[0,4,4,0]} />
               </BarChart>
-            </ResponsiveContainer>}
-          </Widget>
+            </ResponsiveContainer>
+          ) : <div className="h-60 loading rounded-lg" />}
         </div>
+      </div>
 
-        {/* Daily Volume */}
-        <div key="daily">
-          <Widget title="Daily Segment Volume">
-            {loading ? <Skel rows={6} cols={1} /> :
-            <ResponsiveContainer width="100%" height="90%">
-              <BarChart data={daily} margin={{left:0,right:10,bottom:5}}>
-                <XAxis dataKey="label" tick={{fill:'#64748b',fontSize:9}} angle={-45} textAnchor="end" height={50} interval={Math.max(0, Math.floor(daily.length / 15))} />
-                <YAxis tick={{fill:'#64748b',fontSize:10}} tickFormatter={v=>fmtI(v)} />
-                <Tooltip {...TOOLTIP_STYLE}
-                  labelFormatter={(_,payload) => payload?.[0]?.payload?.date || ''}
-                  formatter={(v,n) => [fmtI(v), n === 'count' ? 'Segments' : n]} />
-                <Bar dataKey="count" fill="#16a34a" radius={[3,3,0,0]} />
-              </BarChart>
-            </ResponsiveContainer>}
-          </Widget>
-        </div>
+      {/* Daily Volume */}
+      <div className="card-surface p-4">
+        <div className="text-xs font-semibold text-ink-600 mb-3">Daily Segment Volume</div>
+        {!loading && daily.length > 0 ? (
+          <ResponsiveContainer width="100%" height={200}>
+            <BarChart data={daily} margin={{left:0,right:10,bottom:5}}>
+              <XAxis dataKey="label" tick={{fill:'#64748b',fontSize:9}} angle={-45} textAnchor="end" height={55} interval={Math.max(0,Math.floor(daily.length/20))} />
+              <YAxis tick={{fill:'#64748b',fontSize:10}} tickFormatter={v=>fmtI(v)} />
+              <Tooltip {...TOOLTIP_STYLE} labelFormatter={(_,p) => p?.[0]?.payload?.date||''} formatter={v => [fmtI(v),'Segments']} />
+              <Bar dataKey="count" fill="#16a34a" radius={[3,3,0,0]} />
+            </BarChart>
+          </ResponsiveContainer>
+        ) : <div className="h-48 loading rounded-lg" />}
+      </div>
 
-        {/* Breakdown Table */}
-        <div key="breakdown">
-          <Widget title={<div className="flex items-center justify-between w-full">
-            <span>Breakdown</span>
-            <Pills tabs={[{key:'status',label:'By Status'},{key:'worker',label:'By Worker'}]} active={view} onChange={setView} />
-          </div>}>
-            {view === 'status' ?
-              <Table cols={[
-                {key:'status',label:'Status',w:180},
-                {key:'count',label:'Segments',right:true,render:v=>fmtI(v)},
-                {key:'pct',label:'%',right:true,render:v=><span className="text-ink-400">{v}%</span>},
-                {key:'closed',label:'Closed',right:true,render:v=>fmtI(v)},
-                {key:'open',label:'Open',right:true,render:v=>v>0?<span className="text-amber-600 font-semibold">{fmtI(v)}</span>:fmtI(v)},
-                {key:'avg',label:'Avg',right:true,render:v=>v!=null?fmtDur(v):'—'},
-                {key:'median',label:'Median',right:true,render:v=>v!=null?fmtDur(v):'—'},
-                {key:'hrs',label:'Total Hrs',right:true,render:v=>fmtHrs(v)},
-              ]} rows={byStatus} />
-            :
-              <Table cols={[
-                {key:'worker',label:'Worker',w:180},
-                {key:'count',label:'Segments',right:true,render:v=>fmtI(v)},
-                {key:'orders',label:'Orders',right:true,render:v=>fmtI(v)},
-                {key:'avg',label:'Avg',right:true,render:v=>v!=null?fmtDur(v):'—'},
-                {key:'hrs',label:'Total Hrs',right:true,render:v=>fmtHrs(v)},
-                {key:'xph',label:'XpH',right:true,render:v=>v!=null?<span className="font-semibold text-brand-600">{fmt(v)}</span>:'—'},
-              ]} rows={byWorker} onRow={r => r.workerId !== 'none' && nav(`/kpi/users?worker=${r.workerId}`)} />
-            }
-          </Widget>
+      {/* Breakdown — By Status / By Worker */}
+      <div className="card-surface overflow-hidden">
+        <div className="px-4 py-3 border-b border-surface-200 flex items-center justify-between">
+          <span className="text-xs font-semibold text-ink-600">Breakdown</span>
+          <Pills tabs={[{key:'status',label:'By Status'},{key:'worker',label:'By Worker'}]} active={view} onChange={setView} />
         </div>
-      </DashboardGrid>
+        {view === 'status' ?
+          <Table cols={[
+            {key:'status',label:'Status',w:180},
+            {key:'slug',label:'Slug',w:170,render:v=><span className="font-mono text-[10px] text-ink-400">{v}</span>},
+            {key:'count',label:'Segments',right:true,render:v=>fmtI(v)},
+            {key:'pct',label:'Share',right:true,render:v=><span className="text-ink-400">{v}%</span>},
+            {key:'closed',label:'Closed',right:true,render:v=>fmtI(v)},
+            {key:'open',label:'Open',right:true,render:v=>v>0?<span className="text-amber-600 font-semibold">{fmtI(v)}</span>:'0'},
+            {key:'avg',label:'Avg',right:true,render:v=>v!=null?fmtDur(v):'—'},
+            {key:'median',label:'Median',right:true,render:v=>v!=null?fmtDur(v):'—'},
+            {key:'hrs',label:'Total Hrs',right:true,render:v=>fmtHrs(v)},
+            {key:'workers',label:'Workers',right:true,render:v=>fmtI(v)},
+          ]} rows={byStatus} />
+        :
+          <Table cols={[
+            {key:'worker',label:'Worker',w:170},
+            {key:'dept',label:'Department',w:150,render:v=>v||<span className="text-ink-300">—</span>},
+            {key:'count',label:'Segments',right:true,render:v=>fmtI(v)},
+            {key:'orders',label:'Orders',right:true,render:v=>fmtI(v)},
+            {key:'closed',label:'Closed',right:true,render:v=>fmtI(v)},
+            {key:'open',label:'Open',right:true,render:v=>v>0?<span className="text-amber-600 font-semibold">{fmtI(v)}</span>:'0'},
+            {key:'avg',label:'Avg',right:true,render:v=>v!=null?fmtDur(v):'—'},
+            {key:'hrs',label:'Total Hrs',right:true,render:v=>fmtHrs(v)},
+            {key:'xph',label:'XpH',right:true,render:v=>v!=null?<span className="font-semibold text-brand-600">{fmt(v)}</span>:'—'},
+          ]} rows={byWorker} onRow={r => r.workerId !== 'none' && nav(`/kpi/users?worker=${r.workerId}`)} />
+        }
+      </div>
+
+      {/* Segment Detail */}
+      <div className="card-surface overflow-hidden">
+        <div className="px-4 py-3 border-b border-surface-200 flex items-center justify-between">
+          <div>
+            <span className="text-xs font-semibold text-ink-600">Segment Detail</span>
+            <span className="text-[10px] text-ink-400 ml-2">{fmtI(Math.min(500,segRows.length))} of {fmtI(filtered.length)} · most recent first</span>
+          </div>
+          <button onClick={() => setShowSegs(!showSegs)}
+            className="text-[11px] px-3 py-1 rounded-lg border border-surface-200 text-ink-500 hover:text-brand-600 hover:border-brand-200 font-medium">
+            {showSegs ? 'Hide' : 'Show Segments'}
+          </button>
+        </div>
+        {showSegs && (
+          <div className="overflow-x-auto" style={{maxHeight:'500px'}}>
+            <table className="tbl"><thead className="sticky top-0 z-10"><tr>
+              <th>Date</th><th>Order</th><th>Worker</th><th>Department</th>
+              <th>Status</th><th>Type</th><th className="text-right">Duration</th>
+              <th className="text-right">Min</th><th className="text-right">Sec</th>
+              <th className="text-center">State</th><th>Classification</th><th>Level</th>
+            </tr></thead><tbody>
+              {segRows.map((s,i) => (
+                <tr key={i}>
+                  <td className="text-[11px] font-mono text-ink-500 whitespace-nowrap">{s.segmentStart ? fmtDateTime(s.segmentStart) : '—'}</td>
+                  <td>{s.orderSerialNumber ? <a href={`${ORDER_URL}${s.orderSerialNumber}?tab=order-information`} target="_blank" rel="noopener" className="text-brand-600 hover:underline font-mono text-[11px]">{s.orderSerialNumber}</a> : '—'}</td>
+                  <td className="text-[12px]">{s.displayName || s.workerName || '—'}</td>
+                  <td className="text-[12px] text-ink-500">{s.departmentName || '—'}</td>
+                  <td className="text-[12px]">{s.statusName || s.statusSlug || '—'}</td>
+                  <td className="capitalize text-[11px] text-ink-400">{s.orderType||'—'}</td>
+                  <td className="text-right font-mono text-[11px]">{s.isOpen ? <span className="text-amber-600">Open</span> : fmtDur(s.durationMinutes)}</td>
+                  <td className="text-right font-mono text-[10px] text-ink-400">{s.durationMinutes != null ? fmt(s.durationMinutes) : ''}</td>
+                  <td className="text-right font-mono text-[10px] text-ink-400">{s.durationSeconds != null ? fmtI(Math.round(s.durationSeconds)) : ''}</td>
+                  <td className="text-center"><span className={`badge ${s.isOpen?'badge-warning':'badge-success'}`}>{s.isOpen?'Open':'Closed'}</span></td>
+                  <td><span className={`text-[10px] font-semibold ${s.bucket==='In-Range'?'text-emerald-600':s.bucket==='Out-of-Range Short'||s.bucket==='Out-of-Range Long'?'text-amber-600':s.bucket==='Exclude Short'||s.bucket==='Exclude Long'?'text-red-600':'text-ink-400'}`}>{s.bucket||'—'}</span></td>
+                  <td className="text-[11px] font-mono text-ink-400">{s.userLevel||'—'}</td>
+                </tr>
+              ))}
+            </tbody></table>
+          </div>
+        )}
+      </div>
     </div>
   );
 }
 
-// ── Helpers ─────────────────────────────────────────────────
 function getMedian(arr) {
   if (!arr.length) return null;
-  const s = [...arr].sort((a,b) => a-b);
-  const mid = Math.floor(s.length / 2);
-  return s.length % 2 ? Math.round(s[mid]*10)/10 : Math.round((s[mid-1]+s[mid])/2*10)/10;
+  const s = [...arr].sort((a,b)=>a-b);
+  const mid = Math.floor(s.length/2);
+  return s.length%2 ? Math.round(s[mid]*10)/10 : Math.round((s[mid-1]+s[mid])/2*10)/10;
 }
 
-function formatDateShort(d) {
+function fmtDate(d) {
   if (!d) return '';
   const [,m,day] = d.split('-');
   const months = ['','Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
   return `${months[parseInt(m)]} ${parseInt(day)}`;
+}
+
+function fmtDateTime(iso) {
+  if (!iso) return '—';
+  try {
+    const d = new Date(iso);
+    return d.toLocaleDateString('en-US',{month:'short',day:'numeric'}) + ' ' +
+      d.toLocaleTimeString('en-US',{hour:'numeric',minute:'2-digit',hour12:true});
+  } catch { return iso.substring(0,16); }
 }

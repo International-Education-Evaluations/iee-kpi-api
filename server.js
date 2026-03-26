@@ -2800,10 +2800,10 @@ app.post('/config/benchmarks/thresholds/seed', requireRole('admin'), async (req,
     for (const t of thresholds) {
       if (!t.status) continue;
       const update = { updatedAt: new Date(), updatedBy: changedBy || 'seed' };
-      if (t.excludeShortSec !== undefined) update.excludeShortMin = Number(t.excludeShortSec);
-      if (t.inRangeMinSec !== undefined) update.inRangeMin = Number(t.inRangeMinSec);
-      if (t.inRangeMaxSec !== undefined) update.inRangeMax = Number(t.inRangeMaxSec);
-      if (t.excludeLongSec !== undefined) update.excludeLongMax = Number(t.excludeLongSec);
+      if (t.excludeShortSec !== undefined) update.excludeShortMin = Number(t.excludeShortSec) / 60;
+      if (t.inRangeMinSec !== undefined) update.inRangeMin = Number(t.inRangeMinSec) / 60;
+      if (t.inRangeMaxSec !== undefined) update.inRangeMax = Number(t.inRangeMaxSec) / 60;
+      if (t.excludeLongSec !== undefined) update.excludeLongMax = Number(t.excludeLongSec) / 60;
 
       await db.collection('dashboard_benchmarks').updateMany(
         { status: t.status },

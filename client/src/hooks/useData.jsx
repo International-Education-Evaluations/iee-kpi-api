@@ -1,4 +1,4 @@
-import React, { createContext, useContext, useState, useCallback, useEffect, useRef } from 'react';
+import React, { createContext, useContext, useState, useCallback, useRef } from 'react';
 import { api } from './useApi';
 import { disambiguateWorkers } from '../components/UI';
 
@@ -6,28 +6,61 @@ const DataContext = createContext(null);
 
 export function DataProvider({ children }) {
   const [kpiSegs, setKpiSegs] = useState([]);
+  const [classifiedSummary, setClassifiedSummary] = useState(null);
   const [qcEvents, setQcEvents] = useState([]);
   const [queueSnap, setQueueSnap] = useState(null);
   const [queueWait, setQueueWait] = useState(null);
-  const [classified, setClassified] = useState(null);
+  const [users, setUsers] = useState([]);
   const [kpiLoading, setKpiLoading] = useState(false);
   const [qcLoading, setQcLoading] = useState(false);
   const [queueLoading, setQueueLoading] = useState(false);
   const loadedRef = useRef({ kpi: false, qc: false, queue: false });
 
+  // ── Load KPI: fetch classified segments (paginated) ─────
+  // /kpi-classify returns segments WITH bucket, userLevel, departmentName, xphTarget
+  // This is a superset of /data/kpi-segments — use it as primary source
   const loadKpi = useCallback(async (force = false) => {
     if (loadedRef.current.kpi && !force) return;
     setKpiLoading(true);
     try {
-      let all = [], p = 1, more = true;
+      // Also load users for fallback dept resolution
+      const usersData = await api('/data/users').catch(() => ({ users: [] }));
+      const userList = usersData.users || [];
+      setUsers(userList);
+
+      // Build email→dept and v1Id→dept maps from backfill_users
+      const deptByEmail = {};
+      const deptByV1Id = {};
+      for (const u of userList) {
+        if (u.email && u.departmentName) deptByEmail[u.email.toLowerCase()] = u.departmentName;
+        if (u.v1Id && u.departmentName) deptByV1Id[String(u.v1Id)] = u.departmentName;
+      }
+
+      // Paginated fetch of classified segments
+      let all = [], p = 1, more = true, summary = null;
       while (more) {
-        const d = await api(`/data/kpi-segments?days=60&page=${p}&pageSize=5000`);
-        all = all.concat(d.segments || []);
-        more = d.hasMore; p++;
+        const d = await api(`/kpi-classify?days=60&page=${p}&pageSize=5000`);
+        if (p === 1) summary = d.classification;
+        const segs = (d.segments || []).map(s => {
+          // Resolve department: classify endpoint provides it, fallback to user lookup
+          let dept = s.departmentName || '';
+          if (!dept && s.workerEmail) dept = deptByEmail[s.workerEmail.toLowerCase()] || '';
+          if (!dept && s.workerUserId) dept = deptByV1Id[String(s.workerUserId)] || '';
+
+          // Compute XpH per segment (for performance table)
+          const durHrs = s.durationMinutes > 0 ? s.durationMinutes / 60 : 0;
+          const numerator = s.reportItemCount || 1;
+          const xph = durHrs > 0 ? Math.round(numerator / durHrs * 100) / 100 : null;
+
+          return { ...s, departmentName: dept, xph };
+        });
+        all = all.concat(segs);
+        more = d.hasMore;
+        p++;
       }
       setKpiSegs(disambiguateWorkers(all));
+      setClassifiedSummary(summary);
       loadedRef.current.kpi = true;
-      try { const c = await api('/kpi-classify?days=60&page=1&pageSize=5000'); setClassified(c); } catch {}
     } catch (e) { console.error('KPI load failed:', e); }
     setKpiLoading(false);
   }, []);
@@ -78,7 +111,7 @@ export function DataProvider({ children }) {
 
   return (
     <DataContext.Provider value={{
-      kpiSegs, qcEvents, queueSnap, queueWait, classified,
+      kpiSegs, classifiedSummary, qcEvents, queueSnap, queueWait, users,
       kpiLoading, qcLoading, queueLoading,
       loadKpi, loadQc, loadQueue, forceRefreshQueue, refreshAll
     }}>
