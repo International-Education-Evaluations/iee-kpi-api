@@ -2077,6 +2077,50 @@ app.post('/auth/users/:id/regenerate-key', requireRole('admin'), async (req, res
   }
 });
 
+// —— DELETE /auth/users/:id — Permanently delete a dashboard user ——
+app.delete('/auth/users/:id', requireRole('admin'), async (req, res) => {
+  try {
+    const db = await getConfigDb();
+    const user = await db.collection('dashboard_users').findOne({ _id: new ObjectId(req.params.id) });
+    if (!user) return res.status(404).json({ error: 'User not found' });
+
+    // Prevent self-deletion
+    if (user._id.toString() === req.user?.userId) {
+      return res.status(400).json({ error: 'Cannot delete your own account' });
+    }
+
+    await db.collection('dashboard_users').deleteOne({ _id: new ObjectId(req.params.id) });
+    await auditLog('delete_user', 'dashboard_users',
+      { userId: req.params.id, email: user.email, name: user.name },
+      req.user?.name);
+
+    res.json({ success: true, deleted: user.email });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// —— GET /config/benchmarks/statuses — Distinct status slugs from backfill ——
+// Used by the Benchmarks config UI to prefill the status dropdown
+app.get('/config/benchmarks/statuses', async (req, res) => {
+  try {
+    const db = await getConfigDb();
+    const slugs = await db.collection('backfill_kpi_segments').distinct('statusSlug');
+    const names = await db.collection('backfill_kpi_segments').distinct('statusName');
+    // Build slug→name map
+    const segments = await db.collection('backfill_kpi_segments')
+      .aggregate([
+        { $group: { _id: '$statusSlug', name: { $first: '$statusName' }, count: { $sum: 1 } } },
+        { $sort: { count: -1 } }
+      ]).toArray();
+    res.json({
+      statuses: segments.map(s => ({ slug: s._id, name: s.name, count: s.count }))
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 
 // ═══════════════════════════════════════════════════════════
 // AI CHATBOT — Claude API proxy with live data access
@@ -2217,6 +2261,8 @@ app.post('/ai/chat', aiRateLimit, async (req, res) => {
 
     // Define tools that Claude can use to fetch live data
     // GUARDRAILS: All tools are capped at 90 days max, return summaries only (never raw rows)
+    const guardrailConfig = await getGuardrails();
+    const maxIterations = guardrailConfig.maxToolIterations || 5;
     const tools = [
       {
         name: 'fetch_kpi_summary',
@@ -2309,8 +2355,6 @@ app.post('/ai/chat', aiRateLimit, async (req, res) => {
 
     // Handle tool use — Claude wants to fetch data
     let iterations = 0;
-    const guardrailConfig = await getGuardrails();
-    const maxIterations = guardrailConfig.maxToolIterations || 5;
 
     while (claudeData.stop_reason === 'tool_use' && iterations < maxIterations) {
       iterations++;

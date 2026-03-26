@@ -8,7 +8,7 @@ export default function SettingsPage() {
     <div className="space-y-5">
       <div><h1 className="text-xl font-display font-bold text-ink-900">Configuration</h1><p className="text-xs text-ink-400 mt-0.5">Benchmarks, production hours, user levels · All changes audited</p></div>
       <Pills tabs={[{key:'benchmarks',label:'Benchmarks'},{key:'thresholds',label:'Thresholds'},{key:'hours',label:'Production Hours'},{key:'levels',label:'User Levels'},{key:'audit',label:'Audit Log'}]} active={tab} onChange={setTab} />
-      {tab==='benchmarks'&&<ConfigTable title="XpH Benchmarks" sub="Targets by team, status, and level" endpoint="/config/benchmarks" dataKey="benchmarks" idFields={[{key:'team',label:'Team'},{key:'status',label:'Status'}]} extra={[{key:'xphUnit',label:'Unit'}]} />}
+      {tab==='benchmarks'&&<BenchmarkConfig />}
       {tab==='thresholds'&&<ThresholdConfig />}
       {tab==='hours'&&<ConfigTable title="Production Hours" sub="Net processing hours per day" endpoint="/config/production-hours" dataKey="hours" idFields={[{key:'team',label:'Team'},{key:'status',label:'Status'}]} />}
       {tab==='levels'&&<UserLevels />}
