@@ -3752,12 +3752,10 @@ async function runOrderArrivalBackfill(prodDb, configDb, push, opts = {}) {
     const arrCol    = configDb.collection('backfill_order_arrivals');
     const turnCol   = configDb.collection('backfill_order_turnaround');
 
-    // Data floor: 2025-01-01 — oldest data we trust for demand/staffing analysis.
-    // Pre-2025 data exists but is fragile (low volume, system changes, inconsistent fields).
-    // Separate from the migration spike: 2026-02-06 had 123,490 bulk-imported V1 historical
-    // orders all stamped that single day — those are excluded by the $ne filter below,
-    // not by this floor date.
-    const DATA_FLOOR = new Date('2025-01-01T00:00:00.000Z');
+    // Data floor: 2026-02-07 — V2 go-live date. Only real organic orders from this date forward.
+    // The Feb 6 migration day had 123,490 bulk-imported V1 orders stamped that day — excluded
+    // via $nor below. Real V2 organic orders start Feb 7, 2026.
+    const DATA_FLOOR = new Date('2026-02-07T00:00:00.000Z');
     // Feb 6 2026 migration spike bounds — exclude this specific day regardless of cutoff
     const MIGRATION_DAY_START = new Date('2026-02-06T00:00:00.000Z');
     const MIGRATION_DAY_END   = new Date('2026-02-07T00:00:00.000Z');
