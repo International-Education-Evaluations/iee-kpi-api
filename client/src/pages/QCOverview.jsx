@@ -71,7 +71,10 @@ export default function QCOverview() {
 
   const byDept = useMemo(()=>{
     const d={};
-    filtered.forEach(e=>{const k=e.departmentName||'(blank)';if(!d[k])d[k]={dept:k,total:0,fi:0,kb:0,orders:new Set(),users:new Set()};
+    filtered.forEach(e=>{
+      const k=e.departmentName;
+      if(!k) return; // skip events with no department
+      if(!d[k])d[k]={dept:k,total:0,fi:0,kb:0,orders:new Set(),users:new Set()};
       d[k].total++;if(e.isFixedIt)d[k].fi++;if(e.isKickItBack)d[k].kb++;
       if(e.orderSerialNumber)d[k].orders.add(e.orderSerialNumber);if(e.accountableName)d[k].users.add(e.accountableName.trim());});
     return Object.values(d).map(d=>({...d,orders:d.orders.size,users:d.users.size,fiP:d.total?d.fi/d.total:0,kbRate:d.total?Math.round(d.kb/d.total*100):0})).sort((a,b)=>b.total-a.total);
@@ -104,7 +107,7 @@ export default function QCOverview() {
     evts.map(e => ({...e, outcome: e.isFixedIt?'Fixed It':e.isKickItBack?'Kick Back':'—'})), []);
 
   const openDeptDrawer = useCallback((row) => {
-    const evts = filtered.filter(e=>(e.departmentName||'(blank)')===row.dept);
+    const evts = filtered.filter(e=>(e.departmentName||'')===row.dept);
     setDrawer({open:true, title:row.dept, subtitle:`${fmtI(row.total)} events · ${fmtI(row.fi)} fixed · ${fmtI(row.kb)} kick-back · ${row.kbRate}% KB rate`, rows:withOutcome(evts)});
   },[filtered, withOutcome]);
 

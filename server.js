@@ -3406,7 +3406,10 @@ async function runOrderArrivalBackfill(prodDb, configDb, push) {
     // Go-live date: 2026-02-06 — orders before this date are V1 historical imports
     // with original createdAt dates that don't represent real post-launch demand.
     // We never look further back than go-live regardless of what's in the collection.
-    const GO_LIVE = new Date('2026-02-06T00:00:00.000Z');
+    // 2026-02-06 was the V1→V2 migration date. All historical V1 orders were imported
+    // that day with createdAt stamped as 2026-02-06, creating a massive artificial spike.
+    // Real organic orders start from 2026-02-07 onward.
+    const GO_LIVE = new Date('2026-02-07T00:00:00.000Z');
 
     const latest   = await turnCol.findOne({}, { sort:{ createdAt:-1 }, projection:{ createdAt:1 } });
     const bufferMs = 30 * 60 * 1000;
@@ -3414,7 +3417,7 @@ async function runOrderArrivalBackfill(prodDb, configDb, push) {
       ? new Date(new Date(latest.createdAt).getTime() - bufferMs)
       : new Date(Date.now() - 180 * 24 * 60 * 60 * 1000);
     // Enforce go-live floor — never pull pre-launch V1 historical orders
-    const cutoff = rawCutoff < GO_LIVE ? GO_LIVE : rawCutoff;
+    let cutoff = rawCutoff < GO_LIVE ? GO_LIVE : rawCutoff;
 
     // One-time cleanup: remove any records that were inserted before the isImport filter
     // was added. These are V1 bulk-import orders that artificially spike the heatmap.
@@ -3424,12 +3427,15 @@ async function runOrderArrivalBackfill(prodDb, configDb, push) {
     const totalExisting = await turnCol.countDocuments();
     // Purge stale data: if the collection contains pre-go-live records from
     // the old V1 historical import backfill, wipe and reseed with correct filter.
+    // Also catch records exactly on the migration date (2026-02-06) which are
+    // V1 historical orders stamped with that date, not real organic demand.
+    const MIGRATION_DATE_END = new Date('2026-02-07T00:00:00.000Z');
     const hasPreLaunchData = totalExisting > 0 &&
-      await turnCol.countDocuments({ createdAt: { $lt: GO_LIVE } }) > 0;
+      await turnCol.countDocuments({ createdAt: { $lt: MIGRATION_DATE_END } }) > 0;
 
     if (hasPreLaunchData) {
-      const preCount = await turnCol.countDocuments({ createdAt: { $lt: GO_LIVE } });
-      push(`  Found ${preCount} pre-launch records — purging and re-seeding`);
+      const preCount = await turnCol.countDocuments({ createdAt: { $lt: MIGRATION_DATE_END } });
+      push(`  Found ${preCount} pre/migration records — purging and re-seeding from 2026-02-07`);
       await turnCol.deleteMany({});
       await arrCol.deleteMany({});
       cutoff = GO_LIVE; // reseed from go-live date only

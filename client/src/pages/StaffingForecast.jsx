@@ -8,7 +8,7 @@ const DAYS = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
 const HOURS = Array.from({ length: 24 }, (_, i) => i);
 const fmtHour = h => h === 0 ? '12am' : h < 12 ? `${h}am` : h === 12 ? '12pm' : `${h-12}pm`;
 const fmtHrs  = h => h == null ? '—' : h < 24 ? `${h}h` : `${Math.round(h/24*10)/10}d`;
-const TT = { contentStyle:{ background:'#1e293b', border:'1px solid rgba(255,255,255,0.1)', borderRadius:8, color:'#f1f5f9', fontSize:12 } };
+const TT = { contentStyle:{ background:'#1e293b', border:'1px solid rgba(255,255,255,0.1)', borderRadius:8, color:'#f1f5f9', fontSize:12, padding:'10px 14px' }, labelStyle:{ fontWeight:600, color:'#fff', marginBottom:4 } };
 
 function heatStyle(val, max) {
   if (!max || !val) return { background:'#f1f5f9', color:'#94a3b8' };
@@ -251,7 +251,9 @@ export default function StaffingForecast() {
                     <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.05)" vertical={false} />
                     <XAxis dataKey="label" tick={{ fill:'#94a3b8', fontSize:9 }} angle={-40} textAnchor="end" height={50} />
                     <YAxis tick={{ fill:'#94a3b8', fontSize:10 }} />
-                    <Tooltip {...TT} formatter={(v,n) => n==='requiredStaff'?[v,'Staff needed']: [`${v} orders`,'Avg arrivals']} />
+                    <Tooltip {...TT}
+                      labelFormatter={(label) => `Hour: ${label}`}
+                      formatter={(v, n) => n === 'requiredStaff' ? [`${v} staff`, 'Concurrent staff needed'] : [`${v} orders`, 'Avg arrivals/hr']} />
                     <Bar dataKey="requiredStaff" name="Staff needed" radius={[4,4,0,0]}>
                       {staffingModel.map((s,i) => <Cell key={i} fill={s.requiredStaff >= maxStaff*0.8 ? '#dc2626' : s.requiredStaff >= maxStaff*0.5 ? '#d97706' : '#16a34a'} />)}
                     </Bar>
