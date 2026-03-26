@@ -16,51 +16,74 @@ export function DataProvider({ children }) {
   const [queueLoading, setQueueLoading] = useState(false);
   const loadedRef = useRef({ kpi: false, qc: false, queue: false });
 
-  // ── Load KPI: fetch classified segments (paginated) ─────
-  // /kpi-classify returns segments WITH bucket, userLevel, departmentName, xphTarget
-  // This is a superset of /data/kpi-segments — use it as primary source
   const loadKpi = useCallback(async (force = false) => {
     if (loadedRef.current.kpi && !force) return;
     setKpiLoading(true);
     try {
-      // Also load users for fallback dept resolution
+      // 1. Load users for department/level resolution
       const usersData = await api('/data/users').catch(() => ({ users: [] }));
       const userList = usersData.users || [];
       setUsers(userList);
 
-      // Build email→dept and v1Id→dept maps from backfill_users
-      const deptByEmail = {};
-      const deptByV1Id = {};
+      // Build lookup maps: email→{dept,level}, v1Id→{dept}
+      const userByEmail = {};
+      const userByV1Id = {};
       for (const u of userList) {
-        if (u.email && u.departmentName) deptByEmail[u.email.toLowerCase()] = u.departmentName;
-        if (u.v1Id && u.departmentName) deptByV1Id[String(u.v1Id)] = u.departmentName;
+        if (u.email) {
+          userByEmail[u.email.toLowerCase()] = {
+            dept: u.departmentName || '',
+            name: u.fullName || '',
+          };
+        }
+        if (u.v1Id) {
+          userByV1Id[String(u.v1Id)] = {
+            dept: u.departmentName || '',
+            name: u.fullName || '',
+          };
+        }
       }
 
-      // Paginated fetch of classified segments
-      let all = [], p = 1, more = true, summary = null;
+      // 2. Load user levels from config (for level assignment)
+      let levelByEmail = {};
+      let levelByV1Id = {};
+      try {
+        const lvlData = await api('/config/user-levels');
+        for (const l of (lvlData.levels || [])) {
+          if (l.email) levelByEmail[l.email.toLowerCase()] = l.level;
+          if (l.v1Id) levelByV1Id[String(l.v1Id)] = l.level;
+        }
+      } catch {}
+
+      // 3. Load raw segments from backfill (fast — direct MongoDB read)
+      let all = [], p = 1, more = true;
       while (more) {
-        const d = await api(`/kpi-classify?days=60&page=${p}&pageSize=5000`);
-        if (p === 1) summary = d.classification;
-        const segs = (d.segments || []).map(s => {
-          // Resolve department: classify endpoint provides it, fallback to user lookup
-          let dept = s.departmentName || '';
-          if (!dept && s.workerEmail) dept = deptByEmail[s.workerEmail.toLowerCase()] || '';
-          if (!dept && s.workerUserId) dept = deptByV1Id[String(s.workerUserId)] || '';
-
-          // Compute XpH per segment (for performance table)
-          const durHrs = s.durationMinutes > 0 ? s.durationMinutes / 60 : 0;
-          const numerator = s.reportItemCount || 1;
-          const xph = durHrs > 0 ? Math.round(numerator / durHrs * 100) / 100 : null;
-
-          return { ...s, departmentName: dept, xph };
-        });
-        all = all.concat(segs);
+        const d = await api(`/data/kpi-segments?page=${p}&pageSize=5000`);
+        all = all.concat(d.segments || []);
         more = d.hasMore;
         p++;
       }
-      setKpiSegs(disambiguateWorkers(all));
-      setClassifiedSummary(summary);
+
+      // 4. Enrich segments with department + level from user maps
+      const enriched = all.map(s => {
+        const email = (s.workerEmail || '').toLowerCase();
+        const v1Id = s.workerUserId ? String(s.workerUserId) : '';
+
+        // Department resolution
+        let dept = '';
+        if (email && userByEmail[email]) dept = userByEmail[email].dept;
+        else if (v1Id && userByV1Id[v1Id]) dept = userByV1Id[v1Id].dept;
+
+        // Level resolution
+        let level = '';
+        if (email && levelByEmail[email]) level = levelByEmail[email];
+        else if (v1Id && levelByV1Id[v1Id]) level = levelByV1Id[v1Id];
+
+        return { ...s, departmentName: dept, userLevel: level };
+      });
+
+      setKpiSegs(disambiguateWorkers(enriched));
       loadedRef.current.kpi = true;
+
     } catch (e) { console.error('KPI load failed:', e); }
     setKpiLoading(false);
   }, []);

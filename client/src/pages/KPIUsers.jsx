@@ -43,7 +43,7 @@ export default function KPIUsers() {
     const xph = t > 0 ? c.length / (t/60) : 0;
     const dept = userSegs.find(s => s.departmentName)?.departmentName || '';
     const level = userSegs.find(s => s.userLevel)?.userLevel || '';
-    const inRange = userSegs.filter(s => s.bucket === 'In-Range').length;
+    const inRange = 0; // bucket classification not available on raw segments
     const scorable = c.length || 1;
     return {
       total: userSegs.length, closed: c.length, open: userSegs.filter(s=>s.isOpen).length,
@@ -71,16 +71,14 @@ export default function KPIUsers() {
     const d = {};
     userSegs.forEach(s => {
       const k = s.statusName || s.statusSlug;
-      if (!d[k]) d[k] = { status:k, count:0, totalMin:0, closed:0, inRange:0 };
+      if (!d[k]) d[k] = { status:k, count:0, totalMin:0, closed:0 };
       d[k].count++;
       if (!s.isOpen && s.durationMinutes>0) { d[k].totalMin += s.durationMinutes; d[k].closed++; }
-      if (s.bucket === 'In-Range') d[k].inRange++;
     });
     return Object.values(d).map(d => ({
       ...d, avg: d.closed ? Math.round(d.totalMin/d.closed*10)/10 : null,
       hrs: Math.round(d.totalMin/60*10)/10,
       pct: userSegs.length ? Math.round(d.count/userSegs.length*100) : 0,
-      irPct: d.closed ? Math.round(d.inRange/d.closed*1000)/10 : null,
     })).sort((a,b) => b.count - a.count);
   }, [userSegs]);
 
@@ -130,7 +128,7 @@ export default function KPIUsers() {
           <Card label="Open" value={fmtI(m?.open)} color="amber" loading={loading} />
           <Card label="Avg Duration" value={fmtDur(m?.avg)} color="brand" loading={loading} />
           <Card label="Median" value={fmtDur(m?.median)} color="slate" loading={loading} />
-          <Card label="In-Range" value={m?.inRangePct!=null?`${m.inRangePct}%`:'—'} color="green" loading={loading} />
+          <Card label="Total Hours" value={fmtHrs(m?.hrs)} color="navy" loading={loading} />
           <Card label="XpH" value={m?.xph ? fmt(m.xph) : '—'} sub="segments/hr" color="plum" loading={loading} />
         </div>
 
@@ -174,7 +172,6 @@ export default function KPIUsers() {
             {key:'pct',label:'Share',right:true,render:v=><span className="text-ink-400">{v}%</span>},
             {key:'avg',label:'Avg',right:true,render:v=>v!=null?fmtDur(v):'—'},
             {key:'hrs',label:'Total Hrs',right:true,render:v=>fmtHrs(v)},
-            {key:'irPct',label:'In-Range',right:true,render:v=>v!=null?<span className={v>=50?'text-emerald-600 font-semibold':'text-ink-400'}>{v}%</span>:'—'},
           ]} rows={byStatus} />
         </div>
 

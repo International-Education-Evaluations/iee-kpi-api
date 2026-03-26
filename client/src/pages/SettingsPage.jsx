@@ -77,25 +77,41 @@ function UserLevels() {
   const [levels,setLevels]=useState({});
   const [loading,setLoading]=useState(true);
   const [filter,setFilter]=useState('');
+  const [deptFilter,setDeptFilter]=useState('');
   const [saving,setSaving]=useState(null);
 
   useEffect(()=>{(async()=>{setLoading(true);try{const[ur,lr]=await Promise.all([api('/users'),api('/config/user-levels').catch(()=>({levels:[]}))]);setUsers(ur.users||[]);const m={};for(const l of(lr.levels||[]))m[l.email?.toLowerCase()]=l.level;setLevels(m);}catch(e){console.error(e);}setLoading(false);})();},[]);
 
   const update=async(u,lv)=>{const em=(u.email||'').toLowerCase();setSaving(em);try{await api('/config/user-levels',{method:'PUT',body:JSON.stringify({email:em,name:u.fullName||'',department:u.department||'',level:lv||null,changedBy:getUser()?.name})});setLevels(p=>({...p,[em]:lv||null}));}catch(e){alert('Failed: '+e.message);}setSaving(null);};
 
-  const fl=users.filter(u=>{if(!filter)return true;const s=filter.toLowerCase();return(u.fullName||'').toLowerCase().includes(s)||(u.email||'').toLowerCase().includes(s)||(u.department||'').toLowerCase().includes(s);});
+  const depts = [...new Set(users.map(u=>u.department).filter(Boolean))].sort();
+
+  const fl=users.filter(u=>{
+    if(deptFilter && u.department !== deptFilter) return false;
+    if(!filter) return true;
+    const s=filter.toLowerCase();
+    return(u.fullName||'').toLowerCase().includes(s)||(u.email||'').toLowerCase().includes(s)||(u.department||'').toLowerCase().includes(s);
+  });
 
   if(loading) return <Skel rows={10} cols={5} />;
   return (
     <div className="space-y-3">
       <div className="card-surface p-4"><Section title="User Levels" sub={`${users.length} staff. Level changes save immediately.`} />
-        <input type="text" value={filter} onChange={e=>setFilter(e.target.value)} placeholder="Search name, email, department..." className="w-full max-w-sm px-3 py-2 bg-white border border-surface-200 rounded-lg text-sm text-ink-900 placeholder-ink-400 focus:outline-none focus:border-brand-400 mt-2" />
+        <div className="flex flex-wrap gap-3 mt-2">
+          <input type="text" value={filter} onChange={e=>setFilter(e.target.value)} placeholder="Search name, email..." className="flex-1 min-w-[200px] max-w-sm px-3 py-2 bg-white border border-surface-200 rounded-lg text-sm text-ink-900 placeholder-ink-400 focus:outline-none focus:border-brand-400" />
+          <select value={deptFilter} onChange={e=>setDeptFilter(e.target.value)} className="px-3 py-2 bg-white border border-surface-200 rounded-lg text-sm text-ink-800 focus:outline-none focus:border-brand-400 min-w-[180px]">
+            <option value="">All Departments</option>
+            {depts.map(d=><option key={d} value={d}>{d}</option>)}
+          </select>
+          {(filter||deptFilter)&&<button onClick={()=>{setFilter('');setDeptFilter('');}} className="px-3 py-2 text-xs text-ink-400 hover:text-brand-600 font-medium">Clear</button>}
+        </div>
+        <div className="text-[10px] text-ink-400 mt-1.5">{fl.length} of {users.length} shown{deptFilter ? ` · ${deptFilter}` : ''}</div>
       </div>
       <div className="card-surface overflow-hidden"><div className="overflow-x-auto max-h-[550px] overflow-y-auto"><table className="tbl w-full"><thead className="sticky top-0 z-10"><tr><th>Name</th><th>Email</th><th>Department</th><th className="text-center">Level</th></tr></thead>
-        <tbody>{fl.slice(0,100).map((u,i)=>{const em=(u.email||'').toLowerCase();const cl=levels[em]||'';const sv=saving===em;return(
+        <tbody>{fl.slice(0,200).map((u,i)=>{const em=(u.email||'').toLowerCase();const cl=levels[em]||'';const sv=saving===em;return(
           <tr key={i}><td className="font-medium text-ink-900">{u.fullName||'—'}</td><td className="font-mono text-[11px]">{u.email||'—'}</td><td className="text-sm">{u.department||'—'}</td>
           <td className="text-center"><select value={cl} onChange={e=>update(u,e.target.value)} disabled={sv} className={`px-1.5 py-0.5 bg-white border rounded text-xs text-center font-mono ${sv?'border-amber-500 text-amber-600':cl?'border-emerald-600/40 text-emerald-600':'border-surface-200 text-ink-400'}`}>{['','L0','L1','L2','L3','L4','L5'].map(l=><option key={l} value={l}>{l||'—'}</option>)}</select></td></tr>);})}</tbody></table></div>
-      {fl.length>100&&<div className="px-4 py-1.5 text-[10px] text-ink-500 border-t border-surface-200">Showing 100 of {fl.length}</div>}</div>
+      {fl.length>200&&<div className="px-4 py-1.5 text-[10px] text-ink-500 border-t border-surface-200">Showing 200 of {fl.length}</div>}</div>
     </div>
   );
 }

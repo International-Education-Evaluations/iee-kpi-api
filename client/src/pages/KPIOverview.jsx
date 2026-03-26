@@ -2,13 +2,15 @@ import React, { useEffect, useState, useMemo } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, Cell } from 'recharts';
 import { Card, Table, Pills, FilterBar, FilterSelect, FilterInput, FilterReset, ChartLegend, TOOLTIP_STYLE, fmt, fmtI, fmtDur, fmtHrs } from '../components/UI';
+import { api } from '../hooks/useApi';
 import { useData } from '../hooks/useData';
 
 const BUCKET_COLORS = { 'Exclude Short':'#94a3b8', 'Out-of-Range Short':'#F57F17', 'In-Range':'#16a34a', 'Out-of-Range Long':'#E65100', 'Exclude Long':'#B71C1C', 'Unclassified':'#cbd5e1', 'Open':'#3b82f6' };
 const ORDER_URL = 'https://admin.prod.iee.com/orders/';
 
 export default function KPIOverview() {
-  const { kpiSegs: segs, classifiedSummary, kpiLoading: loading, loadKpi } = useData();
+  const { kpiSegs: segs, kpiLoading: loading, loadKpi } = useData();
+  const [benchmarks, setBenchmarks] = useState([]);
   const [view, setView] = useState('status');
   const [fType, setFType] = useState('');
   const [fDept, setFDept] = useState('');
@@ -20,6 +22,35 @@ export default function KPIOverview() {
   const nav = useNavigate();
 
   useEffect(() => { loadKpi(); }, [loadKpi]);
+
+  // Load benchmarks for client-side classification
+  useEffect(() => {
+    api('/config/benchmarks').then(d => setBenchmarks(d.benchmarks || [])).catch(() => {});
+  }, []);
+
+  // Client-side 5-bucket classification
+  const classifySegment = useMemo(() => {
+    const benchMap = {};
+    for (const b of benchmarks) {
+      if (b.status) benchMap[b.status] = b;
+    }
+    return (s) => {
+      if (s.isOpen) return 'Open';
+      if (s.durationMinutes == null) return 'Unclassified';
+      const b = benchMap[s.statusSlug];
+      if (!b) return 'Unclassified';
+      const dur = s.durationMinutes;
+      const exShort = b.excludeShortMin ?? 0.5;
+      const irMin = b.inRangeMin ?? 1;
+      const irMax = b.inRangeMax ?? 120;
+      const exLong = b.excludeLongMax ?? 480;
+      if (dur < exShort) return 'Exclude Short';
+      if (dur < irMin) return 'Out-of-Range Short';
+      if (dur <= irMax) return 'In-Range';
+      if (dur <= exLong) return 'Out-of-Range Long';
+      return 'Exclude Long';
+    };
+  }, [benchmarks]);
 
   // Dropdown options
   const workers = useMemo(() => {
@@ -52,7 +83,7 @@ export default function KPIOverview() {
     const thisWeek = filtered.filter(s => s.segmentStart >= d7).length;
     const lastWeek = filtered.filter(s => s.segmentStart >= d14 && s.segmentStart < d7).length;
     const volTrend = lastWeek > 0 ? Math.round((thisWeek - lastWeek) / lastWeek * 100) : null;
-    const inRange = filtered.filter(s => s.bucket === 'In-Range').length;
+    const inRange = filtered.filter(s => classifySegment(s) === 'In-Range').length;
     const scorable = closed.length || 1;
     return {
       total: filtered.length, closed: closed.length, open: filtered.filter(s=>s.isOpen).length,
@@ -67,17 +98,19 @@ export default function KPIOverview() {
     };
   }, [filtered]);
 
-  // Bucket data from classified summary or compute from filtered
+  // Bucket data — client-side classification
   const bucketData = useMemo(() => {
+    if (!benchmarks.length) return [];
     const counts = {};
-    filtered.forEach(s => { const b = s.bucket || 'Unclassified'; counts[b] = (counts[b]||0) + 1; });
+    filtered.forEach(s => { const b = classifySegment(s); counts[b] = (counts[b]||0) + 1; });
+    const total = filtered.length || 1;
     const order = ['Exclude Short','Out-of-Range Short','In-Range','Out-of-Range Long','Exclude Long','Unclassified','Open'];
     return order.filter(b => counts[b]).map(b => ({
       bucket: b.replace('Out-of-Range ','OOR ').replace('Exclude ','Excl '), fullName: b,
       count: counts[b], fill: BUCKET_COLORS[b],
-      pct: filtered.length ? Math.round(counts[b]/filtered.length*1000)/10 : 0,
+      pct: Math.round(counts[b]/total*1000)/10,
     }));
-  }, [filtered]);
+  }, [filtered, benchmarks, classifySegment]);
 
   // By Status — full parity with GAS KPI_BY_STATUS
   const byStatus = useMemo(() => {
@@ -301,7 +334,7 @@ export default function KPIOverview() {
                   <td className="text-right font-mono text-[10px] text-ink-400">{s.durationMinutes != null ? fmt(s.durationMinutes) : ''}</td>
                   <td className="text-right font-mono text-[10px] text-ink-400">{s.durationSeconds != null ? fmtI(Math.round(s.durationSeconds)) : ''}</td>
                   <td className="text-center"><span className={`badge ${s.isOpen?'badge-warning':'badge-success'}`}>{s.isOpen?'Open':'Closed'}</span></td>
-                  <td><span className={`text-[10px] font-semibold ${s.bucket==='In-Range'?'text-emerald-600':s.bucket==='Out-of-Range Short'||s.bucket==='Out-of-Range Long'?'text-amber-600':s.bucket==='Exclude Short'||s.bucket==='Exclude Long'?'text-red-600':'text-ink-400'}`}>{s.bucket||'—'}</span></td>
+                  <td>{(() => { const b = classifySegment(s); return <span className={`text-[10px] font-semibold ${b==='In-Range'?'text-emerald-600':b?.includes('Out-of-Range')?'text-amber-600':b?.includes('Exclude')?'text-red-600':'text-ink-400'}`}>{b}</span>; })()}</td>
                   <td className="text-[11px] font-mono text-ink-400">{s.userLevel||'—'}</td>
                 </tr>
               ))}
