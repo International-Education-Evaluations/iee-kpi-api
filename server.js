@@ -3726,28 +3726,36 @@ async function runUserSync(configDb, push) {
 }
 
 // ── Order Arrival & Turnaround Backfill ─────────────────────────────────────
-async function runOrderArrivalBackfill(prodDb, configDb, push) {
+async function runOrderArrivalBackfill(prodDb, configDb, push, opts = {}) {
   try {
     push('Backfilling order arrivals + turnaround...');
     const ordersCol = prodDb.collection('orders');
     const arrCol    = configDb.collection('backfill_order_arrivals');
     const turnCol   = configDb.collection('backfill_order_turnaround');
 
-    // Go-live date: 2026-02-06 — orders before this date are V1 historical imports
+    // Go-live date: 2026-02-07 — orders before this date are V1 historical imports
     // with original createdAt dates that don't represent real post-launch demand.
-    // We never look further back than go-live regardless of what's in the collection.
     // 2026-02-06 was the V1→V2 migration date. All historical V1 orders were imported
     // that day with createdAt stamped as 2026-02-06, creating a massive artificial spike.
     // Real organic orders start from 2026-02-07 onward.
     const GO_LIVE = new Date('2026-02-07T00:00:00.000Z');
 
-    const latest   = await turnCol.findOne({}, { sort:{ createdAt:-1 }, projection:{ createdAt:1 } });
-    const bufferMs = 30 * 60 * 1000;
-    const rawCutoff = latest?.createdAt
-      ? new Date(new Date(latest.createdAt).getTime() - bufferMs)
-      : new Date(Date.now() - 180 * 24 * 60 * 60 * 1000);
-    // Enforce go-live floor — never pull pre-launch V1 historical orders
-    let cutoff = rawCutoff < GO_LIVE ? GO_LIVE : rawCutoff;
+    // On a full refresh: always seed from GO_LIVE regardless of what's in the collection.
+    // Without this, a stale single record left from a previous partial run causes
+    // latest?.createdAt to resolve to today → cutoff = today → only today's orders fetched.
+    let cutoff;
+    if (opts.forceFullSeed) {
+      cutoff = GO_LIVE;
+      push(`  Arrivals: full seed mode — fetching all orders since GO_LIVE`);
+    } else {
+      const latest   = await turnCol.findOne({}, { sort:{ createdAt:-1 }, projection:{ createdAt:1 } });
+      const bufferMs = 30 * 60 * 1000;
+      const rawCutoff = latest?.createdAt
+        ? new Date(new Date(latest.createdAt).getTime() - bufferMs)
+        : new Date(Date.now() - 180 * 24 * 60 * 60 * 1000);
+      // Enforce go-live floor — never pull pre-launch V1 historical orders
+      cutoff = rawCutoff < GO_LIVE ? GO_LIVE : rawCutoff;
+    }
 
     // One-time cleanup: remove any records that were inserted before the isImport filter
     // was added. These are V1 bulk-import orders that artificially spike the heatmap.
@@ -3845,26 +3853,32 @@ async function runOrderArrivalBackfill(prodDb, configDb, push) {
     await processBatch(turnaroundOps.splice(0));
     push(`  Processed ${totalProcessed} orders`);
 
-    // Enrich turnaround records with departmentName from backfill_kpi_segments.
-    // Orders don't have a department field — we derive it from the most common
-    // departmentName seen in segments for that order (the team that worked it most).
+    // Enrich turnaround records with departmentName via backfill_users.
+    // Orders don't have a department field — we derive it by:
+    //   1. Building a Map of v2Id → departmentName from backfill_users
+    //   2. Finding the dominant workerUserId per order from backfill_kpi_segments
+    //   3. Looking up that workerUserId (which IS a v2Id) in the Map
+    // NOTE: workerUserId in segments is populated from assignedTo.foreignKeyId || assignedTo.v2Id
+    // which produces v2-format ObjectId strings (e.g. "687a5894ef7495fca0666516").
+    // backfill_users.v1Id is an integer (e.g. 311571) — these NEVER match.
+    // Must key the Map on v2Id, not v1Id.
     push('  Enriching turnaround with department names...');
     try {
-      // Load backfill_users into memory as a Map: String(v1Id) → departmentName
-      // This is faster than a MongoDB $lookup + $toString on every doc
+      // Load backfill_users into memory as a Map: String(v2Id) → departmentName
       const userDeptDocs = await configDb.collection('backfill_users')
-        .find({ v1Id: { $exists: true, $ne: null }, departmentName: { $exists: true, $ne: null } },
-              { projection: { v1Id: 1, departmentName: 1 } }).toArray();
-      const deptByV1Id = new Map();
+        .find({ v2Id: { $exists: true, $ne: null }, departmentName: { $exists: true, $ne: null } },
+              { projection: { v2Id: 1, departmentName: 1 } }).toArray();
+      const deptByV2Id = new Map();
       for (const u of userDeptDocs) {
-        if (u.v1Id && u.departmentName) deptByV1Id.set(String(u.v1Id), u.departmentName);
+        if (u.v2Id && u.departmentName) deptByV2Id.set(String(u.v2Id), u.departmentName);
       }
-      push(`    Loaded ${deptByV1Id.size} users with department assignments`);
+      push(`    Loaded ${deptByV2Id.size} users with v2Id → dept mapping`);
 
-      if (deptByV1Id.size === 0) {
-        push('  Dept enrichment: 0 users with v1Id found — run user sync first');
+      if (deptByV2Id.size === 0) {
+        push('  Dept enrichment: 0 users with v2Id found — run user sync first');
       } else {
-        // Find the dominant workerUserId per orderSerialNumber from segments
+        // Find the dominant workerUserId per orderSerialNumber from segments.
+        // workerUserId is a v2Id string — matches directly against deptByV2Id keys.
         const workerByOrder = await configDb.collection('backfill_kpi_segments').aggregate([
           { $match: { orderSerialNumber: { $exists:true, $ne:null }, workerUserId: { $exists:true, $ne:null } } },
           { $group: { _id: { order:'$orderSerialNumber', uid:'$workerUserId' }, count:{ $sum:1 } } },
@@ -3877,7 +3891,7 @@ async function runOrderArrivalBackfill(prodDb, configDb, push) {
         const deptOps = [];
         let matched = 0, unmatched = 0;
         for (const r of workerByOrder) {
-          const dept = deptByV1Id.get(String(r.workerUserId));
+          const dept = deptByV2Id.get(String(r.workerUserId));
           if (dept) {
             deptOps.push({ updateOne: {
               filter: { orderSerialNumber: r._id },
@@ -3898,7 +3912,7 @@ async function runOrderArrivalBackfill(prodDb, configDb, push) {
           await turnCol.createIndex({ departmentName:1 }, { background:true }).catch(()=>{});
           await turnCol.createIndex({ departmentName:1, createdAt:-1 }, { background:true }).catch(()=>{});
         } else {
-          push('  Dept enrichment: 0 ops generated — check v1Id alignment between segments and users');
+          push('  Dept enrichment: 0 ops generated — no v2Id overlap between segments workerUserId and users');
         }
       }
     } catch (dErr) {
@@ -4564,7 +4578,7 @@ async function runBackfill(options = {}) {
     // 3c. ORDER ARRIVALS + TURNAROUND — staffing forecast data
     // ═════════════════════════════════════════════════════════
     try {
-      await runOrderArrivalBackfill(prodDb, configDb, push);
+      await runOrderArrivalBackfill(prodDb, configDb, push, { forceFullSeed: isFullRefresh });
     } catch (aErr) {
       push(`Order arrivals: SKIPPED (${aErr.message})`);
     }
@@ -5051,13 +5065,12 @@ function startBackfillScheduler() {
 
       const intervalMs = (settings.autoRefreshMinutes || 5) * 60 * 1000;
 
-      // Memory guard: skip auto-cron if a run is already consuming memory.
-      // Threshold is 450MB — leaves 62MB headroom on Railway's 512MB container.
-      // The order arrival step (180-day seed) can spike to ~460MB so this was
-      // raised from 300MB to avoid false-positive skips during initial seeding.
-      // After a skip, enforce a 90s cooldown so GC has time to run.
+      // Memory guard: skip auto-cron if RSS is unreasonably high.
+      // Raised to 4000MB — this server runs on a 32GB Railway instance so the
+      // old 450MB threshold (tuned for 512MB containers) was firing constantly.
+      // At 4000MB we only skip if something is genuinely leaking.
       const memMB = Math.round(process.memoryUsage().rss / 1024 / 1024);
-      if (memMB > 450) {
+      if (memMB > 4000) {
         _schedulerSkipUntil = Date.now() + 90_000; // 90s mandatory cooldown
         console.log(`[BACKFILL-CRON] Skipped — memory too high (${memMB}MB RSS). Cooldown 90s.`);
         return;
