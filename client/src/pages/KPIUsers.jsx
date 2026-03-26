@@ -115,7 +115,8 @@ export default function KPIUsers() {
     const unitSum  = closed.reduce((a,s) => a + (s.unitValue ?? 1), 0);
     const xph     = totalMin > 0 ? unitSum / (totalMin/60) : 0;
     const orders  = new Set(userSegs.map(s=>s.orderSerialNumber).filter(Boolean));
-    const totalReports = userSegs.reduce((a,s) => a + (s.reportItemCount||0), 0);
+    const totalReports     = userSegs.reduce((a,s) => a + (s.reportItemCount||0), 0);
+    const totalCredentials = userSegs.reduce((a,s) => a + (s.credentialCount||0), 0);
     const errorSegs = userSegs.filter(s => s.isErrorReporting).length;
 
     // week-over-week
@@ -135,6 +136,7 @@ export default function KPIUsers() {
       xph:    Math.round(xph*10)/10,
       xphUnit: closed.length>0 ? (closed.find(s=>s.xphUnit&&s.xphUnit!=='Orders')?.xphUnit || closed[0]?.xphUnit || 'Orders') : 'Orders',
       totalReports,
+      totalCredentials,
       errorSegs,
       dept:   userSegs.find(s=>s.departmentName)?.departmentName || '',
       level:  userSegs.find(s=>s.userLevel)?.userLevel || '',
@@ -323,6 +325,7 @@ export default function KPIUsers() {
           <Card label="XpH"          value={m?.xph?fmt(m.xph):'—'} sub={m?.xphUnit||'units/hr'} color="plum" loading={loading} />
           <Card label="Orders"       value={fmtI(m?.orders)}   color="brand"  loading={loading} />
           <Card label="Reports"      value={fmtI(m?.totalReports)} color="slate" loading={loading} />
+          <Card label="Credentials"  value={fmtI(m?.totalCredentials)} color="plum" loading={loading} />
         </div>
 
         {/* Charts */}
