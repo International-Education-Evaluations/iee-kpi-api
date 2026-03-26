@@ -2403,10 +2403,14 @@ const aiRateLimit = rateLimit({ windowMs: 60000, max: 10, message: { error: 'AI 
 
 // —— POST /ai/chat —————————————————————————————————————————
 // Proxies to Claude API with internal data tools
-app.post('/ai/chat', aiRateLimit, async (req, res) => {
-  // Memory guard: defer AI chat if backfill is running and memory is high
+app.post(`/ai/chat`, aiRateLimit, async (req, res) => {
   const chatMemMB = Math.round(process.memoryUsage().rss / 1024 / 1024);
-  if (backfillRunning && chatMemMB > 420) {
+  console.log(`[AI/chat] ▶ request — user=${req.user?.name||'?'} mem=${chatMemMB}MB backfillRunning=${backfillRunning}`);
+
+  // Memory guard: only block if backfill running AND memory is extremely high.
+  // Raised from 420 → 4000MB — server runs on 32GB Railway instance.
+  if (backfillRunning && chatMemMB > 4000) {
+    console.warn(`[AI/chat] ✗ blocked by memory guard (${chatMemMB}MB > 4000MB)`);
     return res.status(503).json({
       error: 'A data sync is running in the background. Please try again in 2–3 minutes.',
       retryAfter: 120
@@ -2415,6 +2419,7 @@ app.post('/ai/chat', aiRateLimit, async (req, res) => {
 
   try {
     if (!CONFIG.CLAUDE_API_KEY) {
+      console.error('[AI/chat] ✗ CLAUDE_API_KEY not set');
       return res.status(500).json({ error: 'Claude API key not configured' });
     }
 
@@ -2494,7 +2499,7 @@ app.post('/ai/chat', aiRateLimit, async (req, res) => {
           worker: { type: 'string', description: 'Worker name or email (required)' },
           days: { type: 'number', description: 'Days to look back (default 14)' }
         } }
-      },,
+      },
       {
         name: 'fetch_anomaly_scan',
         description: 'Scan for data anomalies and inconsistencies. Returns workers with unusual patterns: zero-activity days during work hours, abnormally high/low segment counts, segments with impossible durations, orders stuck in processing for extended periods, workers with no QC events despite high volume. Use when asked about discrepancies, suspicious patterns, or data quality.',
@@ -2502,7 +2507,7 @@ app.post('/ai/chat', aiRateLimit, async (req, res) => {
           dept: { type: 'string', description: 'Department filter for targeted anomaly scan.' },
           days: { type: 'number', description: 'Days to scan (default 7, max 30)' }
         } }
-      },,
+      },
       {
         name: 'fetch_order_demand',
         description: 'Fetch order arrival demand patterns and SLA analysis. Returns avg daily orders, peak hours/days, volume by day-of-week, SLA distributions, bottleneck statuses. Pass dept for department-filtered demand.',
@@ -2521,6 +2526,8 @@ app.post('/ai/chat', aiRateLimit, async (req, res) => {
     ];
 
     // First Claude call
+    const useModel = guardrailConfig.model || 'claude-sonnet-4-5';
+    console.log(`[AI/chat] → calling Anthropic API model=${useModel} msgs=${messages.length}`);
     const claudeRes = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
       headers: {
@@ -2529,7 +2536,7 @@ app.post('/ai/chat', aiRateLimit, async (req, res) => {
         'anthropic-version': '2023-06-01'
       },
       body: JSON.stringify({
-        model: guardrailConfig.model || 'claude-sonnet-4-5',
+        model: useModel,
         max_tokens: guardrailConfig.maxTokens || 4096,
         system: systemPrompt + glossaryText + contextStr,
         messages,
@@ -2537,13 +2544,15 @@ app.post('/ai/chat', aiRateLimit, async (req, res) => {
       })
     });
 
+    console.log(`[AI/chat] ← Anthropic response status=${claudeRes.status}`);
     if (!claudeRes.ok) {
       const errBody = await claudeRes.text();
-      console.error('Claude API error:', claudeRes.status, errBody);
+      console.error(`[AI/chat] ✗ Anthropic API error ${claudeRes.status}:`, errBody);
       return res.status(500).json({ error: 'Claude API error: ' + claudeRes.status });
     }
 
     let claudeData = await claudeRes.json();
+    console.log(`[AI/chat] stop_reason=${claudeData.stop_reason} content_blocks=${claudeData.content?.length}`);
 
     // Handle tool use — Claude wants to fetch data
     let iterations = 0;
@@ -3050,6 +3059,7 @@ app.post('/ai/chat', aiRateLimit, async (req, res) => {
       });
     } catch { /* non-critical */ }
 
+    console.log(`[AI/chat] ✓ done — iterations=${iterations} response_len=${response?.length||0}`);
     res.json({
       response,
       content: claudeData.content,
@@ -3057,7 +3067,7 @@ app.post('/ai/chat', aiRateLimit, async (req, res) => {
     });
 
   } catch (err) {
-    console.error('AI chat error:', err);
+    console.error(`[AI/chat] ✗ unhandled error:`, err.message, err.stack?.split('\n')[1]||'');
     res.status(500).json({ error: err.message });
   }
 });
@@ -3774,7 +3784,6 @@ async function runOrderArrivalBackfill(prodDb, configDb, push, opts = {}) {
     // rebuild by resetting the cutoff when we detect the collection has suspect data.
     const totalExisting = await turnCol.countDocuments();
     // Purge stale data: if the collection contains pre-floor records wipe and reseed.
-    const totalExisting = await turnCol.countDocuments();
     const hasPreFloorData = totalExisting > 0 &&
       await turnCol.countDocuments({ createdAt: { $lt: DATA_FLOOR } }) > 0;
 
