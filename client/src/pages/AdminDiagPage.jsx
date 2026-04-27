@@ -10,7 +10,7 @@ function defaultRange() {
 }
 
 export default function AdminDiagPage() {
-  const [tab, setTab] = useState('coverage'); // 'coverage' | 'order'
+  const [tab, setTab] = useState('health'); // 'health' | 'coverage' | 'order'
   return (
     <div className="space-y-4">
       <div>
@@ -22,12 +22,14 @@ export default function AdminDiagPage() {
 
       <Pills
         tabs={[
+          { key:'health',   label:'Data Health' },
           { key:'coverage', label:'Coverage Gaps' },
           { key:'order',    label:'Order Quality' },
         ]}
         active={tab} onChange={setTab}
       />
 
+      {tab === 'health'   && <DataHealthTool />}
       {tab === 'coverage' && <CoverageTool />}
       {tab === 'order'    && <OrderQualityTool />}
     </div>
@@ -323,6 +325,216 @@ function OrderQualityResult({ data }) {
           </table>
         </div>
       </div>
+    </div>
+  );
+}
+
+// ── Data Health tool ─────────────────────────────────────────────────────────
+function DataHealthTool() {
+  const [days, setDays] = useState(30);
+  const [data, setData] = useState(null);
+  const [err, setErr]   = useState(null);
+  const [loading, setLoading] = useState(false);
+  const [repairing, setRepairing] = useState({}); // serial -> bool
+
+  const run = useCallback(async () => {
+    setLoading(true); setErr(null);
+    try {
+      const r = await api(`/diag/data-health?days=${encodeURIComponent(days)}`);
+      setData(r);
+    } catch (e) { setErr(e.message); setData(null); }
+    setLoading(false);
+  }, [days]);
+
+  const repair = useCallback(async (serial) => {
+    if (!confirm(`Re-sync ${serial} from live history and delete orphan segments?`)) return;
+    setRepairing(p => ({ ...p, [serial]: true }));
+    try {
+      const r = await api('/diag/order-quality/repair', {
+        method: 'POST',
+        body: JSON.stringify({ serial }),
+      });
+      alert(`${serial}: deleted ${r.deletedCount} orphan segment${r.deletedCount === 1 ? '' : 's'} (live had ${r.liveProcessingEntries}, backfill had ${r.backfillSegments}).`);
+      // Refresh the panel so the order drops out of the offender lists.
+      await run();
+    } catch (e) {
+      alert(`Repair failed for ${serial}: ${e.message}`);
+    } finally {
+      setRepairing(p => ({ ...p, [serial]: false }));
+    }
+  }, [run]);
+
+  return (
+    <div className="space-y-4">
+      <div className="card-surface p-4 flex flex-wrap items-end gap-3">
+        <div>
+          <label className="block text-[10px] font-semibold uppercase tracking-wider text-ink-400 mb-1">Window (days)</label>
+          <select value={days} onChange={e => setDays(Number(e.target.value))}
+            className="px-3 py-1.5 bg-white border border-surface-200 rounded-lg text-xs text-ink-800 focus:outline-none focus:border-brand-400 focus:ring-2 focus:ring-brand-100">
+            <option value={7}>Last 7 days</option>
+            <option value={14}>Last 14 days</option>
+            <option value={30}>Last 30 days</option>
+            <option value={60}>Last 60 days</option>
+            <option value={90}>Last 90 days</option>
+          </select>
+        </div>
+        <button onClick={run} disabled={loading}
+          className="text-xs bg-brand-500 hover:bg-brand-600 disabled:bg-ink-300 text-white px-4 py-1.5 rounded-lg font-semibold">
+          {loading ? 'Scanning…' : 'Run scan'}
+        </button>
+        <span className="text-[11px] text-ink-400">
+          Reads only from <code className="font-mono text-[10px] bg-surface-100 px-1 rounded">backfill_kpi_segments</code> — no production load.
+        </span>
+      </div>
+
+      {err && <div className="card-surface bg-red-50 border-red-200 p-3 text-xs text-red-700">{err}</div>}
+      {!data && !loading && (
+        <div className="card-surface p-8 text-center text-ink-400 text-sm">
+          Click <span className="font-semibold">Run scan</span> to find orders with data-quality issues.
+        </div>
+      )}
+
+      {data && <DataHealthResult data={data} onRepair={repair} repairing={repairing} />}
+    </div>
+  );
+}
+
+function DataHealthResult({ data, onRepair, repairing }) {
+  const s = data.summary;
+  const affectedPct = s.totalOrders > 0
+    ? Math.round((s.anyAffectedOrderCount / s.totalOrders) * 1000) / 10
+    : 0;
+
+  return (
+    <div className="space-y-4">
+      <div className="metric-grid-5">
+        <Card label="Orders in window" value={fmtI(s.totalOrders)} color="brand"
+          tooltip="Distinct orders that have at least one segment in backfill_kpi_segments within the selected window." />
+        <Card label="Affected orders" value={fmtI(s.anyAffectedOrderCount)} sub={`${affectedPct}% of orders`} color={s.anyAffectedOrderCount > 0 ? 'red' : 'green'}
+          tooltip="Orders touched by at least one of the three data-quality patterns. Use the tables below to dig in." />
+        <Card label="Same-minute clusters" value={fmtI(s.ordersWithSameMinuteClusters)} sub={`${fmtI(s.clusteredEntriesTotal)} clustered entries`} color={s.ordersWithSameMinuteClusters > 0 ? 'amber' : 'slate'}
+          tooltip="Orders where 2+ Processing segments share the same wall-clock minute. V1↔V2 batch-sync signal. NOT autofixable — original times are lost." />
+        <Card label="Long segments (>24h)" value={fmtI(s.ordersWithLongSegments)} color={s.ordersWithLongSegments > 0 ? 'amber' : 'slate'}
+          tooltip="Closed Processing segments longer than 24 hours — usually chain-break artifacts where intermediate transitions went missing. Already excluded from Avg/Median in PR #2 if benchmarks classify them as Excl-Long." />
+        <Card label="Multi-open orders" value={fmtI(s.ordersWithMultipleOpen)} color={s.ordersWithMultipleOpen > 0 ? 'red' : 'green'}
+          tooltip="Orders with >1 open Processing segment. Structurally impossible if data is clean. AUTOFIXABLE via Repair — re-syncs from live history and deletes orphans." />
+      </div>
+
+      {data.multipleOpenOrders?.length > 0 && (
+        <div className="card-surface p-4">
+          <div className="text-xs font-semibold text-ink-600 mb-2">Multi-open orders ({data.multipleOpenOrders.length}) — autofixable</div>
+          <div className="text-[11px] text-ink-500 mb-3">
+            Each order below has multiple open Processing segments in our backfill. The "Repair" button re-reads live history and deletes orphans whose composite key no longer matches.
+          </div>
+          <div className="overflow-auto max-h-[400px]">
+            <table className="tbl w-full">
+              <thead className="sticky top-0 bg-surface-50">
+                <tr>
+                  <th className="text-[10px] px-3 py-2 text-left text-ink-500">Order</th>
+                  <th className="text-[10px] px-3 py-2 text-right text-ink-500">Open count</th>
+                  <th className="text-[10px] px-3 py-2 text-left text-ink-500">Open segments</th>
+                  <th className="text-[10px] px-3 py-2 text-right text-ink-500">Action</th>
+                </tr>
+              </thead>
+              <tbody>
+                {data.multipleOpenOrders.map(o => (
+                  <tr key={o.orderSerialNumber} className="border-t border-surface-100">
+                    <td className="px-3 py-2 text-xs font-mono">{o.orderSerialNumber}</td>
+                    <td className="px-3 py-2 text-xs text-right font-mono"><span className="badge badge-danger">{o.openCount}</span></td>
+                    <td className="px-3 py-2 text-[11px] text-ink-500">
+                      {(o.segments || []).slice(0, 3).map((seg, i) => (
+                        <div key={i}>{fmtDateTime(seg.segmentStart)} · {seg.statusName} · {seg.workerName}</div>
+                      ))}
+                      {o.segments && o.segments.length > 3 && <div className="text-ink-300">… +{o.segments.length - 3} more</div>}
+                    </td>
+                    <td className="px-3 py-2 text-right">
+                      <button onClick={() => onRepair(o.orderSerialNumber)} disabled={repairing[o.orderSerialNumber]}
+                        className="text-[11px] bg-emerald-600 hover:bg-emerald-700 disabled:bg-ink-300 text-white px-2.5 py-1 rounded font-semibold">
+                        {repairing[o.orderSerialNumber] ? 'Repairing…' : 'Repair'}
+                      </button>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
+
+      {data.sameMinuteOrders?.length > 0 && (
+        <div className="card-surface p-4">
+          <div className="text-xs font-semibold text-ink-600 mb-2">Same-minute cluster orders ({data.sameMinuteOrders.length}) — flag &amp; exclude</div>
+          <div className="text-[11px] text-ink-500 mb-3">
+            Original event times collapsed by V1↔V2 batch sync. We can't reconstruct them. KPI rollups already drop the zero-duration segments via the <code className="font-mono text-[10px] bg-surface-100 px-1 rounded">durationSeconds &gt; 0</code> filter; affected workers lose attribution for that real time.
+          </div>
+          <div className="overflow-auto max-h-[400px]">
+            <table className="tbl w-full">
+              <thead className="sticky top-0 bg-surface-50">
+                <tr>
+                  <th className="text-[10px] px-3 py-2 text-left text-ink-500">Order</th>
+                  <th className="text-[10px] px-3 py-2 text-right text-ink-500">Cluster count</th>
+                  <th className="text-[10px] px-3 py-2 text-right text-ink-500">Clustered entries</th>
+                  <th className="text-[10px] px-3 py-2 text-left text-ink-500">Sample minutes</th>
+                </tr>
+              </thead>
+              <tbody>
+                {data.sameMinuteOrders.map(o => (
+                  <tr key={o.orderSerialNumber} className="border-t border-surface-100">
+                    <td className="px-3 py-2 text-xs font-mono">{o.orderSerialNumber}</td>
+                    <td className="px-3 py-2 text-xs text-right font-mono">{fmtI(o.clusterCount)}</td>
+                    <td className="px-3 py-2 text-xs text-right font-mono">{fmtI(o.clusteredEntries)}</td>
+                    <td className="px-3 py-2 text-[11px] text-ink-500">
+                      {(o.minutes || []).slice(0, 3).map((m, i) => (
+                        <div key={i}><span className="font-mono">{m.minute}</span> · {m.count} entries</div>
+                      ))}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
+
+      {data.longDurationSegments?.length > 0 && (
+        <div className="card-surface p-4">
+          <div className="text-xs font-semibold text-ink-600 mb-2">Long Processing segments &gt; 24h ({data.longDurationSegments.length}) — already excluded</div>
+          <div className="text-[11px] text-ink-500 mb-3">
+            Segments spanning more than a day. Most are chain-break artifacts (the V1↔V2 sync dropped intermediate transitions, so the segment spans the gap). PR #2's Excl-Long filter already removes these from Avg / Median / Total Hours / XpH if benchmarks classify them past <code className="font-mono text-[10px] bg-surface-100 px-1 rounded">excludeLongSec</code>.
+          </div>
+          <div className="overflow-auto max-h-[400px]">
+            <table className="tbl w-full">
+              <thead className="sticky top-0 bg-surface-50">
+                <tr>
+                  <th className="text-[10px] px-3 py-2 text-left text-ink-500">Order</th>
+                  <th className="text-[10px] px-3 py-2 text-left text-ink-500">Status</th>
+                  <th className="text-[10px] px-3 py-2 text-left text-ink-500">Worker</th>
+                  <th className="text-[10px] px-3 py-2 text-left text-ink-500">Started</th>
+                  <th className="text-[10px] px-3 py-2 text-right text-ink-500">Duration (hrs)</th>
+                </tr>
+              </thead>
+              <tbody>
+                {data.longDurationSegments.map((s, i) => (
+                  <tr key={i} className="border-t border-surface-100">
+                    <td className="px-3 py-2 text-xs font-mono">{s.orderSerialNumber}</td>
+                    <td className="px-3 py-2 text-[11px]">{s.statusName}</td>
+                    <td className="px-3 py-2 text-[11px] text-ink-500">{s.workerName || '—'}</td>
+                    <td className="px-3 py-2 text-[11px] font-mono">{fmtDateTime(s.segmentStart)}</td>
+                    <td className="px-3 py-2 text-xs text-right font-mono text-amber-700">{fmt((s.durationMinutes || 0) / 60)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
+
+      {s.anyAffectedOrderCount === 0 && (
+        <div className="card-surface bg-emerald-50 border-emerald-200 p-6 text-center">
+          <div className="text-3xl mb-2">✓</div>
+          <div className="text-sm font-semibold text-emerald-700">No data-quality issues detected in this window.</div>
+        </div>
+      )}
     </div>
   );
 }

@@ -388,6 +388,31 @@ The benchmarks config is correct. The bugs were all in how the dashboard *aggreg
 
 ---
 
+## 6.6 Orphan segments + autofix (added 2026-04-27, shipped PR #4)
+
+User noticed during a real drilldown that completed orders still had "Open" Processing segments attributed to a worker. Order #1632389001 had completed at Apr 27 2:39 PM, but Elena Gamburg's Verification Processing drilldown showed **two** segments for that order both starting Apr 27 9:53 AM — one closed at 1h 17m, one still open. Meanwhile `/diag/order-quality?serial=1632389001` returned 6 history entries and **none** of them were a Verification Processing entry for Elena. The dashboard was showing segments that don't exist in V2's current `orderStatusHistory`.
+
+**Root cause** — the backfill loop at `server.js:4180-4209` and `server.js:4435-…` upserts into `backfill_kpi_segments` keyed on `_compositeKey = orderId_statusSlug_segmentStart`. There is **no delete step**. When V2 mutates an order's `orderStatusHistory` (the V1↔V2 sync apparently does this — entries get added, removed, or replaced after they were originally written), our backfill faithfully ingests the new state but never reconciles. The segments derived from the prior state remain in `backfill_kpi_segments` forever, with their `isOpen` flag frozen at whatever it was when first ingested. If they were the last entry of the array at that moment, they're permanent phantom-open segments.
+
+**Three patterns surfaced by `/diag/data-health` (PR #4)** — admin-only scan over `backfill_kpi_segments`, no production load:
+
+| Pattern | Detection | Autofixable? |
+|---------|-----------|--------------|
+| Same-minute clusters | `$group` by `(orderSerialNumber, substr(segmentStart, 0, 16))` with `count >= 2` | **No** — original event times collapsed by V1↔V2 batch sync; we can't reconstruct. KPI rollups already drop the zero-duration segments via `durationSeconds > 0` filter. Affected workers lose attribution silently. |
+| Long-duration segments (>24h) | `find({ isOpen: false, durationMinutes: { $gt: 1440 } })` | **No** — chain-break artifacts where intermediate `orderStatusHistory` entries went missing. Already excluded from central-tendency metrics by the §6.5 outlier filter. |
+| Multiple open segments per order | `$group` by `orderSerialNumber` over `isOpen: true`, count >= 2 | **Yes** — orphans from the upsert-without-delete bug. Re-read live history, recompute valid `_compositeKey` set, delete anything in backfill that's not in the set. |
+
+**Repair endpoint:** `POST /diag/order-quality/repair` with `{ serial }`. Pulls the order's current `orderStatusHistory` from production, computes the canonical set of valid composite keys, finds existing rows in `backfill_kpi_segments` for that order whose key is no longer valid, and `deleteMany`s them. Audit-logs every repair. Does not upsert — the next backfill cycle picks up the canonical segments.
+
+**Surface:** Diagnostics → Data Health tab — defaults to a 30-day window, returns prevalence numbers and three worst-offender tables (50 rows each). Multi-open table has a per-row Repair button.
+
+**Open follow-ups (not in PR #4, recommended next):**
+- **Reconciliation in the backfill cycle.** After each batch upserts segments, query `backfill_kpi_segments` for those order IDs, compare against the just-built composite keys, and delete orphans automatically. Closes the loop without human intervention.
+- **`dataQuality` flag on segments.** Stamp every segment with one of `null | 'batch_stamped' | 'chain_break'` at backfill time. Add a global "Exclude flagged orders from KPI rollups" toggle in Settings. Once on, KPIOverview / KPIUsers / KPIScorecard filter on the flag at aggregation time.
+- **Bulk repair.** A "Repair all" button on the Data Health panel that hits the repair endpoint for every order in the multi-open list. Currently one-at-a-time so we can verify behavior on a few orders first.
+
+---
+
 ## 7. References used while auditing
 
 - Backend monolith: `server.js` (route paths line numbers in §2)

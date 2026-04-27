@@ -5126,6 +5126,179 @@ app.get('/diag/order-quality', requireRole('admin'), async (req, res) => {
   }
 });
 
+// —— GET /diag/data-health?days=30 ——————————————————————————
+// Aggregate prevalence of data-quality issues across the active window.
+// Three patterns:
+//   - sameMinuteClusters: orders where 2+ Processing segments share the same
+//     wall-clock minute. Strong V1↔V2 batch-sync signal.
+//   - longDurationSegments: closed Processing segments > 24h. Usually chain-
+//     break artifacts where intermediate orderStatusHistory entries went missing.
+//   - multipleOpenOrders: orders with >1 open Processing segment in our backfill.
+//     This is structurally impossible if the data were clean (an order is in
+//     exactly one Processing status at a time), so any hit is an orphan from
+//     V2 mutating orderStatusHistory after our backfill ingested it.
+//
+// Returns summary counts + worst-offender lists (capped at 50 rows each).
+// All three patterns query the backfill collection (no production load).
+app.get('/diag/data-health', requireRole('admin'), async (req, res) => {
+  try {
+    const days = parsePositiveInt(req.query.days, 30, { min: 1, max: 90 });
+    const cutoff = new Date(Date.now() - days * 86400000).toISOString();
+    const configDb = await getConfigDb();
+    const segCol = configDb.collection('backfill_kpi_segments');
+
+    // ── Pattern 1: same-minute clusters ──────────────────────────────────
+    // Group segments by (orderSerialNumber, minute) where >= 2 entries collide.
+    const sameMinutePromise = segCol.aggregate([
+      { $match: { segmentStart: { $gte: cutoff } } },
+      { $project: {
+          orderSerialNumber: 1,
+          statusSlug: 1,
+          minute: { $substr: ['$segmentStart', 0, 16] }   // YYYY-MM-DDTHH:MM
+      } },
+      { $group: {
+          _id: { order: '$orderSerialNumber', minute: '$minute' },
+          count:    { $sum: 1 },
+          statuses: { $addToSet: '$statusSlug' }
+      } },
+      { $match: { count: { $gte: 2 } } },
+      { $group: {
+          _id: '$_id.order',
+          clusterCount:    { $sum: 1 },
+          clusteredEntries:{ $sum: '$count' },
+          minutes:         { $push: { minute: '$_id.minute', count: '$count', statuses: '$statuses' } }
+      } },
+      { $project: { _id: 0, orderSerialNumber: '$_id', clusterCount: 1, clusteredEntries: 1, minutes: { $slice: ['$minutes', 5] } } },
+      { $sort: { clusterCount: -1, clusteredEntries: -1 } },
+      { $limit: 50 }
+    ], { allowDiskUse: true }).toArray();
+
+    // ── Pattern 2: closed Processing segments longer than 24h ────────────
+    const longDurationPromise = segCol.find(
+      { segmentStart: { $gte: cutoff }, isOpen: false, durationMinutes: { $gt: 1440 } },
+      { projection: { _id: 0, orderSerialNumber: 1, segmentStart: 1, durationMinutes: 1, statusName: 1, workerName: 1, workerEmail: 1 } }
+    ).sort({ durationMinutes: -1 }).limit(50).toArray();
+
+    // ── Pattern 3: orders with >1 open Processing segment ────────────────
+    const multipleOpenPromise = segCol.aggregate([
+      { $match: { isOpen: true, segmentStart: { $gte: cutoff } } },
+      { $group: {
+          _id: '$orderSerialNumber',
+          openCount: { $sum: 1 },
+          segments:  { $push: { segmentStart: '$segmentStart', statusName: '$statusName', workerName: '$workerName' } }
+      } },
+      { $match: { openCount: { $gte: 2 } } },
+      { $project: { _id: 0, orderSerialNumber: '$_id', openCount: 1, segments: 1 } },
+      { $sort: { openCount: -1 } },
+      { $limit: 50 }
+    ], { allowDiskUse: true }).toArray();
+
+    // ── Total order counts in the window for the prevalence denominator ──
+    const totalOrdersPromise = segCol.distinct('orderSerialNumber', { segmentStart: { $gte: cutoff } });
+
+    const [sameMinuteOrders, longDurationSegments, multipleOpenOrders, totalOrders] = await Promise.all([
+      sameMinutePromise, longDurationPromise, multipleOpenPromise, totalOrdersPromise
+    ]);
+
+    const totalOrderCount = totalOrders.length;
+    const totalClusteredEntries = sameMinuteOrders.reduce((a, o) => a + o.clusteredEntries, 0);
+
+    res.json({
+      window: { days, since: cutoff },
+      summary: {
+        totalOrders:                totalOrderCount,
+        ordersWithSameMinuteClusters: sameMinuteOrders.length,
+        clusteredEntriesTotal:        totalClusteredEntries,
+        ordersWithLongSegments:       longDurationSegments.length,
+        ordersWithMultipleOpen:       multipleOpenOrders.length,
+        anyAffectedOrderCount:        new Set([
+          ...sameMinuteOrders.map(o => o.orderSerialNumber),
+          ...longDurationSegments.map(s => s.orderSerialNumber),
+          ...multipleOpenOrders.map(o => o.orderSerialNumber)
+        ]).size
+      },
+      sameMinuteOrders,
+      longDurationSegments,
+      multipleOpenOrders
+    });
+  } catch (err) {
+    console.error('[/diag/data-health]', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// —— POST /diag/order-quality/repair ——————————————————————————
+// Body: { serial: '<orderSerialNumber>' }
+// For one order, re-read its current orderStatusHistory from production,
+// recompute the canonical set of Processing-segment compositeKeys, and delete
+// any segment in backfill_kpi_segments whose compositeKey is no longer valid.
+// This recovers from V2 mutating an order's history after our backfill ingested it.
+//
+// Does NOT upsert new segments — the next backfill cycle will pick those up.
+// We're only deleting orphans here, which is the safe operation.
+app.post('/diag/order-quality/repair', requireRole('admin'), async (req, res) => {
+  try {
+    const serial = String(req.body?.serial || '').trim();
+    if (!serial) return res.status(400).json({ error: 'serial required in body' });
+
+    const prodDb   = await getDb('orders');
+    const configDb = await getConfigDb();
+    const order = await prodDb.collection('orders').findOne(
+      { orderSerialNumber: serial },
+      { projection: { _id: 1, orderStatusHistory: 1 } }
+    );
+    if (!order) return res.status(404).json({ error: `order ${serial} not found in production` });
+
+    // Build the set of valid compositeKeys from current live history.
+    const orderId = String(order._id);
+    const history = Array.isArray(order.orderStatusHistory) ? order.orderStatusHistory : [];
+    const validKeys = new Set();
+    for (const entry of history) {
+      if (entry?.updatedStatus?.statusType !== 'Processing') continue;
+      const entryDate = toDate(entry?.createdAt);
+      if (!entryDate) continue;
+      const slug = entry?.updatedStatus?.slug || '';
+      validKeys.add(`${orderId}_${slug}_${entryDate.toISOString()}`);
+    }
+
+    // Find every segment our backfill currently has for this order.
+    const segCol = configDb.collection('backfill_kpi_segments');
+    const existing = await segCol.find(
+      { orderId },
+      { projection: { _compositeKey: 1, statusSlug: 1, segmentStart: 1, isOpen: 1 } }
+    ).toArray();
+
+    // Anything in `existing` but not in `validKeys` is an orphan to delete.
+    const orphans = existing.filter(s => !validKeys.has(s._compositeKey));
+    let deletedCount = 0;
+    if (orphans.length) {
+      const r = await segCol.deleteMany({ _compositeKey: { $in: orphans.map(o => o._compositeKey) } });
+      deletedCount = r.deletedCount || 0;
+      auditLog('order_quality_repair', 'backfill_kpi_segments', {
+        orderSerialNumber: serial,
+        orderId,
+        deletedCount,
+        orphanKeys: orphans.map(o => o._compositeKey).slice(0, 20)
+      }, req.user?.email || req.user?.name || 'unknown');
+    }
+
+    res.json({
+      orderSerialNumber: serial,
+      orderId,
+      liveProcessingEntries: validKeys.size,
+      backfillSegments:      existing.length,
+      orphansFound:          orphans.length,
+      deletedCount,
+      orphans: orphans.slice(0, 20).map(o => ({
+        compositeKey: o._compositeKey, statusSlug: o.statusSlug, segmentStart: o.segmentStart, wasOpen: o.isOpen
+      }))
+    });
+  } catch (err) {
+    console.error('[/diag/order-quality/repair]', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ═══════════════════════════════════════════════════════════
 // FAST READ ENDPOINTS — Read from backfill collections
 // These replace the slow live queries for the dashboard.
