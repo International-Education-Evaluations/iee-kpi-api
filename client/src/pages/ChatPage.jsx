@@ -2,6 +2,15 @@ import React, { useState, useRef, useEffect, useCallback } from 'react';
 import ReactMarkdown from 'react-markdown';
 import { api, isManagerPlus, getUser } from '../hooks/useApi';
 
+// Defense-in-depth for the assistant transcript renderer. react-markdown v9 disables
+// raw HTML by default, but `skipHtml` is explicit, and `urlTransform` blocks
+// non-http(s)/mailto schemes (e.g., javascript:) in any links the model emits.
+const SAFE_URL_SCHEMES = /^(https?:|mailto:)/i;
+function safeUrl(url) {
+  if (typeof url !== 'string') return '';
+  return SAFE_URL_SCHEMES.test(url.trim()) ? url : '';
+}
+
 function fmtTs(d) {
   if (!d) return '';
   const dt = new Date(d);
@@ -259,7 +268,7 @@ export default function ChatPage() {
                 ) : (
                   <div className="bg-white border border-surface-200 rounded-2xl rounded-tl-sm px-4 py-3 shadow-sm">
                     <div className="text-sm text-ink-700 prose prose-sm max-w-none prose-p:my-1 prose-ul:my-1 prose-li:my-0.5 prose-headings:text-ink-900 prose-headings:font-semibold prose-code:bg-surface-100 prose-code:px-1 prose-code:py-0.5 prose-code:rounded prose-code:text-xs">
-                      <ReactMarkdown>{m.content}</ReactMarkdown>
+                      <ReactMarkdown skipHtml urlTransform={safeUrl}>{m.content}</ReactMarkdown>
                     </div>
                     {m.tools > 0 && (
                       <div className="text-[10px] text-ink-400 mt-2 pt-2 border-t border-surface-100">

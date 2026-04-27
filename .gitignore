@@ -5,3 +5,5 @@ client/node_modules/
 .env.local
 *.log
 .DS_Store
+package-lock.json
+client/package-lock.json

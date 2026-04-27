@@ -5,6 +5,7 @@ import { isAuth, isAdmin, isManagerPlus } from './hooks/useApi';
 import { DataProvider } from './hooks/useData';
 import Sidebar from './components/Sidebar';
 import RefreshBar from './components/RefreshBar';
+import ErrorBoundary from './components/ErrorBoundary';
 import LoginPage from './pages/LoginPage';
 import InvitePage from './pages/InvitePage';
 import KPIOverview from './pages/KPIOverview';
@@ -32,37 +33,43 @@ function AuthGuard() {
   if (!isAuth()) return <Navigate to="/login" replace />;
   return (
     <DataProvider>
-      <div className="flex min-h-screen bg-surface-100">
-        {/* Desktop sidebar */}
-        <div className="sidebar-desktop">
-          <Sidebar />
-        </div>
-        {/* Mobile sidebar overlay */}
-        {sidebarOpen && (
-          <div className="fixed inset-0 z-40 lg:hidden">
-            <div className="absolute inset-0 bg-black/30" onClick={() => setSidebarOpen(false)} />
-            <div className="relative w-56 h-full">
-              <Sidebar onNavigate={() => setSidebarOpen(false)} />
-            </div>
+      <ErrorBoundary scope="auth-shell">
+        <div className="flex min-h-screen bg-surface-100">
+          {/* Desktop sidebar */}
+          <div className="sidebar-desktop">
+            <Sidebar />
           </div>
-        )}
-        <div className="main-content ml-0 lg:ml-56 flex-1 flex flex-col min-h-screen">
-          {/* Top bar */}
-          <header className="sticky top-0 z-20 bg-white/80 backdrop-blur-sm border-b border-surface-200 px-3 sm:px-6 py-2 flex items-center justify-between gap-3">
-            {/* Mobile hamburger */}
-            <button onClick={() => setSidebarOpen(true)}
-              className="sidebar-mobile-toggle p-1.5 rounded-lg hover:bg-surface-100 text-ink-500">
-              <svg width="20" height="20" viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="2">
-                <line x1="3" y1="5" x2="17" y2="5"/><line x1="3" y1="10" x2="17" y2="10"/><line x1="3" y1="15" x2="17" y2="15"/>
-              </svg>
-            </button>
-            <div className="flex-1" />
-            <RefreshBar />
-          </header>
-          <main className="flex-1 p-3 sm:p-6 overflow-auto"><Outlet /></main>
+          {/* Mobile sidebar overlay */}
+          {sidebarOpen && (
+            <div className="fixed inset-0 z-40 lg:hidden">
+              <div className="absolute inset-0 bg-black/30" onClick={() => setSidebarOpen(false)} />
+              <div className="relative w-56 h-full">
+                <Sidebar onNavigate={() => setSidebarOpen(false)} />
+              </div>
+            </div>
+          )}
+          <div className="main-content ml-0 lg:ml-56 flex-1 flex flex-col min-h-screen">
+            {/* Top bar */}
+            <header className="sticky top-0 z-20 bg-white/80 backdrop-blur-sm border-b border-surface-200 px-3 sm:px-6 py-2 flex items-center justify-between gap-3">
+              {/* Mobile hamburger */}
+              <button onClick={() => setSidebarOpen(true)}
+                className="sidebar-mobile-toggle p-1.5 rounded-lg hover:bg-surface-100 text-ink-500">
+                <svg width="20" height="20" viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="2">
+                  <line x1="3" y1="5" x2="17" y2="5"/><line x1="3" y1="10" x2="17" y2="10"/><line x1="3" y1="15" x2="17" y2="15"/>
+                </svg>
+              </button>
+              <div className="flex-1" />
+              <RefreshBar />
+            </header>
+            <main className="flex-1 p-3 sm:p-6 overflow-auto">
+              {/* Inner boundary scoped to the page so a crash there leaves the
+                  sidebar and topbar usable for navigation/recovery. */}
+              <ErrorBoundary scope="page"><Outlet /></ErrorBoundary>
+            </main>
+          </div>
         </div>
-      </div>
-      {tourOpen && <Tour onClose={() => setTourOpen(false)} />}
+        {tourOpen && <Tour onClose={() => setTourOpen(false)} />}
+      </ErrorBoundary>
     </DataProvider>
   );
 }
