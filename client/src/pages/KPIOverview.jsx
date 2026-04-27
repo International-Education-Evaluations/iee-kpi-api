@@ -340,13 +340,20 @@ export default function KPIOverview() {
       </FilterBar>
 
       <div className="metric-grid" data-tour="metric-cards">
-        <Card label="Segments" value={fmtI(metrics?.total)} loading={loading} trend={metrics?.volTrend} />
-        <Card label="Closed" value={fmtI(metrics?.closed)} color="green" loading={loading} />
-        <Card label="Open" value={fmtI(metrics?.open)} color="amber" loading={loading} />
-        <Card label="Avg Duration" value={fmtDur(metrics?.avg)} color="brand" loading={loading} />
-        <Card label="Median" value={fmtDur(metrics?.median)} color="slate" loading={loading} />
-        <Card label="In-Range" value={metrics?.inRangePct!=null?`${metrics.inRangePct}%`:'—'} color="green" loading={loading} />
-        <Card label="Orders" value={fmtI(metrics?.orders)} color="navy" loading={loading} />
+        <Card label="Segments" value={fmtI(metrics?.total)} loading={loading} trend={metrics?.volTrend}
+          tooltip="One row per worker–status period within the active filters. The trend arrow compares this 7-day window vs the prior 7." />
+        <Card label="Closed" value={fmtI(metrics?.closed)} color="green" loading={loading}
+          tooltip="Segments that have ended (the order moved to the next status). Only Closed segments contribute to Avg Duration, Median, and XpH." />
+        <Card label="Open" value={fmtI(metrics?.open)} color="amber" loading={loading}
+          tooltip="Segments still in progress — the order is currently sitting in this status. Open segments are excluded from duration metrics." />
+        <Card label="Avg Duration" value={fmtDur(metrics?.avg)} color="brand" loading={loading}
+          tooltip="Arithmetic mean of durationMinutes across Closed segments only. Outliers (real and from data-quality issues like batched sync writes) pull this up — the Median is usually a better central tendency." />
+        <Card label="Median" value={fmtDur(metrics?.median)} color="slate" loading={loading}
+          tooltip="Middle value of Closed segment durations (50th percentile). Robust to outliers. Median lower than Average means a long-tail of slow segments." />
+        <Card label="In-Range" value={metrics?.inRangePct!=null?`${metrics.inRangePct}%`:'—'} color="green" loading={loading}
+          tooltip="Share of Closed segments whose duration falls inside the per-status benchmark min/max. Segments outside the Excl-Short and Excl-Long thresholds are dropped from the denominator before this is computed." />
+        <Card label="Orders" value={fmtI(metrics?.orders)} color="navy" loading={loading}
+          tooltip="Distinct orders touched within the active filters. One order can have many segments across multiple statuses and workers." />
       </div>
 
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">

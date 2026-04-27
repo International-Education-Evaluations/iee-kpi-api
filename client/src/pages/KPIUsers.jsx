@@ -64,7 +64,10 @@ export default function KPIUsers() {
   const [fType, setFType]     = useState('');
   const [view, setViewRaw]    = useState(() => userGet('kpiusers_view') || 'status');
   const setView = (v) => { setViewRaw(v); userSet('kpiusers_view', v); };
-  const [drawer, setDrawer]   = useState({ open:false, title:'', subtitle:'', rows:[], cols: SEG_COLS });
+  // drawer.allRows holds the unfiltered set; drawer.rows is the currently displayed slice.
+  // drawerState controls a Closed / Open / All filter shown for order drilldowns.
+  const [drawer, setDrawer]   = useState({ open:false, title:'', subtitle:'', allRows:[], cols: SEG_COLS, splitByState:false });
+  const [drawerState, setDrawerState] = useState('all'); // 'all' | 'closed' | 'open'
 
   const dSel     = useDeferredValue(sel);
   const dFFrom   = useDeferredValue(fFrom);
@@ -226,22 +229,40 @@ export default function KPIUsers() {
 
   // ── Drilldown handlers ────────────────────────────────────
   const openStatusDrawer = useCallback((row) => {
-    const rows = userSegs.filter(s=>(s.statusName||s.statusSlug)===row.status)
+    const allRows = userSegs.filter(s=>(s.statusName||s.statusSlug)===row.status)
       .sort((a,b)=>(b.segmentStart||'').localeCompare(a.segmentStart||''));
-    setDrawer({ open:true, cols:SEG_COLS,
+    setDrawerState('all');
+    setDrawer({ open:true, cols:SEG_COLS, splitByState:false,
       title: `${selName} — ${row.status}`,
       subtitle: `${fmtI(row.count)} segments · ${fmtI(row.closed)} closed · ${row.open} open · Avg ${fmtDur(row.avg)} · ${row.orders} orders`,
-      rows });
+      allRows });
   }, [userSegs, selName]);
 
   const openOrderDrawer = useCallback((row) => {
-    const rows = userSegs.filter(s=>s.orderSerialNumber===row.orderSerialNumber)
+    const allRows = userSegs.filter(s=>s.orderSerialNumber===row.orderSerialNumber)
       .sort((a,b)=>(b.segmentStart||'').localeCompare(a.segmentStart||''));
-    setDrawer({ open:true, cols:SEG_COLS,
+    const closedCount = allRows.filter(s => !s.isOpen).length;
+    const openCount   = allRows.length - closedCount;
+    setDrawerState('all');
+    setDrawer({ open:true, cols:SEG_COLS, splitByState:true,
       title: row.orderSerialNumber,
-      subtitle: `${row.segCount} segments · ${fmtDur(row.totalMin)} total · ${row.orderType}`,
-      rows });
+      subtitle: `${row.segCount} segments · ${closedCount} closed · ${openCount} open · ${fmtDur(row.totalMin)} total · ${row.orderType}`,
+      allRows });
   }, [userSegs]);
+
+  // ── Apply Closed / Open / All filter to drawer rows when split is enabled ──
+  const drawerDisplayRows = useMemo(() => {
+    if (!drawer.splitByState || drawerState === 'all') return drawer.allRows;
+    if (drawerState === 'closed') return drawer.allRows.filter(s => !s.isOpen);
+    if (drawerState === 'open')   return drawer.allRows.filter(s => s.isOpen);
+    return drawer.allRows;
+  }, [drawer.allRows, drawer.splitByState, drawerState]);
+
+  const drawerCounts = useMemo(() => {
+    if (!drawer.splitByState) return { all: drawer.allRows.length, closed: 0, open: 0 };
+    const closed = drawer.allRows.filter(s => !s.isOpen).length;
+    return { all: drawer.allRows.length, closed, open: drawer.allRows.length - closed };
+  }, [drawer.allRows, drawer.splitByState]);
 
   // ── Table col defs ────────────────────────────────────────
   const statusCols = [
@@ -408,8 +429,19 @@ export default function KPIUsers() {
           onClose={() => setDrawer(d=>({...d,open:false}))}
           title={drawer.title}
           subtitle={drawer.subtitle}
-          rows={drawer.rows}
+          rows={drawerDisplayRows}
           cols={drawer.cols}
+          extraFilters={drawer.splitByState ? (
+            <Pills
+              tabs={[
+                { key:'all',    label:`All (${fmtI(drawerCounts.all)})` },
+                { key:'closed', label:`Closed (${fmtI(drawerCounts.closed)})` },
+                { key:'open',   label:`Open (${fmtI(drawerCounts.open)})` },
+              ]}
+              active={drawerState}
+              onChange={setDrawerState}
+            />
+          ) : null}
         />
       </>}
     </div>

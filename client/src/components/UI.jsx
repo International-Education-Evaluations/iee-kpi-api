@@ -37,12 +37,15 @@ const CARD_STYLES = {
   slate: { bg:'bg-slate-50', border:'border-slate-200', accent:'text-slate-600' },
   navy:  { bg:'bg-ocean-50', border:'border-ocean-200', accent:'text-ocean-600' },
 };
-export function Card({ label, value, sub, color='brand', loading, trend, icon }) {
+export function Card({ label, value, sub, color='brand', loading, trend, icon, tooltip }) {
   const s = CARD_STYLES[color] || CARD_STYLES.brand;
   return (
     <div className={`card-surface ${s.bg} ${s.border} p-3 sm:p-4 group`}>
       <div className="flex items-start justify-between">
-        <div className="text-[10px] sm:text-[11px] font-semibold uppercase tracking-wider text-ink-400 mb-1">{label}</div>
+        <div className="flex items-center gap-1 mb-1">
+          <div className="text-[10px] sm:text-[11px] font-semibold uppercase tracking-wider text-ink-400">{label}</div>
+          {tooltip && <InfoTip text={tooltip} />}
+        </div>
         {icon && <span className="text-sm opacity-40">{icon}</span>}
       </div>
       {loading ? <div className="h-7 w-16 rounded-lg loading" /> : <>
@@ -57,6 +60,35 @@ export function Card({ label, value, sub, color='brand', loading, trend, icon })
         {sub && <div className="text-[10px] sm:text-[11px] text-ink-400 mt-0.5">{sub}</div>}
       </>}
     </div>
+  );
+}
+
+// Small "i" badge that reveals a definition on hover/focus. Uses the native
+// `title` attribute as a keyboard-/screen-reader-accessible fallback so users
+// without a mouse still get the explanation.
+export function InfoTip({ text }) {
+  const [open, setOpen] = useState(false);
+  return (
+    <span className="relative inline-flex">
+      <button type="button"
+        aria-label={`What does this mean? ${text}`}
+        title={text}
+        onMouseEnter={() => setOpen(true)}
+        onMouseLeave={() => setOpen(false)}
+        onFocus={() => setOpen(true)}
+        onBlur={() => setOpen(false)}
+        onClick={(e) => { e.preventDefault(); setOpen(o => !o); }}
+        className="w-3.5 h-3.5 rounded-full bg-surface-200 hover:bg-surface-300 text-ink-500 hover:text-ink-700 text-[9px] font-bold leading-none flex items-center justify-center cursor-help focus:outline-none focus:ring-2 focus:ring-brand-300">
+        i
+      </button>
+      {open && (
+        <span role="tooltip"
+          className="absolute z-50 left-1/2 -translate-x-1/2 top-full mt-1.5 w-64 px-3 py-2 rounded-lg bg-ink-900 text-white text-[11px] leading-snug font-normal normal-case tracking-normal shadow-lg pointer-events-none">
+          {text}
+          <span className="absolute -top-1 left-1/2 -translate-x-1/2 w-2 h-2 bg-ink-900 rotate-45"></span>
+        </span>
+      )}
+    </span>
   );
 }
 
