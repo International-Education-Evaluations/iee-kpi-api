@@ -186,11 +186,16 @@ export default function QCOverview() {
       </FilterBar>
 
       <div className="metric-grid-5">
-        <Card label="QC Events" value={fmtI(m?.total)} color="brand" loading={loading} trend={m?.trend} />
-        <Card label="Fixed It" value={fmtI(m?.fi)} sub={fmtP(m?.fiP)} color="green" loading={loading} />
-        <Card label="Kick It Back" value={fmtI(m?.kb)} sub={fmtP(m?.kbP)} color="red" loading={loading} />
-        <Card label="Orders Affected" value={fmtI(m?.orders)} color="slate" loading={loading} />
-        <Card label="Accountable Users" value={fmtI(m?.users)} color="plum" loading={loading} />
+        <Card label="QC Events" value={fmtI(m?.total)} color="brand" loading={loading} trend={m?.trend}
+          tooltip="Quality-control discussion entries logged in V2 (orders.order-discussion, type=system_logs, category.slug=quality_control). Trend compares the last 7 days vs the prior 7." />
+        <Card label="Fixed It" value={fmtI(m?.fi)} sub={fmtP(m?.fiP)} color="green" loading={loading}
+          tooltip="QC events with errorType = i_fixed_it — the reviewer corrected the issue without sending it back. Subtitle is the share of total QC events." />
+        <Card label="Kick It Back" value={fmtI(m?.kb)} sub={fmtP(m?.kbP)} color="red" loading={loading}
+          tooltip="QC events with errorType = kick_it_back — the order was returned to the previous worker for rework. Higher percentage usually correlates with higher rework cost downstream." />
+        <Card label="Orders Affected" value={fmtI(m?.orders)} color="slate" loading={loading}
+          tooltip="Distinct orders with at least one QC event in the active filters. One order can have multiple QC events." />
+        <Card label="Accountable Users" value={fmtI(m?.users)} color="plum" loading={loading}
+          tooltip="Distinct users named in errorAssignedTo (the worker held accountable for the issue), not the reviewer who filed the QC event." />
       </div>
 
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">

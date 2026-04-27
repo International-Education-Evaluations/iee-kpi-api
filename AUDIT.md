@@ -11,11 +11,15 @@ Severity scale:
 
 ## 1. Executive summary
 
-1. **Auth is fragile in two places.** `JWT_SECRET` silently regenerates a new random secret per process when the env var is missing (`server.js:52`), invalidating sessions on every restart. And `/auth/login` (`server.js:1891`) writes nothing to `dashboard_audit_log`, so credential stuffing leaves no trail. Both are P0.
-2. **`/reports/query` has a NoSQL field-name injection vector** at `server.js:5291` — `default: return '$' + gb` blindly interpolates user-supplied `groupBy` strings into a `$group` aggregation. P0.
-3. **The backfill watchdog can silently truncate runs** (`server.js:3642-3654`). 10-minute hard reset fires with only a `console.error`, no audit log, no `/health` surfacing. A legitimately long cold-start backfill produces incomplete data with no operator visibility. P0.
-4. **Zero React error boundaries** in `client/src/`. A render error in any page unmounts the entire app and shows a blank screen with no recovery path. P0.
-5. **No tests, no lint, no CI, no README** — and `server.js` (6,450 lines) is one closure with shared mutable state (`backfillRunning`, `CONFIG_CACHE`) that makes refactor expensive. The dashboard ships, but every change risks regression. P1 across the board.
+> Items 1-5 below were the original P0s; items 1-4 shipped in PR #1. PR #2 ships §6.5 metric-correctness fixes and the `/diag/*` auth bypass fix.
+
+1. **Auth is fragile in two places.** `JWT_SECRET` silently regenerates a new random secret per process when the env var is missing (`server.js:52`), invalidating sessions on every restart. And `/auth/login` (`server.js:1891`) writes nothing to `dashboard_audit_log`, so credential stuffing leaves no trail. Both are P0. **Both fixed in PR #1.**
+2. **`/reports/query` has a NoSQL field-name injection vector** at `server.js:5291` — `default: return '$' + gb` blindly interpolates user-supplied `groupBy` strings into a `$group` aggregation. P0. **Fixed in PR #1 via `lib/validate-group-by.js` allowlist.**
+3. **The backfill watchdog can silently truncate runs** (`server.js:3642-3654`). 10-minute hard reset fires with only a `console.error`, no audit log, no `/health` surfacing. A legitimately long cold-start backfill produces incomplete data with no operator visibility. P0. **Fixed in PR #1 — 30-min default + audit row + `/health` surfacing.**
+4. **Zero React error boundaries** in `client/src/`. A render error in any page unmounts the entire app and shows a blank screen with no recovery path. P0. **Fixed in PR #1 via `client/src/components/ErrorBoundary.jsx`.**
+5. **Per-worker XpH was mathematically incoherent** for any worker whose segments mixed unit types (Orders, Reports, Credentials). The summary card summed heterogeneous units and labeled them with the first non-Orders unit found. **Fixed in PR #2 — see §6.5.**
+6. **145-hour segments inflated Avg / Median / Total Hours / XpH** because chain-break gaps in `orderStatusHistory` produced segments spanning many missing transitions. The 5-bucket classifier already labeled these "Excl Long" but only used the label for In-Range %. **Fixed in PR #2 — central-tendency aggregations now apply the same exclusion.**
+7. **No tests, no lint, no CI, no README** — and `server.js` (6,450 lines) is one closure with shared mutable state (`backfillRunning`, `CONFIG_CACHE`) that makes refactor expensive. The dashboard ships, but every change risks regression. P1 across the board. (Tests started in PR #1, expanded in PR #2.)
 
 ---
 
@@ -339,6 +343,48 @@ createdAt: Date = new Date();
 - Detect and quarantine same-minute clusters of ≥3 Processing entries on a single order — flag with `dataQuality: 'batch_stamped'` and exclude from duration metrics
 - When a chain break is detected (gap > 24h between Processing entries with no intermediate non-Processing pause), do not compute a segment that spans the gap; emit it with `dataQuality: 'chain_break'` and exclude from averages
 - Add `dataQuality` index field to `backfill_kpi_segments` and a "Data Health" panel on the dashboard surfacing affected order count + impact on metrics
+
+---
+
+## 6.5 Metric correctness (added 2026-04-27, shipped PR #2)
+
+User reported that the User Drill-Down page showed nonsensical values for at least one worker (Elena Gamburg in Document Management): an XpH summary card reading "1.5 Reports" when the worker did 154 Orders-unit segments and only 1 Reports-unit segment, plus segments listed at 145 hours that don't represent real workload. An Explore agent traced the full computation pipeline (`server.js` segment builder → `client/src/hooks/useData.jsx` enrichment → `client/src/pages/KPIUsers.jsx` aggregation) and surfaced four concrete bugs.
+
+### 6.5.1 The corrected XpH unit assignment per department / status
+
+Sourced from `seed-config.js:35-48` and matches the user's spec:
+
+| Team                | Status                                | XpH unit    |
+|---------------------|---------------------------------------|-------------|
+| Customer Support    | initial-review                        | Orders      |
+| Data Entry          | eval-prep-processing                  | Credentials |
+| Digital Fulfillment | digital-fulfillment-processing        | Orders      |
+| Digital Records     | digital-records-processing, review    | Orders      |
+| Document Management | document, shipment, verification      | Orders      |
+| Evaluation          | initial-evaluation, senior-eval-review| Reports     |
+| Translations        | translation-prep, translation-review  | Orders      |
+
+The benchmarks config is correct. The bugs were all in how the dashboard *aggregated* values that already had the right unit tags.
+
+### 6.5.2 The four bugs and their fixes
+
+| # | Sev | Where | Bug | Fix in PR #2 |
+|---|-----|-------|-----|--------------|
+| **6.5-B1** | **P0** | `KPIUsers.jsx:121-122` (pre-fix) | Reports / Credentials summary cards summed `reportItemCount` and `credentialCount` across **every** segment of the worker. Both fields are order-level — an order with 5 reports touched in 3 segments produced 15 instead of 5. | Replaced with `sumOrderLevelField(segments, field)` from `lib/segment-aggregations.js` which dedupes by `orderSerialNumber` and takes each value once. |
+| **6.5-B2** | **P1** | `KPIUsers.jsx:115-119, 137` (pre-fix) | Per-worker XpH summed `unitValue` across heterogeneous-unit segments and then labeled the card with the first non-Orders unit found. For Elena: `unitSum = 154 + 1 = 155 mixed units`, label = `"Reports"`, value mathematically incoherent. | Replaced with `computeXphByUnit(closedSegments)` — partitions by `xphUnit`, computes per-unit `{ units, hours, xph }`, picks the dominant. Card now reads "1.5 Orders" for Elena, with the per-status table showing the Reports value in its own row (already correct there). |
+| **6.5-B3** | **P1** | `server.js:737-865` (live `/kpi-segments`) | Live endpoint never attached `credentialCount` to segments. Only the backfill path did. Bruno / GAS / any client hitting live got `credentialCount = undefined`, so Data Entry XpH was `0` on those code paths. | Mirrored the backfill credential pre-fetch in the live endpoint — one `order-credentials` aggregation per request, attached to each segment alongside `reportItemCount`. |
+| **6.5-B4** | **P0** | client aggregations | Segments with 145-hour durations (chain-break artifacts from the V1↔V2 sync issue documented in §6.4) flowed untouched into Avg / Median / Total Hours / XpH on every page. The 5-bucket classifier labeled them "Excl Long" via per-status `excludeLongSec` thresholds in Settings, but the label was consumed only by In-Range %. | Extended the canonical "closed segments" filter in `KPIOverview.jsx` and `KPIUsers.jsx` (summary cards + per-status breakdown) to drop `Excl-Short` and `Excl-Long` buckets. `Unclassified` stays in. Excluded count surfaced on the Avg / Median card subtitles so the trim is visible. |
+
+### 6.5.3 Design choices worth recording
+
+- **Outlier exclusion is client-side, not at segment-build.** Real long durations (legitimate weekend-soak segments, etc.) stay in the segment list and the drilldown drawer; only the central-tendency rollups apply the trim. Operators can dial the per-status thresholds via Settings — that's the correct place for the policy decision.
+- **Dominant-unit selection ties to "Orders" by default.** When a worker has zero closed segments, `computeXphByUnit` returns `dominant: 'orders'` so the card label is stable. Future drift (e.g., adding a new unit type) needs to be reflected in `client/src/lib/segment-aggregations.js` and its mirror at `lib/segment-aggregations.js`.
+- **`classifySegment` and `segment-aggregations` were extracted to shared client utilities** (`client/src/lib/`). Previously they lived inline in `KPIOverview.jsx` and were going to drift. KPIUsers now imports them. KPIScorecard does not yet use these; if it grows central-tendency cards, fold it in.
+
+### 6.5.4 What was *not* changed
+
+- Live and backfill segment builders still produce raw 145h segments — the cap is downstream, not at the source. This intentionally preserves the ability to see the artifacts in drilldown drawers and `/diag/order-quality`.
+- The upstream V2 fix (in `iee_v2/apps/api-orders/src/orders-sync/orderSync.service.ts:241-334`) still belongs in the V2 repo; once shipped, the chain breaks will subside and the outlier exclusion in this PR will gradually have less work to do.
 
 ---
 
