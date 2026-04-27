@@ -639,7 +639,7 @@ function authMiddleware(req, res, next) {
   // API routes all start with known prefixes; everything else is a React route
   const apiPrefixes = ['/kpi-', '/qc-', '/queue-', '/credential', '/report-',
     '/users', '/collections', '/indexes', '/config/', '/auth/', '/ai/', '/glossary', '/email/',
-    '/backfill/', '/data/', '/reports/', '/user/'];
+    '/backfill/', '/data/', '/reports/', '/user/', '/diag/'];
   const isApiRoute = apiPrefixes.some(p => req.path.startsWith(p));
   if (!isApiRoute && req.method === 'GET' && !req.path.includes('.')) {
     return next(); // Let SPA fallback handle it
@@ -779,12 +779,32 @@ app.get('/kpi-segments', async (req, res) => {
       }
     ], { allowDiskUse: true }).toArray();
 
+    // Pre-fetch credential counts for the matched orders so Credentials-unit XpH
+    // (Data Entry team) can be computed correctly. Mirrors the backfill pattern
+    // at line ~4118. Non-fatal: orders without credential rows fall back to 0.
+    const credCountMap = {};
+    try {
+      const orderIds = orders.map(o => o._id);
+      if (orderIds.length) {
+        const credAgg = await db.collection('order-credentials').aggregate([
+          { $match: {
+              order: { $in: orderIds },
+              active: true,
+              $or: [{ deletedAt: null }, { deletedAt: { $exists: false } }]
+          }},
+          { $group: { _id: { $toString: '$order' }, credentialCount: { $sum: 1 } } }
+        ], { allowDiskUse: true }).toArray();
+        for (const r of credAgg) credCountMap[r._id] = r.credentialCount;
+      }
+    } catch { /* non-fatal */ }
+
     const allSegments = [];
 
     for (const order of orders) {
       const history = Array.isArray(order.orderStatusHistory) ? order.orderStatusHistory : [];
       const reportCount = Array.isArray(order.reportItems) ? order.reportItems.length : 0;
       const reportName = Array.isArray(order.reportItems) ? (order.reportItems[0]?.name || null) : null;
+      const credentialCount = credCountMap[String(order._id)] || 0;
 
       for (let i = 0; i < history.length; i++) {
         const entry = history[i];
@@ -824,6 +844,7 @@ app.get('/kpi-segments', async (req, res) => {
           parentOrderId: order.parentOrderId || null,
           reportItemCount: reportCount,
           reportItemName: reportName,
+          credentialCount,
           statusSlug: entry?.updatedStatus?.slug || '',
           statusName: entry?.updatedStatus?.name || '',
           // V2 user IDs: foreignKeyId is canonical, email is fallback

@@ -132,12 +132,18 @@ export default function QueueOps() {
       </div>
 
       <div className="metric-grid-6">
-        <Card label="Active Orders" value={fmtI(sm?.active)} color="plum" loading={loading} />
-        <Card label="Waiting" value={fmtI(sm?.waiting)} color="amber" loading={loading} />
-        <Card label="Processing" value={fmtI(sm?.proc)} color="green" loading={loading} />
-        <Card label="> 24 Hours" value={fmtI(sm?.o24)} color={sm?.o24>0?'amber':'slate'} loading={loading} />
-        <Card label="> 72 Hours" value={fmtI(sm?.o72)} color={sm?.o72>0?'red':'slate'} loading={loading} />
-        <Card label="Entered Today" value={fmtI(sm?.today)} color="brand" loading={loading} />
+        <Card label="Active Orders" value={fmtI(sm?.active)} color="plum" loading={loading}
+          tooltip="Orders currently in any non-terminal status (not Completed, not Cancelled). The queue snapshot is updated by the backfill cycle." />
+        <Card label="Waiting" value={fmtI(sm?.waiting)} color="amber" loading={loading}
+          tooltip="Orders sitting in any Waiting-type status (e.g. Awaiting Documents, Awaiting Verification). Time spent here is queue time, not work time." />
+        <Card label="Processing" value={fmtI(sm?.proc)} color="green" loading={loading}
+          tooltip="Orders currently in a Processing-type status — actively being worked by a team member. This is what XpH and duration metrics measure." />
+        <Card label="> 24 Hours" value={fmtI(sm?.o24)} color={sm?.o24>0?'amber':'slate'} loading={loading}
+          tooltip="Active orders that have been in their current status for more than 24 hours. Often a sign of a queue stall or unattended work." />
+        <Card label="> 72 Hours" value={fmtI(sm?.o72)} color={sm?.o72>0?'red':'slate'} loading={loading}
+          tooltip="Active orders that have been in their current status for more than 72 hours. Almost always actionable — either a real stall or a data-quality artifact." />
+        <Card label="Entered Today" value={fmtI(sm?.today)} color="brand" loading={loading}
+          tooltip="Orders that entered their current status today (server time, EST). Useful for sizing the day's incoming workload by status." />
       </div>
 
       {/* ── Compact status order count strip ──────────────────────────── */}

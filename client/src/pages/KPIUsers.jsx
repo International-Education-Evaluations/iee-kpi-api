@@ -6,6 +6,8 @@ import { Card, Table, FilterBar, FilterSelect, FilterInput, FilterReset, DatePre
          TOOLTIP_STYLE, fmt, fmtI, fmtDur, fmtHrs, fmtDateTime } from '../components/UI';
 import { useData } from '../hooks/useData';
 import { userGet, userSet } from '../hooks/useApi';
+import { makeClassifier, isOutlier } from '../lib/classify-segment';
+import { sumOrderLevelField, computeXphByUnit, unitLabel } from '../lib/segment-aggregations';
 
 const BUCKET_COLORS = {
   'Exclude Short':'#94a3b8','Out-of-Range Short':'#F57F17','In-Range':'#16a34a',
@@ -53,7 +55,8 @@ const ORDER_COLS = [
 ];
 
 export default function KPIUsers() {
-  const { kpiSegs: segs, kpiLoading: loading, loadKpi } = useData();
+  const { kpiSegs: segs, kpiLoading: loading, loadKpi, benchmarks } = useData();
+  const classifySegment = useMemo(() => makeClassifier(benchmarks || []), [benchmarks]);
   const [sp] = useSearchParams();
   // Persist selected worker per-user so navigation away and back restores the selection
   const [sel, setSelRaw] = useState(() => sp.get('worker') || userGet('kpiusers_sel') || '');
@@ -113,13 +116,22 @@ export default function KPIUsers() {
   // ── Summary metrics ──────────────────────────────────────
   const m = useMemo(() => {
     if (!userSegs.length) return null;
-    const closed  = userSegs.filter(s => !s.isOpen && s.durationMinutes > 0);
+    const closedAll = userSegs.filter(s => !s.isOpen && s.durationMinutes > 0);
+    // B4: drop Excl-Short / Excl-Long outliers from central-tendency metrics so
+    // 145-hour chain-break segments don't inflate Avg / Median / Total Hours / XpH.
+    const closed = closedAll.filter(s => !isOutlier(classifySegment(s)));
+    const outliersExcluded = closedAll.length - closed.length;
     const totalMin = closed.reduce((a,s) => a + (s.durationMinutes||0), 0);
-    const unitSum  = closed.reduce((a,s) => a + (s.unitValue ?? 1), 0);
-    const xph     = totalMin > 0 ? unitSum / (totalMin/60) : 0;
-    const orders  = new Set(userSegs.map(s=>s.orderSerialNumber).filter(Boolean));
-    const totalReports     = userSegs.reduce((a,s) => a + (s.reportItemCount||0), 0);
-    const totalCredentials = userSegs.reduce((a,s) => a + (s.credentialCount||0), 0);
+
+    // B2: split XpH by unit type and pick the dominant for the summary card.
+    const xphPartitions = computeXphByUnit(closed);
+    const dom = xphPartitions[xphPartitions.dominant] || { xph: null };
+
+    const orders = new Set(userSegs.map(s=>s.orderSerialNumber).filter(Boolean));
+    // B1: dedupe order-level fields by orderSerialNumber so multi-segment orders
+    // don't multi-count their reports / credentials.
+    const totalReports     = sumOrderLevelField(userSegs, 'reportItemCount');
+    const totalCredentials = sumOrderLevelField(userSegs, 'credentialCount');
     const errorSegs = userSegs.filter(s => s.isErrorReporting).length;
 
     // week-over-week
@@ -130,14 +142,16 @@ export default function KPIUsers() {
     const lw  = userSegs.filter(s => s.segmentStart >= d14 && s.segmentStart < d7).length;
 
     return {
-      total: userSegs.length, closed: closed.length,
+      total: userSegs.length, closed: closedAll.length,
       open: userSegs.filter(s=>s.isOpen).length,
       avg:    closed.length ? totalMin/closed.length : 0,
       median: getMedian(closed.map(s=>s.durationMinutes)),
       hrs:    totalMin/60,
+      outliersExcluded,
       orders: orders.size,
-      xph:    Math.round(xph*10)/10,
-      xphUnit: closed.length>0 ? (closed.find(s=>s.xphUnit&&s.xphUnit!=='Orders')?.xphUnit || closed[0]?.xphUnit || 'Orders') : 'Orders',
+      xph:    dom.xph,
+      xphUnit: unitLabel(xphPartitions.dominant),
+      xphPartitions,
       totalReports,
       totalCredentials,
       errorSegs,
@@ -145,7 +159,7 @@ export default function KPIUsers() {
       level:  userSegs.find(s=>s.userLevel)?.userLevel || '',
       volTrend: lw > 0 ? Math.round((tw-lw)/lw*100) : null,
     };
-  }, [userSegs]);
+  }, [userSegs, classifySegment]);
 
   // ── Daily chart data ──────────────────────────────────────
   const daily = useMemo(() => {
@@ -167,26 +181,44 @@ export default function KPIUsers() {
   }, [userSegs]);
 
   // ── By Status breakdown ───────────────────────────────────
+  // Per-status Avg / Median / XpH apply the same B4 outlier exclusion as the
+  // summary cards. We still bump `count` and `closed` for ALL closed segments
+  // (those are the user's true volume) but only fold non-outlier durations into
+  // the central-tendency math.
   const byStatus = useMemo(() => {
     const d = {};
     userSegs.forEach(s => {
       const k = s.statusName||s.statusSlug;
-      if (!d[k]) d[k] = { status:k, slug:s.statusSlug||'', xphUnit:s.xphUnit||'Orders', count:0, totalMin:0, closed:0, open:0, orders:new Set(), durations:[], unitSum:0 };
+      if (!d[k]) d[k] = { status:k, slug:s.statusSlug||'', xphUnit:s.xphUnit||'Orders', count:0, totalMin:0, closed:0, open:0, orders:new Set(), durations:[], unitSum:0, outliers:0 };
       d[k].count++;
-      if (!s.isOpen && s.durationMinutes>0) { d[k].totalMin+=s.durationMinutes; d[k].closed++; d[k].unitSum+=(s.unitValue??1); d[k].durations.push(s.durationMinutes); }
+      if (!s.isOpen && s.durationMinutes>0) {
+        d[k].closed++;
+        if (isOutlier(classifySegment(s))) {
+          d[k].outliers++;
+        } else {
+          d[k].totalMin += s.durationMinutes;
+          d[k].unitSum  += (s.unitValue ?? 1);
+          d[k].durations.push(s.durationMinutes);
+        }
+      }
       if (s.isOpen) d[k].open++;
       if (s.orderSerialNumber) d[k].orders.add(s.orderSerialNumber);
     });
-    return Object.values(d).map(d => ({
-      ...d,
-      orders: d.orders.size,
-      avg:    d.closed ? Math.round(d.totalMin/d.closed*10)/10 : null,
-      median: getMedian(d.durations),
-      hrs:    Math.round(d.totalMin/60*10)/10,
-      xph:    d.totalMin>0 ? Math.round((d.unitSum??0)/(d.totalMin/60)*10)/10 : null,
-      pct:    userSegs.length ? Math.round(d.count/userSegs.length*100) : 0,
-    })).sort((a,b) => b.count-a.count);
-  }, [userSegs]);
+    return Object.values(d).map(d => {
+      // d.durations only holds non-outlier closed durations after B4, so use its
+      // length as the denominator for avg (not d.closed which still counts outliers).
+      const inSampleClosed = d.durations.length;
+      return {
+        ...d,
+        orders: d.orders.size,
+        avg:    inSampleClosed ? Math.round(d.totalMin/inSampleClosed*10)/10 : null,
+        median: getMedian(d.durations),
+        hrs:    Math.round(d.totalMin/60*10)/10,
+        xph:    d.totalMin>0 ? Math.round((d.unitSum??0)/(d.totalMin/60)*10)/10 : null,
+        pct:    userSegs.length ? Math.round(d.count/userSegs.length*100) : 0,
+      };
+    }).sort((a,b) => b.count-a.count);
+  }, [userSegs, classifySegment]);
 
   // ── Orders worked ─────────────────────────────────────────
   const ordersWorked = useMemo(() => {
@@ -337,16 +369,28 @@ export default function KPIUsers() {
 
         {/* Metric cards — expanded set */}
         <div className="metric-grid">
-          <Card label="Segments"     value={fmtI(m?.total)}               loading={loading} trend={m?.volTrend} />
-          <Card label="Closed"       value={fmtI(m?.closed)}   color="green"  loading={loading} />
-          <Card label="Open"         value={fmtI(m?.open)}     color="amber"  loading={loading} />
-          <Card label="Avg Duration" value={fmtDur(m?.avg)}    color="brand"  loading={loading} />
-          <Card label="Median"       value={fmtDur(m?.median)} color="slate"  loading={loading} />
-          <Card label="Total Hours"  value={fmtHrs(m?.hrs)}    color="navy"   loading={loading} />
-          <Card label="XpH"          value={m?.xph?fmt(m.xph):'—'} sub={m?.xphUnit||'units/hr'} color="plum" loading={loading} />
-          <Card label="Orders"       value={fmtI(m?.orders)}   color="brand"  loading={loading} />
-          <Card label="Reports"      value={fmtI(m?.totalReports)} color="slate" loading={loading} />
-          <Card label="Credentials"  value={fmtI(m?.totalCredentials)} color="plum" loading={loading} />
+          <Card label="Segments" value={fmtI(m?.total)} loading={loading} trend={m?.volTrend}
+            tooltip="One row per worker–status period this user touched in the active filters. Trend compares the last 7 days vs the prior 7." />
+          <Card label="Closed" value={fmtI(m?.closed)} color="green" loading={loading}
+            tooltip="Segments where the order has moved to the next status. Only Closed segments contribute to Avg / Median / Total Hours / XpH." />
+          <Card label="Open" value={fmtI(m?.open)} color="amber" loading={loading}
+            tooltip="Segments still active — the order is currently sitting in this status with this worker. Excluded from duration metrics." />
+          <Card label="Avg Duration" value={fmtDur(m?.avg)} color="brand" loading={loading}
+            sub={m?.outliersExcluded > 0 ? `excluded ${fmtI(m.outliersExcluded)} outlier${m.outliersExcluded === 1 ? '' : 's'}` : undefined}
+            tooltip="Mean duration across Closed segments after Excl-Short / Excl-Long outliers (per per-status thresholds in Settings) are filtered. Subtitle shows how many were dropped." />
+          <Card label="Median" value={fmtDur(m?.median)} color="slate" loading={loading}
+            sub={m?.outliersExcluded > 0 ? `excluded ${fmtI(m.outliersExcluded)} outlier${m.outliersExcluded === 1 ? '' : 's'}` : undefined}
+            tooltip="50th-percentile duration across Closed in-sample segments. More robust than Avg for skewed distributions." />
+          <Card label="Total Hours" value={fmtHrs(m?.hrs)} color="navy" loading={loading}
+            tooltip="Sum of in-sample Closed segment durations, in hours. Excludes outliers; this is the time we attribute to this worker for XpH." />
+          <Card label="XpH" value={m?.xph != null ? fmt(m.xph) : '—'} sub={m?.xphUnit || 'units/hr'} color="plum" loading={loading}
+            tooltip={`Output per hour in the worker's dominant unit (${m?.xphUnit || 'Orders'}). Computed as units ÷ hours within that unit only — no mixing across statuses with different units. Per-status breakdown table below shows the others.`} />
+          <Card label="Orders" value={fmtI(m?.orders)} color="brand" loading={loading}
+            tooltip="Distinct orders this worker touched in the filtered window. One order may have multiple segments across statuses." />
+          <Card label="Reports" value={fmtI(m?.totalReports)} color="slate" loading={loading}
+            tooltip="Sum of report items across the distinct orders the worker touched. Counted once per order (an order with 5 reports touched in 3 segments contributes 5, not 15)." />
+          <Card label="Credentials" value={fmtI(m?.totalCredentials)} color="plum" loading={loading}
+            tooltip="Sum of credentials across the distinct orders the worker touched. Counted once per order, same dedupe rule as Reports. Used as the XpH unit for Data Entry." />
         </div>
 
         {/* Charts */}

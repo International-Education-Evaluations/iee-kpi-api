@@ -6,6 +6,7 @@ import { Card, Table, Pills, FilterBar, FilterSelect, FilterInput, FilterReset, 
          TOOLTIP_STYLE, fmt, fmtI, fmtDur, fmtHrs, fmtDateTime } from '../components/UI';
 import { api } from '../hooks/useApi';
 import { useData } from '../hooks/useData';
+import { makeClassifier, isOutlier } from '../lib/classify-segment';
 
 const BUCKET_COLORS = {
   'Exclude Short':'#94a3b8','Out-of-Range Short':'#F57F17','In-Range':'#16a34a',
@@ -60,22 +61,7 @@ export default function KPIOverview() {
   useEffect(() => { loadKpi(); }, [loadKpi]);
   // benchmarks loaded by DataProvider — no local effect needed
 
-  const classifySegment = useMemo(() => {
-    const benchMap = {};
-    for (const b of benchmarks) { if (b.status) benchMap[b.status]=b; }
-    return (s) => {
-      if (s.isOpen) return 'Open';
-      if (s.durationMinutes==null) return 'Unclassified';
-      const b = benchMap[s.statusSlug];
-      if (!b) return 'Unclassified';
-      const dur=s.durationMinutes;
-      if (dur<(b.excludeShortMin??0.5)) return 'Exclude Short';
-      if (dur<(b.inRangeMin??1)) return 'Out-of-Range Short';
-      if (dur<=(b.inRangeMax??120)) return 'In-Range';
-      if (dur<=(b.excludeLongMax??480)) return 'Out-of-Range Long';
-      return 'Exclude Long';
-    };
-  }, [benchmarks]);
+  const classifySegment = useMemo(() => makeClassifier(benchmarks), [benchmarks]);
 
   const workers = useMemo(()=>{
     const m = {};
@@ -113,17 +99,23 @@ export default function KPIOverview() {
 
   const metrics = useMemo(()=>{
     if(!filtered.length)return null;
-    const closed=filtered.filter(s=>!s.isOpen&&s.durationMinutes>0);
-    const totalMin=closed.reduce((a,s)=>a+(s.durationMinutes||0),0);
+    const closedAll = filtered.filter(s=>!s.isOpen&&s.durationMinutes>0);
+    // Central-tendency metrics (Avg, Median, Total Hours) exclude Excl Short / Excl Long
+    // outliers per the per-status thresholds. Unclassified stays in so we don't quietly
+    // hide unbenchmarked statuses.
+    const closed = closedAll.filter(s => !isOutlier(classifySegment(s)));
+    const outliersExcluded = closedAll.length - closed.length;
+    const totalMin = closed.reduce((a,s)=>a+(s.durationMinutes||0),0);
     const now=new Date(); const d7=new Date(now-7*86400000).toISOString(); const d14=new Date(now-14*86400000).toISOString();
     const tw=filtered.filter(s=>s.segmentStart>=d7).length; const lw=filtered.filter(s=>s.segmentStart>=d14&&s.segmentStart<d7).length;
     const inRange=filtered.filter(s=>classifySegment(s)==='In-Range').length;
-    return{total:filtered.length,closed:closed.length,open:filtered.filter(s=>s.isOpen).length,
+    return{total:filtered.length,closed:closedAll.length,open:filtered.filter(s=>s.isOpen).length,
       avg:closed.length?totalMin/closed.length:0,median:getMedian(closed.map(s=>s.durationMinutes)),
       hrs:totalMin/60,workers:new Set(filtered.map(s=>s._workerId).filter(Boolean)).size,
       orders:new Set(filtered.map(s=>s.orderSerialNumber).filter(Boolean)).size,
       depts:new Set(filtered.map(s=>s.departmentName).filter(Boolean)).size,
-      volTrend:lw>0?Math.round((tw-lw)/lw*100):null,inRangePct:Math.round(inRange/(closed.length||1)*1000)/10};
+      outliersExcluded,
+      volTrend:lw>0?Math.round((tw-lw)/lw*100):null,inRangePct:Math.round(inRange/(closedAll.length||1)*1000)/10};
   },[filtered,classifySegment]);
 
   const bucketData = useMemo(()=>{
@@ -347,9 +339,11 @@ export default function KPIOverview() {
         <Card label="Open" value={fmtI(metrics?.open)} color="amber" loading={loading}
           tooltip="Segments still in progress — the order is currently sitting in this status. Open segments are excluded from duration metrics." />
         <Card label="Avg Duration" value={fmtDur(metrics?.avg)} color="brand" loading={loading}
-          tooltip="Arithmetic mean of durationMinutes across Closed segments only. Outliers (real and from data-quality issues like batched sync writes) pull this up — the Median is usually a better central tendency." />
+          sub={metrics?.outliersExcluded > 0 ? `excluded ${fmtI(metrics.outliersExcluded)} outlier${metrics.outliersExcluded === 1 ? '' : 's'}` : undefined}
+          tooltip="Arithmetic mean of durationMinutes across Closed segments. Excl-Short and Excl-Long outliers (per per-status thresholds in Settings) are filtered out — see the subtitle for the count." />
         <Card label="Median" value={fmtDur(metrics?.median)} color="slate" loading={loading}
-          tooltip="Middle value of Closed segment durations (50th percentile). Robust to outliers. Median lower than Average means a long-tail of slow segments." />
+          sub={metrics?.outliersExcluded > 0 ? `excluded ${fmtI(metrics.outliersExcluded)} outlier${metrics.outliersExcluded === 1 ? '' : 's'}` : undefined}
+          tooltip="50th percentile of Closed segment durations after Excl-Short / Excl-Long outliers are filtered. Robust to remaining tail." />
         <Card label="In-Range" value={metrics?.inRangePct!=null?`${metrics.inRangePct}%`:'—'} color="green" loading={loading}
           tooltip="Share of Closed segments whose duration falls inside the per-status benchmark min/max. Segments outside the Excl-Short and Excl-Long thresholds are dropped from the denominator before this is computed." />
         <Card label="Orders" value={fmtI(metrics?.orders)} color="navy" loading={loading}

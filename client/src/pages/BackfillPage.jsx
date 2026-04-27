@@ -67,12 +67,18 @@ export default function BackfillPage() {
 
       {/* Status Cards */}
       <div className="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-6 gap-2.5">
-        <Card label="Segments" value={fmtI(status?.currentCounts?.segments)} color="navy" />
-        <Card label="QC Events" value={fmtI(status?.currentCounts?.qcEvents)} color="green" />
-        <Card label="Users" value={fmtI(status?.currentCounts?.users)} color="plum" />
-        <Card label="Last Run" value={status?.lastRunDurationSec ? status.lastRunDurationSec + 's' : '—'} color="slate" />
-        <Card label="Open Segs" value={fmtI(status?.counts?.openSegments)} color="amber" />
-        <Card label="Status" value={running ? 'Running' : 'Idle'} color={running ? 'amber' : 'green'} />
+        <Card label="Segments" value={fmtI(status?.currentCounts?.segments)} color="navy"
+          tooltip="Total rows in iee_dashboard.backfill_kpi_segments. Each row is one worker–status period derived from orders.orderStatusHistory." />
+        <Card label="QC Events" value={fmtI(status?.currentCounts?.qcEvents)} color="green"
+          tooltip="Total rows in iee_dashboard.backfill_qc_events — derived from orders.order-discussion entries with category.slug = quality_control." />
+        <Card label="Users" value={fmtI(status?.currentCounts?.users)} color="plum"
+          tooltip="Total rows in iee_dashboard.backfill_users. Synced hourly (decoupled from the segment cycle) since staff change infrequently." />
+        <Card label="Last Run" value={status?.lastRunDurationSec ? status.lastRunDurationSec + 's' : '—'} color="slate"
+          tooltip="Wall-clock duration of the most recent backfill cycle. If this trends up sharply, the watchdog at 30 min may fire — check /health for lastWatchdogResetAt." />
+        <Card label="Open Segs" value={fmtI(status?.counts?.openSegments)} color="amber"
+          tooltip="Segments with no successor entry in orderStatusHistory — the order is currently sitting in this status. Updated each cycle as orders move forward." />
+        <Card label="Status" value={running ? 'Running' : 'Idle'} color={running ? 'amber' : 'green'}
+          tooltip="Whether a backfill cycle is in flight right now. Cycles are scheduled every ~5 min by default; manual triggers also possible from the controls below." />
       </div>
 
       {/* Backfill Controls */}
