@@ -20,6 +20,7 @@ const NAV = [
   { to:'/email', icon:'✉', label:'Email Reports', section:'CONFIG', managerOnly:true },
   { to:'/admin/users', icon:'◎', label:'User Management', section:'ADMIN', adminOnly:true },
   { to:'/admin/backfill', icon:'↻', label:'Data Backfill', section:'ADMIN', adminOnly:true },
+  { to:'/admin/diagnostics', icon:'🔍', label:'Diagnostics', section:'ADMIN', adminOnly:true },
 ];
 
 export default function Sidebar({ onNavigate, onStartTour }) {

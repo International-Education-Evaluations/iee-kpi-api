@@ -25,6 +25,7 @@ import EmailPage from './pages/EmailPage';
 import ReportBuilder from './pages/ReportBuilder';
 import AdminUsers from './pages/AdminUsers';
 import BackfillPage from './pages/BackfillPage';
+import AdminDiagPage from './pages/AdminDiagPage';
 
 function AuthGuard() {
   const [sidebarOpen, setSidebarOpen] = useState(false);
@@ -103,6 +104,7 @@ export default function App() {
             <Route path="/ai/config" element={<GuardrailsPage />} />
             <Route path="/admin/users" element={<AdminUsers />} />
             <Route path="/admin/backfill" element={<BackfillPage />} />
+            <Route path="/admin/diagnostics" element={<AdminDiagPage />} />
           </Route>
         </Route>
         <Route path="*" element={<Navigate to="/" replace />} />
