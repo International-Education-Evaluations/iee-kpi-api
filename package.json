@@ -6,7 +6,8 @@
     "start": "node server.js",
     "dev": "node --watch server.js",
     "build:client": "cd client && npm install && npm run build",
-    "postinstall": "npm run build:client"
+    "postinstall": "npm run build:client",
+    "test": "node --test test/*.test.js"
   },
   "dependencies": {
     "bcryptjs": "^2.4.3",

@@ -49,7 +49,7 @@ const CONFIG = {
   API_KEY: process.env.API_KEY,
   PORT: process.env.PORT || 3000,
   ALLOWED_IPS: process.env.ALLOWED_IPS || '',
-  JWT_SECRET: process.env.JWT_SECRET || require('crypto').randomBytes(32).toString('hex'),
+  JWT_SECRET: process.env.JWT_SECRET,
   CLAUDE_API_KEY: process.env.CLAUDE_API_KEY || '',
   SENDGRID_API_KEY: process.env.SENDGRID_API_KEY || '',
   SENDGRID_TEMPLATE_ID: process.env.SENDGRID_TEMPLATE_ID || '',
@@ -61,6 +61,10 @@ const CONFIG = {
 
 if (!CONFIG.MONGO_URI) { console.error('FATAL: MONGO_URI required'); process.exit(1); }
 if (!CONFIG.API_KEY) { console.error('FATAL: API_KEY required'); process.exit(1); }
+if (!CONFIG.JWT_SECRET) {
+  console.error('FATAL: JWT_SECRET required (32+ hex chars; generate with: openssl rand -hex 32)');
+  process.exit(1);
+}
 
 // —— Security ————————————————————————————————————————————
 app.use(helmet());
@@ -701,7 +705,14 @@ app.get('/health', async (req, res) => {
   try {
     const db = await getDb('orders');
     await db.command({ ping: 1 });
-    res.json({ status: 'ok', timestamp: new Date().toISOString(), env: CONFIG.NODE_ENV, version: '5.4.22' });
+    res.json({
+      status: 'ok',
+      timestamp: new Date().toISOString(),
+      env: CONFIG.NODE_ENV,
+      version: '5.4.22',
+      backfillRunning,
+      lastWatchdogResetAt: backfillLastWatchdogResetAt
+    });
   } catch (err) {
     res.status(500).json({ status: 'error', message: err.message });
   }
@@ -1895,22 +1906,30 @@ app.post('/auth/login', async (req, res) => {
       return res.status(400).json({ error: 'email and password required' });
     }
 
+    const normalizedEmail = email.toLowerCase().trim();
     const db = await getConfigDb();
     const user = await db.collection('dashboard_users').findOne({
-      email: email.toLowerCase().trim(),
+      email: normalizedEmail,
       isActive: true
     });
 
+    // Don't audit unknown-email failures — that would log every typo
+    // as PII. The global rate limit handles enumeration risk.
     if (!user) return res.status(401).json({ error: 'Invalid credentials' });
 
     const valid = await bcrypt.compare(password, user.passwordHash);
-    if (!valid) return res.status(401).json({ error: 'Invalid credentials' });
+    if (!valid) {
+      auditLog('login_failure', 'auth', { email: normalizedEmail, ip: req.ip, reason: 'bad_password' }, normalizedEmail);
+      return res.status(401).json({ error: 'Invalid credentials' });
+    }
 
     // Update last login
     await db.collection('dashboard_users').updateOne(
       { _id: user._id },
       { $set: { lastLoginAt: new Date() } }
     );
+
+    auditLog('login_success', 'auth', { email: normalizedEmail, ip: req.ip }, normalizedEmail);
 
     const token = generateToken(user);
     res.json({
@@ -3638,20 +3657,26 @@ app.post('/email/send-now', requireRole('admin', 'manager'), async (req, res) =>
 let backfillRunning = false;
 let backfillLastRunEnd = 0;
 let backfillStartedAt  = 0; // timestamp when current run started — for watchdog
+let backfillLastWatchdogResetAt = null; // ISO string of most recent watchdog fire — surfaced by /health
 
-// Watchdog: if a backfill run has been active for more than 10 minutes, it's
-// stuck (likely a hung MongoDB cursor on production). Reset the flag so the
-// next cron cycle can start a fresh incremental run.
-setInterval(() => {
+// Watchdog: if a backfill run is still active past BACKFILL_WATCHDOG_MIN, it's
+// likely stuck (hung Atlas cursor, slow cold start). Reset the flag so the next
+// cron cycle starts a fresh incremental run, write an audit-log row, and
+// surface the timestamp via /health so monitoring can detect repeated fires.
+const BACKFILL_WATCHDOG_MIN = parsePositiveInt(process.env.BACKFILL_WATCHDOG_MIN, 30, { min: 5, max: 240 });
+const _watchdogIntervalId = setInterval(() => {
   if (!backfillRunning || !backfillStartedAt) return;
   const elapsedMin = (Date.now() - backfillStartedAt) / 60000;
-  if (elapsedMin > 10) {
-    console.error(`[WATCHDOG] Backfill stuck for ${Math.round(elapsedMin)}min — forcing reset`);
+  if (elapsedMin > BACKFILL_WATCHDOG_MIN) {
+    const elapsedRounded = Math.round(elapsedMin);
+    console.error(`[WATCHDOG] Backfill stuck for ${elapsedRounded}min (threshold ${BACKFILL_WATCHDOG_MIN}) — forcing reset`);
     backfillRunning  = false;
     backfillStartedAt = 0;
+    backfillLastWatchdogResetAt = new Date().toISOString();
+    auditLog('backfill_watchdog_reset', 'backfill', { elapsedMin: elapsedRounded, thresholdMin: BACKFILL_WATCHDOG_MIN }, 'system_watchdog');
     // Don't update lastRunEnd so the scheduler fires again promptly
   }
-}, 30000); // check every 30s // epoch ms — anchors next-run calculation to run completion, not wall clock
+}, 30000); // check every 30s
 
 // ── User sync state — decoupled from main backfill cycle ──
 // Users change infrequently (HR ops, not order ops). Syncing 150k docs every
@@ -4835,6 +4860,252 @@ app.get('/backfill/next', async (req, res) => {
 });
 
 // ═══════════════════════════════════════════════════════════
+// DIAGNOSTICS — Coverage gap detection
+// Compares daily transition counts in production orders.orders
+// against backfill_kpi_segments to surface dates where data is
+// missing in either layer. Admin-only.
+// ═══════════════════════════════════════════════════════════
+
+// —— GET /diag/coverage?from=YYYY-MM-DD&to=YYYY-MM-DD ————————
+// Returns per-day counts from production (live unwind of orderStatusHistory)
+// and from backfill_kpi_segments, plus any watchdog resets and the latest
+// backfill metadata. Used to triage user reports like "April 3-10 looks empty".
+app.get('/diag/coverage', requireRole('admin'), async (req, res) => {
+  try {
+    const from = String(req.query.from || '');
+    const to   = String(req.query.to   || '');
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(from) || !/^\d{4}-\d{2}-\d{2}$/.test(to)) {
+      return res.status(400).json({ error: 'from and to required as YYYY-MM-DD' });
+    }
+    const fromDate = new Date(from + 'T00:00:00.000Z');
+    const toDate   = new Date(to   + 'T23:59:59.999Z');
+    if (Number.isNaN(fromDate.getTime()) || Number.isNaN(toDate.getTime()) || fromDate > toDate) {
+      return res.status(400).json({ error: 'invalid date range' });
+    }
+    // Hard cap to keep the production unwind bounded — 31 days is plenty for triage
+    const spanDays = (toDate - fromDate) / 86400000;
+    if (spanDays > 31) return res.status(400).json({ error: 'range capped at 31 days' });
+
+    const prodDb   = await getDb('orders');
+    const configDb = await getConfigDb();
+
+    // ── Production: count Processing-type transitions per day ──────────────
+    // Pipeline matches the segment-builder logic in /kpi-segments (line ~785):
+    // we only count entries whose updatedStatus.statusType === 'Processing'.
+    const prodPipeline = [
+      { $match: { 'orderStatusHistory.createdAt': { $gte: fromDate, $lte: toDate } } },
+      { $unwind: '$orderStatusHistory' },
+      { $match: {
+          'orderStatusHistory.createdAt': { $gte: fromDate, $lte: toDate },
+          'orderStatusHistory.updatedStatus.statusType': 'Processing'
+      } },
+      { $group: {
+          _id: { $dateToString: { format: '%Y-%m-%d', date: '$orderStatusHistory.createdAt', timezone: 'UTC' } },
+          transitions: { $sum: 1 },
+          orderIds:    { $addToSet: '$_id' }
+      } },
+      { $project: { _id: 0, date: '$_id', transitions: 1, orders: { $size: '$orderIds' } } },
+      { $sort: { date: 1 } }
+    ];
+    const prodPromise = prodDb.collection('orders').aggregate(prodPipeline, { allowDiskUse: true, maxTimeMS: 60000 }).toArray();
+
+    // ── Backfill: count segments per day on segmentStart ──────────────────
+    const fromIso = fromDate.toISOString();
+    const toIso   = toDate.toISOString();
+    const backfillPipeline = [
+      { $match: { segmentStart: { $gte: fromIso, $lte: toIso } } },
+      { $group: {
+          _id: { $substr: ['$segmentStart', 0, 10] },
+          segments:    { $sum: 1 },
+          orderIds:    { $addToSet: '$orderSerialNumber' }
+      } },
+      { $project: { _id: 0, date: '$_id', segments: 1, orders: { $size: '$orderIds' } } },
+      { $sort: { date: 1 } }
+    ];
+    const backfillPromise = configDb.collection('backfill_kpi_segments').aggregate(backfillPipeline, { allowDiskUse: true, maxTimeMS: 30000 }).toArray();
+
+    // ── Audit log: any watchdog resets in this range ──────────────────────
+    const auditPromise = configDb.collection('dashboard_audit_log').find({
+      action: 'backfill_watchdog_reset',
+      timestamp: { $gte: fromDate, $lte: toDate }
+    }).sort({ timestamp: 1 }).limit(50).toArray();
+
+    // ── Backfill metadata ──────────────────────────────────────────────────
+    const metaPromise = configDb.collection('backfill_metadata').findOne({ _id: 'status' });
+
+    const [prodByDay, backfillByDay, watchdogResets, backfillMeta] = await Promise.all([
+      prodPromise, backfillPromise, auditPromise, metaPromise
+    ]);
+
+    // ── Build a unified day-by-day report and gap flags ────────────────────
+    const byDate = {};
+    for (const r of prodByDay)     byDate[r.date] = { date: r.date, prodTransitions: r.transitions, prodOrders: r.orders, segments: 0, segOrders: 0 };
+    for (const r of backfillByDay) {
+      byDate[r.date] = byDate[r.date] || { date: r.date, prodTransitions: 0, prodOrders: 0 };
+      byDate[r.date].segments  = r.segments;
+      byDate[r.date].segOrders = r.orders;
+    }
+    // Fill in any zero-zero days within the requested range so gaps are visible
+    for (let t = fromDate.getTime(); t <= toDate.getTime(); t += 86400000) {
+      const d = new Date(t).toISOString().slice(0, 10);
+      if (!byDate[d]) byDate[d] = { date: d, prodTransitions: 0, prodOrders: 0, segments: 0, segOrders: 0 };
+    }
+    const days = Object.values(byDate).sort((a, b) => a.date.localeCompare(b.date));
+
+    // ── Flag gaps: prod has data but backfill doesn't, or both are zero ───
+    const gaps = days.filter(d =>
+      (d.prodTransitions > 0 && d.segments === 0) ||
+      (d.prodTransitions === 0 && d.segments === 0)
+    ).map(d => ({
+      date: d.date,
+      kind: d.prodTransitions === 0 ? 'no-source-data' : 'backfill-missing',
+      prodTransitions: d.prodTransitions,
+      segments: d.segments
+    }));
+
+    res.json({
+      range: { from, to, days: Math.round(spanDays) + 1 },
+      days,
+      gaps,
+      watchdogResets,
+      backfill: {
+        lastRunAt: backfillMeta?.lastRunAt || null,
+        lastRunDurationSec: backfillMeta?.lastRunDurationSec || null,
+        currentlyRunning: backfillRunning,
+        startedAt: backfillStartedAt ? new Date(backfillStartedAt).toISOString() : null,
+        watchdogThresholdMin: BACKFILL_WATCHDOG_MIN
+      }
+    });
+  } catch (err) {
+    console.error('[/diag/coverage]', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// —— GET /diag/order-quality?serial=<orderSerialNumber> ——————————
+// Returns the raw orderStatusHistory for one order plus heuristic data-quality
+// flags. Use this to triage individual problem orders (e.g. "this order looks
+// like it's missing transitions" or "all timestamps are clustered at one minute").
+//
+// Heuristics applied:
+//   - sameMinuteClusters: groups of 2+ entries whose createdAt values fall in
+//     the same wall-clock minute. Strong signal of a batch sync write.
+//   - outOfOrderEntries:  consecutive entries where createdAt[i+1] <= createdAt[i].
+//   - largeGapsHours:     gaps > 24h between consecutive Processing entries.
+//   - selfTransitions:    consecutive entries pointing at the same updatedStatus.slug.
+app.get('/diag/order-quality', requireRole('admin'), async (req, res) => {
+  try {
+    const serial = String(req.query.serial || '').trim();
+    if (!serial) return res.status(400).json({ error: 'serial query param required (orderSerialNumber)' });
+
+    const prodDb = await getDb('orders');
+    const order  = await prodDb.collection('orders').findOne(
+      { orderSerialNumber: serial },
+      { projection: {
+          orderSerialNumber:1, orderType:1, orderSource:1,
+          createdAt:1, lastAssignedAt:1, orderCompletedAt:1, processTime:1,
+          orderStatusHistory:1
+      } }
+    );
+    if (!order) return res.status(404).json({ error: `order ${serial} not found` });
+
+    const history = Array.isArray(order.orderStatusHistory) ? order.orderStatusHistory : [];
+
+    // Normalize and sort by createdAt ascending — production sometimes returns
+    // entries out of order (which is one of the data-quality issues we're hunting)
+    const sorted = history.map((e, originalIdx) => ({
+      idx: originalIdx,
+      createdAt: toIso(e?.createdAt),
+      anotherStatusUpdatedAt: toIso(e?.anotherStatusUpdatedAt),
+      statusSlug: e?.updatedStatus?.slug || null,
+      statusName: e?.updatedStatus?.name || null,
+      statusType: e?.updatedStatus?.statusType || null,
+      assignedTo: e?.assignedTo ? buildFullName(e.assignedTo) : null,
+      changedBy:  e?.user ? buildFullName(e.user) : null,
+      isErrorReporting: !!e?.isErrorReporting
+    })).sort((a, b) => (a.createdAt || '').localeCompare(b.createdAt || ''));
+
+    // ── Same-minute clusters ─────────────────────────────────────────────
+    const minuteBuckets = {};
+    for (const entry of sorted) {
+      if (!entry.createdAt) continue;
+      const minute = entry.createdAt.slice(0, 16); // YYYY-MM-DDTHH:MM
+      (minuteBuckets[minute] = minuteBuckets[minute] || []).push(entry);
+    }
+    const sameMinuteClusters = Object.entries(minuteBuckets)
+      .filter(([, entries]) => entries.length >= 2)
+      .map(([minute, entries]) => ({
+        minute,
+        count: entries.length,
+        statuses: entries.map(e => e.statusSlug || '?')
+      }));
+
+    // ── Out-of-order, gaps, self-transitions ─────────────────────────────
+    const outOfOrderEntries = [];
+    const largeGapsHours    = [];
+    const selfTransitions   = [];
+    for (let i = 1; i < sorted.length; i++) {
+      const prev = sorted[i - 1];
+      const curr = sorted[i];
+      if (!prev.createdAt || !curr.createdAt) continue;
+      const dtPrev = new Date(prev.createdAt).getTime();
+      const dtCurr = new Date(curr.createdAt).getTime();
+
+      if (dtCurr < dtPrev) {
+        outOfOrderEntries.push({ at: curr.createdAt, after: prev.createdAt, status: curr.statusSlug });
+      }
+      const gapHours = (dtCurr - dtPrev) / 3600000;
+      if (gapHours > 24 && prev.statusType === 'Processing' && curr.statusType === 'Processing') {
+        largeGapsHours.push({
+          fromStatus: prev.statusSlug, toStatus: curr.statusSlug,
+          fromAt: prev.createdAt, toAt: curr.createdAt,
+          hours: Math.round(gapHours * 10) / 10
+        });
+      }
+      if (prev.statusSlug && prev.statusSlug === curr.statusSlug) {
+        selfTransitions.push({ slug: curr.statusSlug, at: curr.createdAt });
+      }
+    }
+
+    // ── Summary stats ────────────────────────────────────────────────────
+    const processingCount = sorted.filter(e => e.statusType === 'Processing').length;
+    const firstAt = sorted[0]?.createdAt || null;
+    const lastAt  = sorted[sorted.length - 1]?.createdAt || null;
+    const totalElapsedHours = firstAt && lastAt
+      ? Math.round((new Date(lastAt) - new Date(firstAt)) / 3600000 * 10) / 10
+      : null;
+
+    res.json({
+      orderSerialNumber: serial,
+      orderType:    order.orderType || null,
+      orderSource:  order.orderSource || null,
+      createdAt:    toIso(order.createdAt),
+      completedAt:  toIso(order.orderCompletedAt),
+      processTime:  order.processTime || null,
+      summary: {
+        totalEntries: sorted.length,
+        processingEntries: processingCount,
+        firstAt, lastAt, totalElapsedHours,
+        anomalies: {
+          sameMinuteClusterCount: sameMinuteClusters.length,
+          outOfOrderCount:        outOfOrderEntries.length,
+          largeGapCount:          largeGapsHours.length,
+          selfTransitionCount:    selfTransitions.length
+        }
+      },
+      sameMinuteClusters,
+      outOfOrderEntries,
+      largeGapsHours,
+      selfTransitions,
+      history: sorted // full timeline, sorted ascending
+    });
+  } catch (err) {
+    console.error('[/diag/order-quality]', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════
 // FAST READ ENDPOINTS — Read from backfill collections
 // These replace the slow live queries for the dashboard.
 // The original endpoints still work for GAS/Bruno (live data).
@@ -5231,11 +5502,16 @@ app.get('/data/order/:serialNumber', async (req, res) => {
 });
 
 // —— POST /reports/query — Execute a report ——————————————
+const { ALLOWED_GROUP_BY, validateGroupBy } = require('./lib/validate-group-by');
+
 app.post('/reports/query', async (req, res) => {
   try {
     const { source, metric, secondaryMetric, groupBy, filters, sortBy, limit } = req.body;
     if (!source || !metric || !groupBy) {
       return res.status(400).json({ error: 'source, metric, and groupBy required' });
+    }
+    if (!validateGroupBy(groupBy)) {
+      return res.status(400).json({ error: `groupBy must be one of: ${[...ALLOWED_GROUP_BY].join(', ')}` });
     }
 
     const db = await getConfigDb();
@@ -5288,7 +5564,9 @@ app.post('/reports/query', async (req, res) => {
         case 'date':  return { $substr: [`$${dateField}`, 0, 10] };
         case 'week':  return { $dateToString: { format:'%G-W%V', date:{ $dateFromString:{ dateString:`$${dateField}` } } } };
         case 'month': return { $substr: [`$${dateField}`, 0, 7] };
-        default: return '$' + gb;
+        // Unreachable — validateGroupBy() rejects unknown values before we get here.
+        // Throw so an allowlist drift bug surfaces loudly instead of injecting into the pipeline.
+        default: throw new Error(`unreachable groupBy: ${gb}`);
       }
     }
 
@@ -6306,6 +6584,9 @@ function gracefulShutdown(signal) {
   if (_shuttingDown) return;
   _shuttingDown = true;
   console.log(`[SHUTDOWN] ${signal} received — draining requests (max 15s)`);
+
+  // Stop background timers so they don't keep the event loop alive
+  clearInterval(_watchdogIntervalId);
 
   // Stop accepting new connections
   if (_httpServer) {
