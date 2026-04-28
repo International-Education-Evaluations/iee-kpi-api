@@ -2,6 +2,8 @@ import React, { useEffect, useState, useMemo, useCallback, useDeferredValue } fr
 import { useData } from '../hooks/useData';
 import { api } from '../hooks/useApi';
 import { fmtI, fmt, fmtDur, OrderLink } from '../components/UI';
+import { computeXphByUnit, unitLabel } from '../lib/segment-aggregations';
+import { isOutlier } from '../lib/classify-segment';
 
 const BUCKET_COLORS = {
   'Exclude Short':      '#94a3b8',
@@ -141,6 +143,12 @@ export default function KPIScorecard() {
   }, [kpiSegs]);
 
   // ── Per-worker scorecard ─────────────────────────────────────
+  // XpH is partitioned by xphUnit (Orders / Reports / Credentials) and the
+  // dominant unit's value is reported on the row — avoids the unit-mixing bug
+  // PR #2 fixed on User Drill-Down. xph_pct is computed against the targets
+  // for segments matching the dominant unit only, so apples-to-apples.
+  // Avg Duration / Total Hours / In-Range denominator drop Excl-Short and
+  // Excl-Long outliers via the same classifier used in PR #2 (isOutlier).
   const workerRows = useMemo(() => {
     const m = {};
     for (const s of filtered) {
@@ -153,55 +161,85 @@ export default function KPIScorecard() {
           const em  = (s.workerEmail || '').toLowerCase();
           return (uid && levelMap[uid]) || (em && levelMap[em]) || s.userLevel || null;
         })(),
-        segs: 0, closed: 0, inRange: 0, totalMin: 0, xphNumer: 0, xphDenom: 0,
-        xphTargets: [], orders: new Set(), xphUnits: new Set(),
+        segs: 0, closedAll: 0, inRange: 0,
+        // Closed in-sample segments (after Excl outliers dropped) drive Avg/Total
+        sampleClosed: 0, sampleTotalMin: 0,
+        // Per-segment payloads we hand to computeXphByUnit + per-unit target lookup
+        unitSegs: [], targetsByUnit: { orders: [], reports: [], credentials: [] },
+        outliersExcluded: 0, orders: new Set(),
       };
       const r = m[id];
       r.segs++;
-      // Only count closed segments — open segments don't have a valid duration
-      if (!s.isOpen && s.durationMinutes > 0) {
-        r.closed++;
-        r.totalMin += s.durationMinutes;
-        r.xphNumer += (s.unitValue ?? 1);
-        r.xphDenom += s.durationMinutes / 60;
-      }
-      if (s.xphUnit) r.xphUnits.add(s.xphUnit);
       const bucket = classify(s);
       if (bucket === 'In-Range') r.inRange++;
-      const t = getXphTarget(s);
-      if (t != null) r.xphTargets.push(t);
+      if (!s.isOpen && s.durationMinutes > 0) {
+        r.closedAll++;
+        if (isOutlier(bucket)) {
+          r.outliersExcluded++;
+        } else {
+          r.sampleClosed++;
+          r.sampleTotalMin += s.durationMinutes;
+          r.unitSegs.push(s);
+          const unit = String(s.xphUnit || 'Orders').toLowerCase();
+          const t = getXphTarget(s);
+          if (t != null && r.targetsByUnit[unit]) r.targetsByUnit[unit].push(t);
+        }
+      }
       if (s.orderSerialNumber) r.orders.add(s.orderSerialNumber);
     }
     return Object.values(m).map(r => {
-      const xph = r.xphDenom > 0 ? r.xphNumer / r.xphDenom : 0;
-      const xphTarget = r.xphTargets.length ? r.xphTargets.reduce((a,b)=>a+b,0)/r.xphTargets.length : null;
-      const inRangePct = r.closed > 0 ? r.inRange / r.closed * 100 : 0;
+      const xphPart = computeXphByUnit(r.unitSegs);
+      const dom = xphPart[xphPart.dominant] || { xph: null, units: 0, hours: 0 };
+      const targets = r.targetsByUnit[xphPart.dominant] || [];
+      const xphTarget = targets.length ? targets.reduce((a,b)=>a+b,0)/targets.length : null;
+      const inRangePct = r.closedAll > 0 ? r.inRange / r.closedAll * 100 : 0;
+      const xph = dom.xph || 0;
       const xph_pct = xphTarget > 0 ? xph / xphTarget * 100 : null;
-      const xphUnit = r.xphUnits.size===1 ? [...r.xphUnits][0] : r.xphUnits.size>1 ? 'Mixed' : 'Orders';
-      return { ...r, xph: Math.round(xph*100)/100, xphTarget: xphTarget ? Math.round(xphTarget*100)/100 : null,
-               inRangePct: Math.round(inRangePct*10)/10, xph_pct, xphUnit, orders: r.orders.size,
-               totalHrs: Math.round(r.totalMin/60*10)/10 };
+      return {
+        ...r,
+        xph: Math.round(xph*100)/100,
+        xphTarget: xphTarget ? Math.round(xphTarget*100)/100 : null,
+        inRangePct: Math.round(inRangePct*10)/10,
+        xph_pct, xphUnit: unitLabel(xphPart.dominant),
+        xphPartitions: xphPart,
+        closed: r.closedAll, // back-compat with sort/filter code paths
+        orders: r.orders.size,
+        totalHrs: Math.round(r.sampleTotalMin/60*10)/10,
+      };
     });
   }, [filtered, classify, getXphTarget, levelMap]);
 
   // ── Per-status scorecard ─────────────────────────────────────
+  // Per-status rollups don't have the unit-mixing problem (one status = one
+  // xphUnit) so a single sum/divide is correct. But we still drop Excl-Short
+  // and Excl-Long outliers from Avg Duration / XpH so chain-break artifacts
+  // don't pull the numbers around.
   const statusRows = useMemo(() => {
     const m = {};
     for (const s of filtered) {
       const key = s.statusSlug || 'unknown';
-      if (!m[key]) m[key] = { slug:key, name:s.statusName||key, segs:0, inRange:0, totalMin:0, cnt:0, workers:new Set(), orders:new Set(), xphUnit:s.xphUnit||'Orders' };
+      if (!m[key]) m[key] = { slug:key, name:s.statusName||key, segs:0, inRange:0, sampleMin:0, sampleCnt:0, workers:new Set(), orders:new Set(), xphUnit:s.xphUnit||'Orders', outliersExcluded:0 };
       const r = m[key];
-      r.segs++; r.cnt++;
-      if (classify(s) === 'In-Range') r.inRange++;
-      if (s.durationMinutes > 0) { r.totalMin += s.durationMinutes; r.unitSum = (r.unitSum||0) + (s.unitValue??1); }
+      r.segs++;
+      const bucket = classify(s);
+      if (bucket === 'In-Range') r.inRange++;
+      if (s.durationMinutes > 0) {
+        if (isOutlier(bucket)) {
+          r.outliersExcluded++;
+        } else {
+          r.sampleMin += s.durationMinutes;
+          r.sampleCnt++;
+          r.unitSum = (r.unitSum||0) + (s.unitValue??1);
+        }
+      }
       if (s._workerId) r.workers.add(s._workerId);
       if (s.orderSerialNumber) r.orders.add(s.orderSerialNumber);
     }
     return Object.values(m).map(r => ({
       ...r, workers: r.workers.size, orders: r.orders.size,
       inRangePct: r.segs > 0 ? Math.round(r.inRange/r.segs*1000)/10 : 0,
-      avgDuration: r.cnt > 0 ? Math.round(r.totalMin/r.cnt*10)/10 : 0,
-      xph: r.totalMin > 0 ? Math.round((r.unitSum??0)/(r.totalMin/60)*100)/100 : 0,
+      avgDuration: r.sampleCnt > 0 ? Math.round(r.sampleMin/r.sampleCnt*10)/10 : 0,
+      xph: r.sampleMin > 0 ? Math.round((r.unitSum??0)/(r.sampleMin/60)*100)/100 : 0,
       xphUnit: r.xphUnit || 'Orders',
     }));
   }, [filtered, classify]);
