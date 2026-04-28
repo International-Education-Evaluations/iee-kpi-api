@@ -6,7 +6,7 @@ import { Card, Table, FilterBar, FilterSelect, FilterInput, FilterReset, DatePre
          TOOLTIP_STYLE, fmt, fmtI, fmtDur, fmtHrs, fmtDateTime } from '../components/UI';
 import { useData } from '../hooks/useData';
 import { userGet, userSet } from '../hooks/useApi';
-import { makeClassifier, isOutlier } from '../lib/classify-segment';
+import { makeClassifier, isOutlier, computeDateRange, findGapDays } from '../lib/classify-segment';
 import { sumOrderLevelField, computeXphByUnit, unitLabel } from '../lib/segment-aggregations';
 
 const BUCKET_COLORS = {
@@ -329,11 +329,17 @@ export default function KPIUsers() {
     {key:'isOpen',            label:'State',     w:65,  sortable:true, render:v=><span className={`badge ${v?'badge-warning':'badge-success'}`}>{v?'Open':'Closed'}</span>},
   ];
 
+  // Always surface the explicit date window + any days inside it that have no segments.
+  const dateRange = useMemo(() => computeDateRange({ from: fFrom, to: fTo, segments: userSegs }), [fFrom, fTo, userSegs]);
+  const gapDays = useMemo(() => findGapDays(userSegs, dateRange.fromIso, dateRange.toIso), [userSegs, dateRange.fromIso, dateRange.toIso]);
+
   return (
     <div className="space-y-4">
       <div>
         <h1 className="text-lg sm:text-xl font-display font-bold text-ink-900" data-tour="user-drilldown-title">User Drill-Down</h1>
-        <p className="text-[11px] text-ink-400 mt-0.5">Individual worker performance · Last 60 days</p>
+        <p className="text-[11px] text-ink-400 mt-0.5">
+          Individual worker performance · <span className="font-mono text-ink-500">{dateRange.label}</span>
+        </p>
       </div>
 
       {!sel ? (
@@ -369,6 +375,22 @@ export default function KPIUsers() {
             </span>
           )}
         </div>
+
+        {/* Gap-day banner — surfaces days inside the active window where this
+            worker has zero segments. Could be a real day off OR a coverage
+            gap upstream; the link to Diagnostics tells them which. */}
+        {!loading && userSegs.length > 0 && gapDays.length > 0 && (
+          <div className="card-surface bg-amber-50 border-amber-200 p-3 flex items-start gap-3">
+            <span className="text-amber-600 text-base shrink-0">!</span>
+            <div className="flex-1 text-xs text-amber-800">
+              <div className="font-semibold">{gapDays.length} day{gapDays.length === 1 ? '' : 's'} inside {dateRange.label} have no segments for {selName}</div>
+              <div className="text-amber-700 mt-0.5 break-words">
+                {gapDays.length <= 8 ? gapDays.join(' · ') : `${gapDays.slice(0, 6).join(' · ')} … (+${gapDays.length - 6} more)`}
+                {' · '}<a href="/admin/diagnostics" className="underline">Open Coverage Gaps</a> to confirm whether each day is missing in V2 or only here.
+              </div>
+            </div>
+          </div>
+        )}
 
         {/* Metric cards — expanded set */}
         <div className="metric-grid">

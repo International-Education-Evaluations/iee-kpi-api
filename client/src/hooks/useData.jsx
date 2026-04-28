@@ -4,6 +4,12 @@ import { disambiguateWorkers } from '../components/UI';
 
 const DataContext = createContext(null);
 
+// Per-loader status tracking lets the RefreshBar diagnostic panel show which
+// data sources are healthy and which failed, with a per-loader Retry button.
+// Shape: { state: 'idle'|'loading'|'ok'|'error', error: string|null, at: number|null,
+//          partial: { /* sub-fetch results */ } }
+function initStatus() { return { state: 'idle', error: null, at: null, partial: {} }; }
+
 export function DataProvider({ children }) {
   const [kpiSegs, setKpiSegs]             = useState([]);
   const [benchmarks, setBenchmarks]       = useState([]);
@@ -15,17 +21,30 @@ export function DataProvider({ children }) {
   const [kpiLoading, setKpiLoading]       = useState(false);
   const [qcLoading, setQcLoading]         = useState(false);
   const [queueLoading, setQueueLoading]   = useState(false);
+  const [loadStatus, setLoadStatus]       = useState({ kpi: initStatus(), qc: initStatus(), queue: initStatus() });
   const loadedRef = useRef({ kpi: false, qc: false, queue: false });
+
+  function bumpStatus(key, patch) {
+    setLoadStatus(s => ({ ...s, [key]: { ...s[key], ...patch, at: Date.now() } }));
+  }
 
   const loadKpi = useCallback(async (force = false) => {
     if (loadedRef.current.kpi && !force) return;
     setKpiLoading(true);
+    bumpStatus('kpi', { state: 'loading', error: null, partial: {} });
     try {
+      // Track each sub-fetch so the diagnostic panel can show "users ok,
+      // benchmarks failed, segments ok" instead of one opaque red dot.
+      const partial = {};
+      const safeFetch = async (label, path, fallback) => {
+        try { const r = await api(path, { silent: true }); partial[label] = 'ok'; return r; }
+        catch (e) { partial[label] = `err: ${e.message}`; return fallback; }
+      };
       // ── Fix 3: fetch users + user-levels in parallel, don't block segments ──
       const [usersData, lvlData, benchData] = await Promise.all([
-        api('/data/users').catch(() => ({ users: [] })),
-        api('/config/user-levels').catch(() => ({ levels: [] })),
-        api('/config/benchmarks').catch(() => ({ benchmarks: [] })),
+        safeFetch('users',      '/data/users',         { users: [] }),
+        safeFetch('userLevels', '/config/user-levels', { levels: [] }),
+        safeFetch('benchmarks', '/config/benchmarks',  { benchmarks: [] }),
       ]);
 
       const userList = usersData.users || [];
@@ -115,13 +134,21 @@ export function DataProvider({ children }) {
       setKpiSegs(disambiguateWorkers(enriched));
       loadedRef.current.kpi = true;
 
-    } catch (e) { console.error('KPI load failed:', e); }
+      // Sub-fetch failures bubble up as partial state — overall is 'ok' if
+      // segments themselves loaded, even if a side-fetch (users/levels) failed.
+      const anyPartialErr = Object.values(partial).some(v => v !== 'ok');
+      bumpStatus('kpi', { state: anyPartialErr ? 'partial' : 'ok', error: null, partial });
+    } catch (e) {
+      console.error('KPI load failed:', e);
+      bumpStatus('kpi', { state: 'error', error: e.message });
+    }
     setKpiLoading(false);
   }, []);
 
   const loadQc = useCallback(async (force = false) => {
     if (loadedRef.current.qc && !force) return;
     setQcLoading(true);
+    bumpStatus('qc', { state: 'loading', error: null });
     try {
       // Paginate like KPI segments: fetch p1, then remaining pages in parallel.
       // QC is small now (1,100 events) but this future-proofs growth to 50k+.
@@ -137,13 +164,18 @@ export function DataProvider({ children }) {
       }
       setQcEvents([first, ...rest].flatMap(d => d.events || []));
       loadedRef.current.qc = true;
-    } catch (e) { console.error('QC load failed:', e); }
+      bumpStatus('qc', { state: 'ok', error: null });
+    } catch (e) {
+      console.error('QC load failed:', e);
+      bumpStatus('qc', { state: 'error', error: e.message });
+    }
     setQcLoading(false);
   }, []);
 
   const loadQueue = useCallback(async (force = false) => {
     if (loadedRef.current.queue && !force) return;
     setQueueLoading(true);
+    bumpStatus('queue', { state: 'loading', error: null });
     try {
       // ── Fix 2: /data/queue-wait-summary reads from backfill config DB (~1ms)
       //   instead of running a live 450-day production aggregation (10–22s). ──
@@ -154,7 +186,11 @@ export function DataProvider({ children }) {
       setQueueSnap(s);
       setQueueWait(w);
       loadedRef.current.queue = true;
-    } catch (e) { console.error('Queue load failed:', e); }
+      bumpStatus('queue', { state: 'ok', error: null });
+    } catch (e) {
+      console.error('Queue load failed:', e);
+      bumpStatus('queue', { state: 'error', error: e.message });
+    }
     setQueueLoading(false);
   }, []);
 
@@ -181,6 +217,7 @@ export function DataProvider({ children }) {
     <DataContext.Provider value={{
       kpiSegs, classifiedSummary, qcEvents, queueSnap, queueWait, users, benchmarks,
       kpiLoading, qcLoading, queueLoading,
+      loadStatus,
       loadKpi, loadQc, loadQueue, forceRefreshQueue, refreshAll,
     }}>
       {children}

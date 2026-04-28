@@ -62,7 +62,10 @@ export function getTokenExpiresIn() {
 }
 
 // ── API fetch wrapper ──────────────────────────────────────
+// `silent: true` in opts suppresses the auto-toast on failure (use this when
+// the caller is going to handle the error itself, e.g. a polling status check).
 export async function api(path, opts = {}) {
+  const { silent, ...fetchOpts } = opts;
   // Pre-check token expiration before making the call
   if (!isAuth()) {
     clearAuth();
@@ -70,12 +73,38 @@ export async function api(path, opts = {}) {
     throw new Error('Session expired');
   }
   const token = getToken();
-  const h = { 'Content-Type': 'application/json', ...opts.headers };
+  const h = { 'Content-Type': 'application/json', ...fetchOpts.headers };
   if (token) h['Authorization'] = `Bearer ${token}`;
-  const r = await fetch(path, { ...opts, headers: h });
+  let r;
+  try {
+    r = await fetch(path, { ...fetchOpts, headers: h });
+  } catch (netErr) {
+    if (!silent) emitToast({ kind: 'error', title: 'Network error', message: `${path} — ${netErr.message}` });
+    throw netErr;
+  }
   if (r.status === 401) { clearAuth(); window.location.href = '/login'; throw new Error('Session expired'); }
-  if (!r.ok) { const b = await r.json().catch(() => ({})); throw new Error(b.error || `Error ${r.status}`); }
+  if (!r.ok) {
+    const b = await r.json().catch(() => ({}));
+    const err = new Error(b.error || `Error ${r.status}`);
+    err.status = r.status;
+    err.path = path;
+    if (!silent) emitToast({ kind: 'error', title: `${r.status} on ${shortPath(path)}`, message: err.message });
+    throw err;
+  }
   return r.json();
+}
+
+function emitToast(opts) {
+  // window.__ieeToast is set by ToastProvider on mount. If the toast system
+  // isn't ready (e.g. error during initial app boot) we fall back to console.
+  if (typeof window !== 'undefined' && window.__ieeToast) window.__ieeToast.show(opts);
+  else console.error(`[${opts.kind}] ${opts.title}: ${opts.message}`);
+}
+
+function shortPath(p) {
+  // Trim query string and prefix slash so the toast title fits.
+  const noQuery = (p || '').split('?')[0];
+  return noQuery.length > 32 ? '…' + noQuery.slice(-31) : noQuery;
 }
 
 // ── Login / Setup ──────────────────────────────────────────

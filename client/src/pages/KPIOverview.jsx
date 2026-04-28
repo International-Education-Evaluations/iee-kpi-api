@@ -6,7 +6,7 @@ import { Card, Table, Pills, FilterBar, FilterSelect, FilterInput, FilterReset, 
          TOOLTIP_STYLE, fmt, fmtI, fmtDur, fmtHrs, fmtDateTime } from '../components/UI';
 import { api } from '../hooks/useApi';
 import { useData } from '../hooks/useData';
-import { makeClassifier, isOutlier } from '../lib/classify-segment';
+import { makeClassifier, isOutlier, computeDateRange, findGapDays } from '../lib/classify-segment';
 
 const BUCKET_COLORS = {
   'Exclude Short':'#94a3b8','Out-of-Range Short':'#F57F17','In-Range':'#16a34a',
@@ -39,7 +39,8 @@ const SEG_COLS = [
 ];
 
 export default function KPIOverview() {
-  const { kpiSegs: segs, kpiLoading: loading, loadKpi , benchmarks } = useData();
+  const { kpiSegs: segs, kpiLoading: loading, loadKpi, loadStatus, benchmarks } = useData();
+  const kpiStatus = loadStatus?.kpi || {};
   // benchmarks now come from DataProvider context — no local state needed
   const [view, setView] = useState('status');
   const [fType, setFType] = useState(''); const [fDept, setFDept] = useState('');
@@ -313,11 +314,17 @@ export default function KPIOverview() {
     {key:'xph',label:'XpH',w:70,right:true,sortable:true,render:v=>v!=null?<span className="font-semibold text-brand-600">{fmt(v)}</span>:'—'},
   ];
 
+  // Always show the explicit date range covered by the active dataset / filters.
+  const dateRange = useMemo(() => computeDateRange({ from: fFrom, to: fTo, segments: segs }), [fFrom, fTo, segs]);
+  const gapDays = useMemo(() => findGapDays(segs, dateRange.fromIso, dateRange.toIso), [segs, dateRange.fromIso, dateRange.toIso]);
+
   return (
     <div className="space-y-4">
       <div>
         <h1 className="text-lg sm:text-xl font-display font-bold text-ink-900" data-tour="kpi-overview-title">KPI Overview</h1>
-        <p className="text-[11px] text-ink-400 mt-0.5">Processing performance · Last 60 days · {fmtI(segs.length)} segments · {metrics?.depts||0} departments · <span className="text-brand-500">Click status or worker rows to drill in</span></p>
+        <p className="text-[11px] text-ink-400 mt-0.5">
+          Processing performance · <span className="font-mono text-ink-500">{dateRange.label}</span> · {fmtI(segs.length)} segments · {metrics?.depts||0} departments · <span className="text-brand-500">Click status or worker rows to drill in</span>
+        </p>
       </div>
 
       <FilterBar data-tour="filter-bar">
@@ -330,6 +337,72 @@ export default function KPIOverview() {
         <DatePresets onSelect={(from,to)=>{ setFFrom(from); setFTo(to); }} />
         {hasFilters && <FilterReset onClick={clearFilters} />}
       </FilterBar>
+
+      {/* Empty-state / load-error banner. Intentionally surfaces three different
+          failure modes with distinct copy so the user knows what to do. */}
+      {!loading && kpiStatus.state === 'error' && (
+        <div className="card-surface bg-red-50 border-red-200 p-3 flex items-start gap-3">
+          <span className="text-red-500 text-base shrink-0">⚠</span>
+          <div className="flex-1 text-xs text-red-800">
+            <div className="font-semibold">Couldn't load KPI data</div>
+            <div className="text-red-700 mt-0.5">{kpiStatus.error || 'Unknown error'}</div>
+          </div>
+          <button onClick={() => loadKpi(true)}
+            className="text-xs bg-red-600 hover:bg-red-700 text-white px-3 py-1 rounded font-semibold shrink-0">Retry</button>
+        </div>
+      )}
+      {!loading && kpiStatus.state !== 'error' && segs.length > 0 && filtered.length === 0 && (
+        <div className="card-surface bg-amber-50 border-amber-200 p-3 flex items-start gap-3">
+          <span className="text-amber-600 text-base shrink-0">!</span>
+          <div className="flex-1 text-xs text-amber-800">
+            <div className="font-semibold">No segments match the current filters</div>
+            <div className="text-amber-700 mt-0.5">
+              {fDept || fType || fStatus || fWorker || fFrom || fTo
+                ? `Try widening the date range or clearing some filters. Total segments loaded: ${fmtI(segs.length)}.`
+                : `The 60-day window has ${fmtI(segs.length)} segments — but the active filter combination matches none.`}
+            </div>
+          </div>
+          {hasFilters && <button onClick={clearFilters}
+            className="text-xs bg-amber-600 hover:bg-amber-700 text-white px-3 py-1 rounded font-semibold shrink-0">Clear filters</button>}
+        </div>
+      )}
+      {!loading && kpiStatus.state !== 'error' && segs.length === 0 && (
+        <div className="card-surface bg-amber-50 border-amber-200 p-3 flex items-start gap-3">
+          <span className="text-amber-600 text-base shrink-0">!</span>
+          <div className="flex-1 text-xs text-amber-800">
+            <div className="font-semibold">No segments in the backfill yet</div>
+            <div className="text-amber-700 mt-0.5">
+              The backfill may not have run, or the 60-day cutoff filtered everything out. Check
+              {' '}<a href="/admin/diagnostics" className="underline">Diagnostics → Coverage Gaps</a>
+              {' '}or <a href="/admin/backfill" className="underline">Data Backfill</a> for the last run status.
+            </div>
+          </div>
+        </div>
+      )}
+      {!loading && kpiStatus.state !== 'error' && segs.length > 0 && gapDays.length > 0 && (
+        <div className="card-surface bg-amber-50 border-amber-200 p-3 flex items-start gap-3">
+          <span className="text-amber-600 text-base shrink-0">!</span>
+          <div className="flex-1 text-xs text-amber-800">
+            <div className="font-semibold">{gapDays.length} day{gapDays.length === 1 ? '' : 's'} in this window have no segments</div>
+            <div className="text-amber-700 mt-0.5 break-words">
+              {gapDays.length <= 8 ? gapDays.join(' · ') : `${gapDays.slice(0, 6).join(' · ')} … (+${gapDays.length - 6} more)`}
+              {' · '}<a href="/admin/diagnostics" className="underline">Open Coverage Gaps</a> to see whether each day is missing in V2 (upstream) or only in our backfill.
+            </div>
+          </div>
+        </div>
+      )}
+      {!loading && kpiStatus.state !== 'error' && segs.length > 0 && benchmarks.length === 0 && (
+        <div className="card-surface bg-amber-50 border-amber-200 p-3 flex items-start gap-3">
+          <span className="text-amber-600 text-base shrink-0">!</span>
+          <div className="flex-1 text-xs text-amber-800">
+            <div className="font-semibold">No benchmarks configured</div>
+            <div className="text-amber-700 mt-0.5">
+              In-Range %, the 5-bucket classification, and outlier exclusion all need per-status benchmarks.
+              {' '}Visit <a href="/settings" className="underline">Configuration → Benchmarks</a> to seed them.
+            </div>
+          </div>
+        </div>
+      )}
 
       <div className="metric-grid" data-tour="metric-cards">
         <Card label="Segments" value={fmtI(metrics?.total)} loading={loading} trend={metrics?.volTrend}

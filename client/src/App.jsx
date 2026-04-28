@@ -6,6 +6,7 @@ import { DataProvider } from './hooks/useData';
 import Sidebar from './components/Sidebar';
 import RefreshBar from './components/RefreshBar';
 import ErrorBoundary from './components/ErrorBoundary';
+import { ToastProvider } from './components/Toast';
 import LoginPage from './pages/LoginPage';
 import InvitePage from './pages/InvitePage';
 import KPIOverview from './pages/KPIOverview';
@@ -79,6 +80,7 @@ function ManagerGuard() { if (!isManagerPlus()) return <Navigate to="/" replace 
 
 export default function App() {
   return (
+    <ToastProvider>
     <BrowserRouter>
       <Routes>
         <Route path="/login" element={<LoginPage />} />
@@ -110,5 +112,6 @@ export default function App() {
         <Route path="*" element={<Navigate to="/" replace />} />
       </Routes>
     </BrowserRouter>
+    </ToastProvider>
   );
 }
