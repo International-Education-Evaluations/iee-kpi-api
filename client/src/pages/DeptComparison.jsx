@@ -19,7 +19,7 @@ function StatCell({ value, max, color }) {
 }
 
 export default function DeptComparison() {
-  const { kpiSegs, qcEvents, kpiLoading, qcLoading, loadKpi, loadQc } = useData();
+  const { kpiSegs, qcEvents, kpiLoading, qcLoading, loadKpi, loadQc, flaggedSegmentKeys, excludeFlagged } = useData();
   const [benchmarks, setBenchmarks] = useState([]);
   const [fFrom, setFFrom] = useState('');
   const [fTo, setFTo] = useState('');
@@ -55,11 +55,12 @@ export default function DeptComparison() {
 
   const filteredSegs = useMemo(() => kpiSegs.filter(s => {
     if (!s.departmentName) return false;
+    if (excludeFlagged && s._compositeKey && flaggedSegmentKeys.has(s._compositeKey)) return false;
     if (dFType && s.orderType !== dFType) return false;
     if (dFFrom && s.segmentStart < dFFrom) return false;
     if (dFTo   && s.segmentStart > dFTo + 'T23:59:59') return false;
     return true;
-  }), [kpiSegs, dFFrom, dFTo, dFType]);
+  }), [kpiSegs, dFFrom, dFTo, dFType, excludeFlagged, flaggedSegmentKeys]);
 
   const filteredQc = useMemo(() => qcEvents.filter(e => {
     if (!e.departmentName) return false;

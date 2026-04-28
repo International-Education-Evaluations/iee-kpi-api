@@ -6002,6 +6002,20 @@ app.post('/reports/query', async (req, res) => {
       if (filters.errorTypes?.length)  match.errorType     = { $in: filters.errorTypes };
       if (filters.issues?.length)      match.issueName     = { $in: filters.issues };
       if (filters.excludeOpen)         match.isOpen        = { $ne: true };
+      // Honor the global "exclude flagged segments from KPI rollups" toggle —
+      // when on, drop segments whose _compositeKey is in the data-quality
+      // flagged set. Uses the same in-memory cache as /data/data-quality-flags.
+      if (filters.excludeFlagged) {
+        try {
+          const now = Date.now();
+          if (!_flaggedCache || now - _flaggedCacheTs >= FLAGGED_TTL_MS) {
+            _flaggedCache = await computeFlaggedOrders();
+            _flaggedCacheTs = now;
+          }
+          const keys = _flaggedCache?.flaggedSegmentKeys || [];
+          if (keys.length) match._compositeKey = { $nin: keys };
+        } catch { /* non-fatal — proceed without exclusion */ }
+      }
     }
 
     // ── Build group key ──────────────────────────────────────
