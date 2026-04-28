@@ -5193,33 +5193,105 @@ app.get('/diag/data-health', requireRole('admin'), async (req, res) => {
       { $limit: 50 }
     ], { allowDiskUse: true }).toArray();
 
+    // ── Pattern 4: stuck open segments (>7 days open) ────────────────────
+    // Open Processing segments whose segmentStart is older than a week. The
+    // order is sitting in this status with this worker unattended; metrics
+    // count it as "still in progress" forever. Two severity tiers in the
+    // response: warn (7-30d) and crit (>30d).
+    const sevenDaysAgo  = new Date(Date.now() -  7 * 86400000).toISOString();
+    const thirtyDaysAgo = new Date(Date.now() - 30 * 86400000).toISOString();
+    const stuckOpenPromise = segCol.find(
+      { isOpen: true, segmentStart: { $lt: sevenDaysAgo } },
+      { projection: { _id: 0, orderSerialNumber: 1, statusName: 1, workerName: 1, workerEmail: 1, segmentStart: 1 } }
+    ).sort({ segmentStart: 1 }).limit(50).toArray();
+
+    // ── Pattern 5: tiny Processing segments by worker (<30s closed) ──────
+    // Sub-30-second closed segments are almost always ghost clicks (status
+    // toggled by accident, never real work). Group by worker; surface
+    // workers with ≥5 such segments in the window.
+    const tinySegsPromise = segCol.aggregate([
+      { $match: {
+          segmentStart: { $gte: cutoff },
+          isOpen: false,
+          durationSeconds: { $gt: 0, $lt: 30 }
+      } },
+      { $group: {
+          _id: { uid: '$workerUserId', email: '$workerEmail', name: '$workerName' },
+          count:    { $sum: 1 },
+          samples:  { $push: { orderSerialNumber: '$orderSerialNumber', segmentStart: '$segmentStart', durationSeconds: '$durationSeconds', statusName: '$statusName' } }
+      } },
+      { $match: { count: { $gte: 5 } } },
+      { $project: {
+          _id: 0,
+          workerUserId: '$_id.uid', workerEmail: '$_id.email', workerName: '$_id.name',
+          tinyCount: '$count',
+          samples: { $slice: ['$samples', 5] }
+      } },
+      { $sort: { tinyCount: -1 } },
+      { $limit: 50 }
+    ], { allowDiskUse: true }).toArray();
+
+    // ── Pattern 6: workers with high open-segment rate ───────────────────
+    // Workers where most of their segments are open. Indicates workflow
+    // abandonment (start a status, never close it). Threshold: ≥30% open
+    // AND ≥10 total segments (filter out new staff with sparse data).
+    const highOpenPromise = segCol.aggregate([
+      { $match: { segmentStart: { $gte: cutoff }, workerUserId: { $ne: null } } },
+      { $group: {
+          _id: { uid: '$workerUserId', email: '$workerEmail', name: '$workerName' },
+          total: { $sum: 1 },
+          open:  { $sum: { $cond: ['$isOpen', 1, 0] } }
+      } },
+      { $match: { total: { $gte: 10 } } },
+      { $project: {
+          _id: 0,
+          workerUserId: '$_id.uid', workerEmail: '$_id.email', workerName: '$_id.name',
+          total: 1, open: 1,
+          openRate: { $round: [{ $multiply: [{ $divide: ['$open', '$total'] }, 100] }, 1] }
+      } },
+      { $match: { openRate: { $gte: 30 } } },
+      { $sort: { openRate: -1 } },
+      { $limit: 50 }
+    ], { allowDiskUse: true }).toArray();
+
     // ── Total order counts in the window for the prevalence denominator ──
     const totalOrdersPromise = segCol.distinct('orderSerialNumber', { segmentStart: { $gte: cutoff } });
 
-    const [sameMinuteOrders, longDurationSegments, multipleOpenOrders, totalOrders] = await Promise.all([
-      sameMinutePromise, longDurationPromise, multipleOpenPromise, totalOrdersPromise
+    const [sameMinuteOrders, longDurationSegments, multipleOpenOrders, stuckOpenSegments, tinySegmentsByWorker, highOpenWorkers, totalOrders] = await Promise.all([
+      sameMinutePromise, longDurationPromise, multipleOpenPromise, stuckOpenPromise, tinySegsPromise, highOpenPromise, totalOrdersPromise
     ]);
 
     const totalOrderCount = totalOrders.length;
     const totalClusteredEntries = sameMinuteOrders.reduce((a, o) => a + o.clusteredEntries, 0);
+    const stuckCritical = stuckOpenSegments.filter(s => s.segmentStart < thirtyDaysAgo).length;
+    const totalTinySegs = tinySegmentsByWorker.reduce((a, w) => a + w.tinyCount, 0);
 
     res.json({
-      window: { days, since: cutoff },
+      window: { days, since: cutoff, sevenDaysAgo, thirtyDaysAgo },
       summary: {
         totalOrders:                totalOrderCount,
         ordersWithSameMinuteClusters: sameMinuteOrders.length,
         clusteredEntriesTotal:        totalClusteredEntries,
         ordersWithLongSegments:       longDurationSegments.length,
         ordersWithMultipleOpen:       multipleOpenOrders.length,
+        stuckOpenCount:               stuckOpenSegments.length,
+        stuckCriticalCount:           stuckCritical,
+        tinySegmentsTotal:            totalTinySegs,
+        workersWithTinySegments:      tinySegmentsByWorker.length,
+        workersWithHighOpenRate:      highOpenWorkers.length,
         anyAffectedOrderCount:        new Set([
           ...sameMinuteOrders.map(o => o.orderSerialNumber),
           ...longDurationSegments.map(s => s.orderSerialNumber),
-          ...multipleOpenOrders.map(o => o.orderSerialNumber)
+          ...multipleOpenOrders.map(o => o.orderSerialNumber),
+          ...stuckOpenSegments.map(s => s.orderSerialNumber)
         ]).size
       },
       sameMinuteOrders,
       longDurationSegments,
-      multipleOpenOrders
+      multipleOpenOrders,
+      stuckOpenSegments,
+      tinySegmentsByWorker,
+      highOpenWorkers
     });
   } catch (err) {
     console.error('[/diag/data-health]', err);
