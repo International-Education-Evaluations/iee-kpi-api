@@ -42,6 +42,7 @@ function CoverageTool() {
   const [data, setData] = useState(null);
   const [err, setErr] = useState(null);
   const [loading, setLoading] = useState(false);
+  const [repairing, setRepairing] = useState(false);
 
   const run = useCallback(async () => {
     if (!from || !to) { setErr('Pick both from and to dates.'); return; }
@@ -52,6 +53,33 @@ function CoverageTool() {
     } catch (e) { setErr(e.message); setData(null); }
     setLoading(false);
   }, [from, to]);
+
+  // Trigger a non-destructive range backfill for the dates that show
+  // "Backfill missing" in the current scan. Uses the existing /backfill/run
+  // with { dateFrom, dateTo } — adds segments without wiping anything else.
+  const repairRange = useCallback(async () => {
+    if (!data) return;
+    const missing = (data.gaps || []).filter(g => g.kind === 'backfill-missing');
+    if (!missing.length) return;
+    // Use the actual missing-day bounds (compact to a single contiguous range —
+    // the backfill cycle iterates by createdAt anyway, so a wider range is fine).
+    const dates = missing.map(g => g.date).sort();
+    const dateFrom = dates[0];
+    const dateTo   = dates[dates.length - 1];
+    if (!confirm(`Backfill ${missing.length} missing day${missing.length === 1 ? '' : 's'} (${dateFrom} → ${dateTo})?\n\nThis adds segments to backfill_kpi_segments without wiping anything else. May take a few minutes.`)) return;
+    setRepairing(true);
+    try {
+      const r = await api('/backfill/run', {
+        method: 'POST',
+        body: JSON.stringify({ dateFrom, dateTo, triggeredBy: 'coverage-repair' })
+      });
+      alert(`Started: ${r.message || 'backfill running'}.\n\nWait ~1-3 minutes, then click Run again to verify the missing days are filled.`);
+    } catch (e) {
+      alert(`Couldn't start backfill: ${e.message}`);
+    } finally {
+      setRepairing(false);
+    }
+  }, [data]);
 
   return (
     <div className="space-y-4">
@@ -75,12 +103,12 @@ function CoverageTool() {
 
       {err && <div className="card-surface bg-red-50 border-red-200 p-3 text-xs text-red-700">{err}</div>}
 
-      {data && <CoverageResult data={data} />}
+      {data && <CoverageResult data={data} onRepairRange={repairRange} repairing={repairing} />}
     </div>
   );
 }
 
-function CoverageResult({ data }) {
+function CoverageResult({ data, onRepairRange, repairing }) {
   const totalProd     = data.days.reduce((a, d) => a + (d.prodTransitions || 0), 0);
   const totalSegments = data.days.reduce((a, d) => a + (d.segments || 0), 0);
   const backfillMissing = data.gaps.filter(g => g.kind === 'backfill-missing').length;
@@ -88,6 +116,22 @@ function CoverageResult({ data }) {
 
   return (
     <div className="space-y-4">
+      {backfillMissing > 0 && (
+        <div className="card-surface bg-red-50 border-red-200 p-3 flex items-start gap-3">
+          <span className="text-red-500 text-base shrink-0">⚠</span>
+          <div className="flex-1 text-xs text-red-800">
+            <div className="font-semibold">{backfillMissing} day{backfillMissing === 1 ? '' : 's'} missing in our backfill</div>
+            <div className="text-red-700 mt-0.5">
+              Production has these transitions but <code className="font-mono text-[10px] bg-white px-1 rounded">backfill_kpi_segments</code> doesn't. The incremental scheduler only rolls forward from the most recent segment, so historic windows never get filled. Click <span className="font-semibold">Backfill missing days</span> to run a non-destructive range fill — adds segments without wiping anything else.
+            </div>
+          </div>
+          <button onClick={onRepairRange} disabled={repairing}
+            className="text-xs bg-red-600 hover:bg-red-700 disabled:bg-ink-300 text-white px-3 py-1.5 rounded font-semibold shrink-0">
+            {repairing ? 'Starting…' : 'Backfill missing days'}
+          </button>
+        </div>
+      )}
+
       <div className="metric-grid-5">
         <Card label="Days" value={fmtI(data.range.days)} color="brand" />
         <Card label="Prod Transitions" value={fmtI(totalProd)} color="navy"
