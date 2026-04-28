@@ -6,6 +6,7 @@ import {
   ResponsiveContainer, ReferenceLine
 } from 'recharts';
 import { api } from '../hooks/useApi';
+import { useData } from '../hooks/useData';
 import { TOOLTIP_STYLE, fmtI, fmt, fmtDur, fmtHrs, OrderLink } from '../components/UI';
 
 // ── Constants ────────────────────────────────────────────────
@@ -161,6 +162,7 @@ function MultiSelect({ label, options, value, onChange, valueKey='value', labelK
 
 // ── Main component ────────────────────────────────────────────
 export default function ReportBuilder() {
+  const { excludeFlagged } = useData();
   const [filterOpts, setFilterOpts]   = useState(null);
   const [config, setConfig]           = useState(DEFAULT_CONFIG);
   const [results, setResults]         = useState(null);
@@ -185,7 +187,13 @@ export default function ReportBuilder() {
   const runReport = async () => {
     setLoading(true); setResults(null);
     try {
-      const d = await api('/reports/query', { method: 'POST', body: JSON.stringify(config) });
+      // Honor the global "exclude flagged" toggle by passing it through to the
+      // server. /reports/query consults the same flagged-keys cache.
+      const payload = {
+        ...config,
+        filters: { ...(config.filters || {}), excludeFlagged: !!excludeFlagged }
+      };
+      const d = await api('/reports/query', { method: 'POST', body: JSON.stringify(payload) });
       setResults(d);
       setTab('chart');
     } catch (e) { alert('Report failed: ' + e.message); }

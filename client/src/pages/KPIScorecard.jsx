@@ -45,7 +45,7 @@ function MiniBar({ pct, color = '#16a34a' }) {
 }
 
 export default function KPIScorecard() {
-  const { kpiSegs, kpiLoading, loadKpi } = useData();
+  const { kpiSegs, kpiLoading, loadKpi, flaggedSegmentKeys, excludeFlagged } = useData();
   const [benchmarks, setBenchmarks] = useState([]);
   const [userLevels, setUserLevels] = useState([]);
   const [fDept, setFDept] = useState('');
@@ -116,13 +116,14 @@ export default function KPIScorecard() {
   // Apply filters
   const filtered = useMemo(() => kpiSegs.filter(s => {
     if (s.isOpen) return false; // scorecard only covers closed work
+    if (excludeFlagged && s._compositeKey && flaggedSegmentKeys.has(s._compositeKey)) return false;
     if (dFDept   && s.departmentName !== dFDept)   return false;
     if (dFStatus && s.statusSlug !== dFStatus)      return false;
     if (dFWorker && s._workerId !== dFWorker)       return false;
     if (dFFrom   && s.segmentStart && s.segmentStart < dFFrom) return false;
     if (dFTo     && s.segmentStart && s.segmentStart > dFTo + 'T23:59:59') return false;
     return true;
-  }), [kpiSegs, dFDept, dFStatus, dFWorker, dFFrom, dFTo]);
+  }), [kpiSegs, dFDept, dFStatus, dFWorker, dFFrom, dFTo, excludeFlagged, flaggedSegmentKeys]);
 
   // Dropdown options
   const depts   = useMemo(() => [...new Set(kpiSegs.map(s => s.departmentName).filter(Boolean))].sort(), [kpiSegs]);

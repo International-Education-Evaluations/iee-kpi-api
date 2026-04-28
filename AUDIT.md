@@ -413,8 +413,11 @@ User noticed during a real drilldown that completed orders still had "Open" Proc
 - Global "Exclude flagged segments from KPI rollups" toggle ships in Settings
 - KPIOverview + KPIUsers respect it; drilldown drawer surfaces flagged rows with red highlighting + Flags column
 
+**Closed in PR #11 (extend exclusion site-wide, 2026-04-28):**
+- KPIScorecard, DeptComparison, ShiftHeatmap apply the same segment-level filter at memo level when `excludeFlagged` is on
+- ReportBuilder passes `filters.excludeFlagged: true` to `/reports/query` when the toggle is on; server applies `_compositeKey: { $nin: keys }` against the same in-memory flagged cache used by `/data/data-quality-flags`
+
 **Still open (recommended next):**
-- **Extend exclusion to remaining pages.** KPIScorecard, DeptComparison, ShiftHeatmap, ReportBuilder don't yet read `excludeFlagged` from context — their rollups don't filter. Mechanical change once tested on KPIOverview/KPIUsers.
 - **Bulk repair.** A "Repair all" button on Data Health that hits the existing single-order repair endpoint in a loop. Reduced priority now that cycle reconciliation auto-heals; useful only for orders the cycle hasn't touched recently.
 - **Periodic full-sweep reconciliation.** Cycle reconciliation only touches orders whose history has changed in the cutoff window. Orders that haven't changed but were corrupted before the cycle landed don't get healed. A weekly cron that runs reconciliation across all orders modified in the last 90 days would close that gap.
 

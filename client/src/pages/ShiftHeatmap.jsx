@@ -24,7 +24,7 @@ function heatColorStyle(val, max) {
 }
 
 export default function ShiftHeatmap() {
-  const { kpiSegs, kpiLoading, loadKpi } = useData();
+  const { kpiSegs, kpiLoading, loadKpi, flaggedSegmentKeys, excludeFlagged } = useData();
   const [metric, setMetric] = useState('count'); // count | avgDuration | xph
   const [fDept, setFDept]   = useState('');
   const [fFrom, setFFrom]   = useState('');
@@ -42,12 +42,13 @@ export default function ShiftHeatmap() {
 
   const filtered = useMemo(() => kpiSegs.filter(s => {
     if (!s.segmentStart) return false;
+    if (excludeFlagged && s._compositeKey && flaggedSegmentKeys.has(s._compositeKey)) return false;
     if (dFDept && s.departmentName !== dFDept) return false;
     if (dFType && s.orderType !== dFType) return false;
     if (dFFrom && s.segmentStart < dFFrom) return false;
     if (dFTo   && s.segmentStart > dFTo + 'T23:59:59') return false;
     return true;
-  }), [kpiSegs, dFDept, dFFrom, dFTo, dFType]);
+  }), [kpiSegs, dFDept, dFFrom, dFTo, dFType, excludeFlagged, flaggedSegmentKeys]);
 
   // Build day × hour grid
   const grid = useMemo(() => {
