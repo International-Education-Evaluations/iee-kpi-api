@@ -4321,7 +4321,7 @@ async function runBackfill(options = {}) {
     // (Skipped if full refresh already ran batched above)
     // ═════════════════════════════════════════════════════════
 
-    let upsertedSegs = 0, updatedSegs = 0, segOpsCount = 0, qcRawCount = 0, upsertedQc = 0, ordersScanned = 0, openOrdersRechecked = 0;
+    let upsertedSegs = 0, updatedSegs = 0, segOpsCount = 0, qcRawCount = 0, upsertedQc = 0, ordersScanned = 0, openOrdersRechecked = 0, reconciledOrphans = 0;
 
     if (!fullBatchResults) {
 
@@ -4403,16 +4403,28 @@ async function runBackfill(options = {}) {
 
     // 1d. Build segments
     const segOps = []; // bulkWrite operations
+    // Track every Processing entry's compositeKey per order — this is the
+    // canonical valid-keyset, used after upsert to detect orphans (segments
+    // in our backfill that no longer correspond to a live history entry,
+    // typically caused by V2 mutating orderStatusHistory after we ingested it).
+    const validKeysByOrderId = new Map(); // orderId -> Set<compositeKey>
+    const touchedOrderIds = new Set();    // orders we wrote to OR re-checked
     for (const order of allOrders.values()) {
       const history = Array.isArray(order.orderStatusHistory) ? order.orderStatusHistory : [];
       const reportCount = Array.isArray(order.reportItems) ? order.reportItems.length : 0;
       const reportName = Array.isArray(order.reportItems) ? (order.reportItems[0]?.name || null) : null;
+      const orderIdStr = String(order._id);
+      const validKeys = new Set();
 
       for (let i = 0; i < history.length; i++) {
         const entry = history[i];
         if (entry?.updatedStatus?.statusType !== 'Processing') continue;
         const entryDate = toDate(entry?.createdAt);
         if (!entryDate) continue;
+
+        // Build the canonical keyset for reconciliation regardless of cutoff —
+        // we need to know EVERY valid key on this order to identify orphans.
+        validKeys.add(`${orderIdStr}_${entry?.updatedStatus?.slug || ''}_${entryDate.toISOString()}`);
 
         // For incremental: skip segments we definitely already have and that are closed
         // (they're immutable). Only process if:
@@ -4465,6 +4477,14 @@ async function runBackfill(options = {}) {
             upsert: true
           }
         });
+        touchedOrderIds.add(orderIdStr);
+      }
+      // Even if we didn't add a segOp this cycle (all entries old + closed),
+      // the order is still relevant to reconcile if it's in openOrderIds —
+      // V2 may have removed its open entry server-side and we want to clean up.
+      if (validKeys.size > 0 && (touchedOrderIds.has(orderIdStr) || openOrderIds.includes(orderIdStr))) {
+        validKeysByOrderId.set(orderIdStr, validKeys);
+        touchedOrderIds.add(orderIdStr);
       }
     }
 
@@ -4477,6 +4497,42 @@ async function runBackfill(options = {}) {
         const result = await segCol.bulkWrite(batch, { ordered: false });
         upsertedSegs += result.upsertedCount || 0;
         updatedSegs += result.modifiedCount || 0;
+      }
+    }
+
+    // 1e.1. Cycle-level reconciliation — delete orphan segments whose
+    // _compositeKey is no longer present in the order's current
+    // orderStatusHistory (V2 mutated the array post-ingest). This auto-heals
+    // the multi-open phantom pattern AUDIT.md §6.6 documented; the manual
+    // "Repair" button on Diagnostics is now a backstop, not the primary fix.
+    if (touchedOrderIds.size > 0) {
+      try {
+        const touchedIds = Array.from(touchedOrderIds);
+        // Fetch existing keys per touched order in one query.
+        const existing = await segCol.find(
+          { orderId: { $in: touchedIds } },
+          { projection: { _id: 0, _compositeKey: 1, orderId: 1 } }
+        ).toArray();
+        const orphanKeys = [];
+        for (const row of existing) {
+          const valid = validKeysByOrderId.get(row.orderId);
+          if (!valid || !valid.has(row._compositeKey)) {
+            orphanKeys.push(row._compositeKey);
+          }
+        }
+        if (orphanKeys.length > 0) {
+          // deleteMany in batches to keep payload size sane.
+          for (let i = 0; i < orphanKeys.length; i += 1000) {
+            const batch = orphanKeys.slice(i, i + 1000);
+            const r = await segCol.deleteMany({ _compositeKey: { $in: batch } });
+            reconciledOrphans += r.deletedCount || 0;
+          }
+          push(`Reconciled ${reconciledOrphans} orphan segments across ${touchedIds.length} touched orders`);
+        }
+      } catch (err) {
+        // Non-fatal — log and continue. The manual Repair button is still available.
+        console.error('[reconciliation]', err);
+        push(`Reconciliation skipped: ${err.message}`);
       }
     }
 
@@ -4688,6 +4744,7 @@ async function runBackfill(options = {}) {
         segmentsProcessed: segOpsCount,
         segmentsNew: upsertedSegs,
         segmentsUpdated: updatedSegs,
+        segmentsReconciled: reconciledOrphans,
         segmentsTotal: totalSegs,
         qcProcessed: qcRawCount,
         qcNew: upsertedQc,

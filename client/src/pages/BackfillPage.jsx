@@ -149,10 +149,11 @@ export default function BackfillPage() {
       {/* Last Run Info */}
       {status?.lastRunAt && <div className="card-surface p-4">
         <Section title="Last Backfill" sub={`${new Date(status.lastRunAt).toLocaleString('en-US', { timeZone: 'America/New_York' })} · ${status.mode || 'unknown'} · by ${status.triggeredBy || 'system'}`} />
-        <div className="grid grid-cols-2 md:grid-cols-4 gap-2 mt-3 text-xs">
+        <div className="grid grid-cols-2 md:grid-cols-5 gap-2 mt-3 text-xs">
           <div className="p-2 bg-surface-50 rounded"><span className="text-ink-500">Orders scanned:</span> <span className="text-ink-900 font-mono">{fmtI(status.counts?.ordersScanned)}</span></div>
           <div className="p-2 bg-surface-50 rounded"><span className="text-ink-500">Segments new:</span> <span className="text-emerald-600 font-mono">{fmtI(status.counts?.segmentsNew)}</span></div>
           <div className="p-2 bg-surface-50 rounded"><span className="text-ink-500">Segments updated:</span> <span className="text-amber-600 font-mono">{fmtI(status.counts?.segmentsUpdated)}</span></div>
+          <div className="p-2 bg-surface-50 rounded" title="Orphan segments deleted because the order's live history no longer references their composite key"><span className="text-ink-500">Orphans cleaned:</span> <span className={`font-mono ${(status.counts?.segmentsReconciled||0)>0?'text-purple-600':'text-ink-400'}`}>{fmtI(status.counts?.segmentsReconciled)}</span></div>
           <div className="p-2 bg-surface-50 rounded"><span className="text-ink-500">QC new:</span> <span className="text-emerald-600 font-mono">{fmtI(status.counts?.qcNew)}</span></div>
         </div>
         {status.log && <details className="mt-3"><summary className="text-[10px] text-ink-500 cursor-pointer hover:text-ink-900">Run log ({status.log.length} entries)</summary>
