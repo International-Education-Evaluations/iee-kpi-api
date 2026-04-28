@@ -406,10 +406,17 @@ User noticed during a real drilldown that completed orders still had "Open" Proc
 
 **Surface:** Diagnostics → Data Health tab — defaults to a 30-day window, returns prevalence numbers and three worst-offender tables (50 rows each). Multi-open table has a per-row Repair button.
 
-**Open follow-ups (not in PR #4, recommended next):**
-- **Reconciliation in the backfill cycle.** After each batch upserts segments, query `backfill_kpi_segments` for those order IDs, compare against the just-built composite keys, and delete orphans automatically. Closes the loop without human intervention.
-- **`dataQuality` flag on segments.** Stamp every segment with one of `null | 'batch_stamped' | 'chain_break'` at backfill time. Add a global "Exclude flagged orders from KPI rollups" toggle in Settings. Once on, KPIOverview / KPIUsers / KPIScorecard filter on the flag at aggregation time.
-- **Bulk repair.** A "Repair all" button on the Data Health panel that hits the repair endpoint for every order in the multi-open list. Currently one-at-a-time so we can verify behavior on a few orders first.
+**Closed in PR #10 (cycle reconciliation, 2026-04-28):** the incremental backfill loop now builds the canonical composite-key set per touched order from the live history, queries `backfill_kpi_segments` for those orders' existing keys, and `deleteMany`s anything not in the canonical set. Multi-open phantom accumulation stops at the source — the manual Repair button on Data Health is now a backstop, not the primary fix. The run-summary metadata gains `segmentsReconciled` so admins can verify on the Backfill page.
+
+**Closed in PR #9 (segment-level data-quality exclusion, 2026-04-27):**
+- `_dqReasons` is stamped on every segment at DataProvider load time
+- Global "Exclude flagged segments from KPI rollups" toggle ships in Settings
+- KPIOverview + KPIUsers respect it; drilldown drawer surfaces flagged rows with red highlighting + Flags column
+
+**Still open (recommended next):**
+- **Extend exclusion to remaining pages.** KPIScorecard, DeptComparison, ShiftHeatmap, ReportBuilder don't yet read `excludeFlagged` from context — their rollups don't filter. Mechanical change once tested on KPIOverview/KPIUsers.
+- **Bulk repair.** A "Repair all" button on Data Health that hits the existing single-order repair endpoint in a loop. Reduced priority now that cycle reconciliation auto-heals; useful only for orders the cycle hasn't touched recently.
+- **Periodic full-sweep reconciliation.** Cycle reconciliation only touches orders whose history has changed in the cutoff window. Orders that haven't changed but were corrupted before the cycle landed don't get healed. A weekly cron that runs reconciliation across all orders modified in the last 90 days would close that gap.
 
 ---
 
