@@ -399,15 +399,20 @@ export function DrilldownDrawer({ open, onClose, title, subtitle, rows=[], loadi
                 </tr>
               </thead>
               <tbody>
-                {displayed.map((r, i) => (
-                  <tr key={i} className="hover:bg-brand-50/30 transition-colors">
-                    {visibleCols.map((c, j) => (
-                      <td key={j} className={`px-3 py-2 text-[12px] border-b border-surface-100 ${c.right?'text-right font-mono':''}`}>
-                        {c.render ? c.render(r[c.key], r) : (r[c.key] ?? '—')}
-                      </td>
-                    ))}
-                  </tr>
-                ))}
+                {displayed.map((r, i) => {
+                  // Flagged rows (any data-quality reason on the segment) get a
+                  // red tint + left border so they stand out from clean rows.
+                  const isFlagged = Array.isArray(r._dqReasons) && r._dqReasons.length > 0;
+                  return (
+                    <tr key={i} className={`transition-colors ${isFlagged ? 'bg-red-50 hover:bg-red-100 border-l-2 border-l-red-400' : 'hover:bg-brand-50/30'}`}>
+                      {visibleCols.map((c, j) => (
+                        <td key={j} className={`px-3 py-2 text-[12px] border-b border-surface-100 ${c.right?'text-right font-mono':''}`}>
+                          {c.render ? c.render(r[c.key], r) : (r[c.key] ?? '—')}
+                        </td>
+                      ))}
+                    </tr>
+                  );
+                })}
               </tbody>
             </table>
           )}

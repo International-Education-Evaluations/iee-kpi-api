@@ -39,7 +39,8 @@ const SEG_COLS = [
 ];
 
 export default function KPIOverview() {
-  const { kpiSegs: segs, kpiLoading: loading, loadKpi, loadStatus, benchmarks } = useData();
+  const { kpiSegs: segs, kpiLoading: loading, loadKpi, loadStatus, benchmarks,
+          flaggedSegmentKeys, flaggedReasonsByKey, excludeFlagged } = useData();
   const kpiStatus = loadStatus?.kpi || {};
   // benchmarks now come from DataProvider context — no local state needed
   const [view, setView] = useState('status');
@@ -89,6 +90,9 @@ export default function KPIOverview() {
   const depts = useMemo(()=>[...new Set(segs.map(s=>s.departmentName).filter(Boolean))].sort(),[segs]);
 
   const filtered = useMemo(()=>segs.filter(s=>{
+    // Segment-level data-quality exclusion — drop only the bad segments,
+    // not the whole order. Good segments on the same order stay in.
+    if(excludeFlagged&&s._compositeKey&&flaggedSegmentKeys.has(s._compositeKey))return false;
     if(deferredFType&&s.orderType!==deferredFType)return false;
     if(deferredFDept&&s.departmentName!==deferredFDept)return false;
     if(deferredFWorker&&s._workerId!==deferredFWorker)return false;
@@ -96,7 +100,11 @@ export default function KPIOverview() {
     if(deferredFFrom&&s.segmentStart&&s.segmentStart<deferredFFrom)return false;
     if(deferredFTo&&s.segmentStart&&s.segmentStart>deferredFTo+'T23:59:59')return false;
     return true;
-  }),[segs,deferredFType,deferredFDept,deferredFFrom,deferredFTo,deferredFWorker,deferredFStatus]);
+  }),[segs,deferredFType,deferredFDept,deferredFFrom,deferredFTo,deferredFWorker,deferredFStatus,excludeFlagged,flaggedSegmentKeys]);
+  const excludedFlaggedSegCount = useMemo(() => {
+    if (!excludeFlagged || !flaggedSegmentKeys.size) return 0;
+    return segs.reduce((a, s) => a + (s._compositeKey && flaggedSegmentKeys.has(s._compositeKey) ? 1 : 0), 0);
+  }, [segs, excludeFlagged, flaggedSegmentKeys]);
 
   const metrics = useMemo(()=>{
     if(!filtered.length)return null;
@@ -375,6 +383,19 @@ export default function KPIOverview() {
               The backfill may not have run, or the 60-day cutoff filtered everything out. Check
               {' '}<a href="/admin/diagnostics" className="underline">Diagnostics → Coverage Gaps</a>
               {' '}or <a href="/admin/backfill" className="underline">Data Backfill</a> for the last run status.
+            </div>
+          </div>
+        </div>
+      )}
+      {!loading && excludeFlagged && excludedFlaggedSegCount > 0 && (
+        <div className="card-surface bg-blue-50 border-blue-200 p-3 flex items-start gap-3">
+          <span className="text-brand-600 text-base shrink-0">ℹ</span>
+          <div className="flex-1 text-xs text-brand-800">
+            <div className="font-semibold">Excluding {fmtI(excludedFlaggedSegCount)} flagged segment{excludedFlaggedSegCount === 1 ? '' : 's'} from KPI rollups</div>
+            <div className="text-brand-700 mt-0.5">
+              Same-minute clusters, chain-break long durations, multi-open orphans, and stuck open segments are removed from Avg / Median / Total Hours / XpH. Drilldowns still show them with red highlighting.
+              {' · '}<a href="/admin/diagnostics" className="underline">Open Data Health</a>
+              {' · '}<a href="/settings" className="underline">Toggle in Settings</a>
             </div>
           </div>
         </div>

@@ -42,6 +42,12 @@ const SEG_COLS = [
   { key:'isErrorReporting',  label:'Error Rpt', w:75,  sortable:true, empty:v=>!v, render:v=>v?<span className="badge badge-danger">Yes</span>:'' },
   { key:'isOpen',            label:'State',     w:65,  sortable:true, alwaysShow:true, render:v=><span className={`badge ${v?'badge-warning':'badge-success'}`}>{v?'Open':'Closed'}</span> },
   { key:'orderSource',       label:'Source',    w:80,  sortable:true, render:v=>v?<span className="text-[10px] text-ink-400 font-mono">{v}</span>:'' },
+  // Data-quality flags surface bad segments alongside the good ones so you
+  // can see exactly which rows the rollup excluded and why.
+  { key:'_dqReasons',        label:'Flags',     w:140, sortable:false, empty:v => !v || v.length === 0,
+    render:v => Array.isArray(v) && v.length > 0
+      ? <span className="flex flex-wrap gap-1">{v.map((r,i) => <span key={i} className="badge badge-danger text-[9px]">{r}</span>)}</span>
+      : '' },
 ];
 
 // ── Orders worked cols (distinct orders this worker touched) ──
@@ -58,7 +64,8 @@ const ORDER_COLS = [
 ];
 
 export default function KPIUsers() {
-  const { kpiSegs: segs, kpiLoading: loading, loadKpi, benchmarks } = useData();
+  const { kpiSegs: segs, kpiLoading: loading, loadKpi, benchmarks,
+          flaggedSegmentKeys, excludeFlagged } = useData();
   const classifySegment = useMemo(() => makeClassifier(benchmarks || []), [benchmarks]);
   const [sp] = useSearchParams();
   // Persist selected worker per-user so navigation away and back restores the selection
@@ -105,6 +112,22 @@ export default function KPIUsers() {
   }, [segs]);
 
   const userSegs = useMemo(() => {
+    if (!dSel) return [];
+    return segs.filter(s => {
+      if (s._workerId !== dSel) return false;
+      // Segment-level data-quality exclusion (when global toggle is on).
+      if (excludeFlagged && s._compositeKey && flaggedSegmentKeys.has(s._compositeKey)) return false;
+      if (dFFrom && s.segmentStart && s.segmentStart < dFFrom) return false;
+      if (dFTo   && s.segmentStart && s.segmentStart > dFTo + 'T23:59:59') return false;
+      if (dFStatus && (s.statusName||s.statusSlug) !== dFStatus) return false;
+      if (dFType && s.orderType !== dFType) return false;
+      return true;
+    });
+  }, [segs, dSel, dFFrom, dFTo, dFStatus, dFType, excludeFlagged, flaggedSegmentKeys]);
+
+  // Always-visible (regardless of toggle) — used by the drilldown drawer so
+  // flagged segments still show up there with their reason badges.
+  const userSegsIncludingFlagged = useMemo(() => {
     if (!dSel) return [];
     return segs.filter(s => {
       if (s._workerId !== dSel) return false;
@@ -263,27 +286,32 @@ export default function KPIUsers() {
   const hasFilters = fFrom||fTo||fStatus||fType;
 
   // ── Drilldown handlers ────────────────────────────────────
+  // Drilldown rows always include flagged segments (regardless of the global
+  // toggle) so the user can SEE the bad data and confirm the reasons. Rollups
+  // already exclude them from Avg/Median/XpH via `userSegs`.
   const openStatusDrawer = useCallback((row) => {
-    const allRows = userSegs.filter(s=>(s.statusName||s.statusSlug)===row.status)
+    const allRows = userSegsIncludingFlagged.filter(s=>(s.statusName||s.statusSlug)===row.status)
       .sort((a,b)=>(b.segmentStart||'').localeCompare(a.segmentStart||''));
+    const flaggedCount = allRows.reduce((a, s) => a + (s._dqReasons ? 1 : 0), 0);
     setDrawerState('all');
     setDrawer({ open:true, cols:SEG_COLS, splitByState:false,
       title: `${selName} — ${row.status}`,
-      subtitle: `${fmtI(row.count)} segments · ${fmtI(row.closed)} closed · ${row.open} open · Avg ${fmtDur(row.avg)} · ${row.orders} orders`,
+      subtitle: `${fmtI(row.count)} segments · ${fmtI(row.closed)} closed · ${row.open} open · Avg ${fmtDur(row.avg)} · ${row.orders} orders${flaggedCount > 0 ? ` · ${flaggedCount} flagged` : ''}`,
       allRows });
-  }, [userSegs, selName]);
+  }, [userSegsIncludingFlagged, selName]);
 
   const openOrderDrawer = useCallback((row) => {
-    const allRows = userSegs.filter(s=>s.orderSerialNumber===row.orderSerialNumber)
+    const allRows = userSegsIncludingFlagged.filter(s=>s.orderSerialNumber===row.orderSerialNumber)
       .sort((a,b)=>(b.segmentStart||'').localeCompare(a.segmentStart||''));
     const closedCount = allRows.filter(s => !s.isOpen).length;
     const openCount   = allRows.length - closedCount;
+    const flaggedCount = allRows.reduce((a, s) => a + (s._dqReasons ? 1 : 0), 0);
     setDrawerState('all');
     setDrawer({ open:true, cols:SEG_COLS, splitByState:true,
       title: row.orderSerialNumber,
-      subtitle: `${row.segCount} segments · ${closedCount} closed · ${openCount} open · ${fmtDur(row.totalMin)} total · ${row.orderType}`,
+      subtitle: `${row.segCount} segments · ${closedCount} closed · ${openCount} open · ${fmtDur(row.totalMin)} total · ${row.orderType}${flaggedCount > 0 ? ` · ${flaggedCount} flagged` : ''}`,
       allRows });
-  }, [userSegs]);
+  }, [userSegsIncludingFlagged]);
 
   // ── Apply Closed / Open / All filter to drawer rows when split is enabled ──
   const drawerDisplayRows = useMemo(() => {
