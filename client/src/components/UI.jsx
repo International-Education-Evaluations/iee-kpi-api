@@ -333,12 +333,25 @@ export function DrilldownDrawer({ open, onClose, title, subtitle, rows=[], loadi
     return out;
   }, [rows, search, sortKey, sortDir]);
 
+  // Auto-hide columns that are empty for every row in the current dataset.
+  // A column is empty when every row's value passes its `empty` predicate
+  // (default treats null/undefined/''/false as empty). Columns can opt out
+  // with `alwaysShow: true`. The Order column should never disappear.
+  const visibleCols = useMemo(() => {
+    if (!rows.length) return cols;
+    return cols.filter((c, idx) => {
+      if (c.alwaysShow || idx === 0) return true; // never hide the first column
+      const isEmpty = c.empty || ((v) => v == null || v === '' || v === false);
+      return rows.some(r => !isEmpty(r[c.key], r));
+    });
+  }, [cols, rows]);
+
   return (
     <>
       <div onClick={onClose}
         className="fixed inset-0 z-40 bg-black/30 backdrop-blur-[2px] transition-opacity duration-200"
         style={{ opacity: open ? 1 : 0, pointerEvents: open ? 'auto' : 'none' }} />
-      <div className="fixed top-0 right-0 z-50 h-full w-full max-w-3xl flex flex-col bg-white shadow-2xl transition-transform duration-300 ease-out"
+      <div className="fixed top-0 right-0 z-50 h-full w-full max-w-[min(95vw,1280px)] flex flex-col bg-white shadow-2xl transition-transform duration-300 ease-out"
         style={{ transform: open ? 'translateX(0)' : 'translateX(100%)' }}>
 
         {/* Header */}
@@ -375,7 +388,7 @@ export function DrilldownDrawer({ open, onClose, title, subtitle, rows=[], loadi
             <table className="tbl w-full">
               <thead className="sticky top-0 z-10 bg-surface-50">
                 <tr>
-                  {cols.map((c, i) => (
+                  {visibleCols.map((c, i) => (
                     <th key={i}
                       className={`${c.right?'text-right':''} ${c.sortable!==false?'cursor-pointer hover:bg-surface-100 select-none':''} text-[10px] px-3 py-2.5 font-semibold uppercase tracking-wider text-ink-500 border-b border-surface-200`}
                       style={{minWidth:c.w}} onClick={() => c.sortable!==false && handleSort(c.key)}>
@@ -388,7 +401,7 @@ export function DrilldownDrawer({ open, onClose, title, subtitle, rows=[], loadi
               <tbody>
                 {displayed.map((r, i) => (
                   <tr key={i} className="hover:bg-brand-50/30 transition-colors">
-                    {cols.map((c, j) => (
+                    {visibleCols.map((c, j) => (
                       <td key={j} className={`px-3 py-2 text-[12px] border-b border-surface-100 ${c.right?'text-right font-mono':''}`}>
                         {c.render ? c.render(r[c.key], r) : (r[c.key] ?? '—')}
                       </td>

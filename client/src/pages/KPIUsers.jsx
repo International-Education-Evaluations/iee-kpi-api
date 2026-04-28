@@ -26,19 +26,22 @@ function fmtDate(d) {
 }
 
 // ── Drilldown cols — full segment detail for a given status ──
+// `empty: v => !v` on numeric/boolean columns lets DrilldownDrawer auto-hide
+// the whole column when every row is 0 / false (e.g. Creds for Doc Mgmt workers,
+// Error Rpt when no QC events). The `alwaysShow: true` columns never hide.
 const SEG_COLS = [
-  { key:'orderSerialNumber', label:'Order',     w:110, sortable:true, render:v=><OrderLink serial={v} /> },
-  { key:'segmentStart',      label:'Start',     w:130, sortable:true, render:v=>fmtDateTime(v) },
-  { key:'segmentEnd',        label:'End',       w:130, sortable:true, render:(v,r)=>r.isOpen?<span className="text-amber-500 text-[11px]">Open</span>:fmtDateTime(v) },
-  { key:'durationMinutes',   label:'Duration',  w:85,  right:true, sortable:true, render:(v,r)=>r.isOpen?<span className="text-amber-600 text-[11px]">Open</span>:fmtDur(v) },
-  { key:'durationSeconds',   label:'Sec',       w:65,  right:true, sortable:true, render:v=>v!=null?<span className="font-mono text-ink-400 text-[11px]">{Math.round(v)}</span>:'—' },
-  { key:'orderType',         label:'Type',      w:80,  sortable:true, render:v=><span className="capitalize text-[11px] text-ink-500">{v||'—'}</span> },
-  { key:'reportItemCount',   label:'Reports',   w:70,  right:true, sortable:true, render:v=>v>0?<span className="font-semibold text-ink-700">{v}</span>:<span className="text-ink-300">—</span> },
-  { key:'credentialCount',  label:'Creds',     w:65,  right:true, sortable:true, render:v=>v>0?<span className="font-semibold text-purple-700">{v}</span>:<span className="text-ink-300">—</span> },
-  { key:'changedByName',     label:'Changed By',w:130, sortable:true, render:v=>v||<span className="text-ink-300">—</span> },
-  { key:'isErrorReporting',  label:'Error Rpt', w:75,  sortable:true, render:v=>v?<span className="badge badge-danger">Yes</span>:<span className="text-ink-300">—</span> },
-  { key:'isOpen',            label:'State',     w:65,  sortable:true, render:v=><span className={`badge ${v?'badge-warning':'badge-success'}`}>{v?'Open':'Closed'}</span> },
-  { key:'orderSource',       label:'Source',    w:80,  sortable:true, render:v=>v?<span className="text-[10px] text-ink-400 font-mono">{v}</span>:'—' },
+  { key:'orderSerialNumber', label:'Order',     w:110, sortable:true, alwaysShow:true, render:v=><OrderLink serial={v} /> },
+  { key:'segmentStart',      label:'Start',     w:130, sortable:true, alwaysShow:true, render:v=>fmtDateTime(v) },
+  { key:'segmentEnd',        label:'End',       w:130, sortable:true, alwaysShow:true, render:(v,r)=>r.isOpen?<span className="text-amber-500 text-[11px]">Open</span>:fmtDateTime(v) },
+  { key:'durationMinutes',   label:'Duration',  w:85,  right:true, sortable:true, alwaysShow:true, render:(v,r)=>r.isOpen?<span className="text-amber-600 text-[11px]">Open</span>:fmtDur(v) },
+  { key:'durationSeconds',   label:'Sec',       w:65,  right:true, sortable:true, render:v=>v!=null?<span className="font-mono text-ink-400 text-[11px]">{Math.round(v)}</span>:''  },
+  { key:'orderType',         label:'Type',      w:80,  sortable:true, render:v=>v?<span className="capitalize text-[11px] text-ink-500">{v}</span>:'' },
+  { key:'reportItemCount',   label:'Reports',   w:70,  right:true, sortable:true, empty:v=>!v, render:v=>v>0?<span className="font-semibold text-ink-700">{v}</span>:'' },
+  { key:'credentialCount',   label:'Creds',     w:65,  right:true, sortable:true, empty:v=>!v, render:v=>v>0?<span className="font-semibold text-purple-700">{v}</span>:'' },
+  { key:'changedByName',     label:'Changed By',w:130, sortable:true, render:v=>v||'' },
+  { key:'isErrorReporting',  label:'Error Rpt', w:75,  sortable:true, empty:v=>!v, render:v=>v?<span className="badge badge-danger">Yes</span>:'' },
+  { key:'isOpen',            label:'State',     w:65,  sortable:true, alwaysShow:true, render:v=><span className={`badge ${v?'badge-warning':'badge-success'}`}>{v?'Open':'Closed'}</span> },
+  { key:'orderSource',       label:'Source',    w:80,  sortable:true, render:v=>v?<span className="text-[10px] text-ink-400 font-mono">{v}</span>:'' },
 ];
 
 // ── Orders worked cols (distinct orders this worker touched) ──
