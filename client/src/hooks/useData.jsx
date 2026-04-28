@@ -22,6 +22,16 @@ export function DataProvider({ children }) {
   const [qcLoading, setQcLoading]         = useState(false);
   const [queueLoading, setQueueLoading]   = useState(false);
   const [loadStatus, setLoadStatus]       = useState({ kpi: initStatus(), qc: initStatus(), queue: initStatus() });
+  // Data-quality flagged orders + the global toggle that decides whether KPI
+  // rollups exclude them. Populated alongside the KPI load so a single page
+  // visit gives you fully-filtered numbers without a second fetch.
+  // Segment-level flagged set (composite keys) is what KPI rollups filter on.
+  // Order set is kept for the existing Multi-open Repair flow on Diagnostics.
+  const [flaggedSegmentKeys, setFlaggedSegmentKeys] = useState(/** @type {Set<string>} */(new Set()));
+  const [flaggedReasonsByKey, setFlaggedReasonsByKey] = useState(/** @type {Record<string,string[]>} */({}));
+  const [flaggedOrders,  setFlaggedOrders]  = useState(/** @type {Set<string>} */(new Set()));
+  const [flaggedCounts,  setFlaggedCounts]  = useState({ totalSegments: 0, totalOrders: 0, sameMinute: 0, longDuration: 0, multiOpen: 0, stuckOpen: 0 });
+  const [excludeFlagged, setExcludeFlagged] = useState(false);
   const loadedRef = useRef({ kpi: false, qc: false, queue: false });
 
   function bumpStatus(key, patch) {
@@ -41,11 +51,20 @@ export function DataProvider({ children }) {
         catch (e) { partial[label] = `err: ${e.message}`; return fallback; }
       };
       // ── Fix 3: fetch users + user-levels in parallel, don't block segments ──
-      const [usersData, lvlData, benchData] = await Promise.all([
-        safeFetch('users',      '/data/users',         { users: [] }),
-        safeFetch('userLevels', '/config/user-levels', { levels: [] }),
-        safeFetch('benchmarks', '/config/benchmarks',  { benchmarks: [] }),
+      // Also fetch the data-quality flagged set + the global exclude toggle so
+      // pages can apply (or skip) the filter without a second round-trip.
+      const [usersData, lvlData, benchData, flagsData, settingsData] = await Promise.all([
+        safeFetch('users',       '/data/users',                 { users: [] }),
+        safeFetch('userLevels',  '/config/user-levels',         { levels: [] }),
+        safeFetch('benchmarks',  '/config/benchmarks',          { benchmarks: [] }),
+        safeFetch('flags',       '/data/data-quality-flags',    { flaggedSegmentKeys: [], reasonsByKey: {}, flaggedOrders: [], counts: {} }),
+        safeFetch('settings',    '/config/dashboard-settings',  { excludeFlaggedFromKpi: false }),
       ]);
+      setFlaggedSegmentKeys(new Set(flagsData.flaggedSegmentKeys || []));
+      setFlaggedReasonsByKey(flagsData.reasonsByKey || {});
+      setFlaggedOrders(new Set(flagsData.flaggedOrders || []));
+      setFlaggedCounts({ totalSegments: 0, totalOrders: 0, sameMinute: 0, longDuration: 0, multiOpen: 0, stuckOpen: 0, ...(flagsData.counts || {}) });
+      setExcludeFlagged(!!settingsData.excludeFlaggedFromKpi);
 
       const userList = usersData.users || [];
       setUsers(userList);
@@ -103,6 +122,10 @@ export function DataProvider({ children }) {
 
       const all = [first, ...rest].flatMap(d => d.segments || []);
 
+      // Build a lookup so each segment can carry its data-quality reasons
+      // through to the UI (drilldown row highlight + Flags column badge).
+      const reasonsByKey = flagsData?.reasonsByKey || {};
+
       // ── Enrich segments with department + level ──────────────────────────
       const enriched = all.map(s => {
         const email = (s.workerEmail || '').toLowerCase();
@@ -128,7 +151,8 @@ export function DataProvider({ children }) {
             ? (s.reportItemCount || 0)
             : 1;
 
-        return { ...s, departmentName: dept, userLevel: level, xphUnit, unitValue };
+        const dqReasons = s._compositeKey ? (reasonsByKey[s._compositeKey] || null) : null;
+        return { ...s, departmentName: dept, userLevel: level, xphUnit, unitValue, _dqReasons: dqReasons };
       });
 
       setKpiSegs(disambiguateWorkers(enriched));
@@ -218,6 +242,7 @@ export function DataProvider({ children }) {
       kpiSegs, classifiedSummary, qcEvents, queueSnap, queueWait, users, benchmarks,
       kpiLoading, qcLoading, queueLoading,
       loadStatus,
+      flaggedSegmentKeys, flaggedReasonsByKey, flaggedOrders, flaggedCounts, excludeFlagged, setExcludeFlagged,
       loadKpi, loadQc, loadQueue, forceRefreshQueue, refreshAll,
     }}>
       {children}

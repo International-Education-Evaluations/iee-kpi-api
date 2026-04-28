@@ -7,12 +7,66 @@ export default function SettingsPage() {
   return (
     <div className="space-y-5">
       <div><h1 className="text-xl font-display font-bold text-ink-900" data-tour="settings-title">Configuration</h1><p className="text-xs text-ink-400 mt-0.5">Benchmarks, production hours, user levels · All changes audited</p></div>
+      <DataQualityToggle />
       <Pills tabs={[{key:'benchmarks',label:'Benchmarks'},{key:'thresholds',label:'Thresholds'},{key:'hours',label:'Production Hours'},{key:'levels',label:'User Levels'},{key:'audit',label:'Audit Log'}]} active={tab} onChange={setTab} />
       {tab==='benchmarks'&&<BenchmarkConfig />}
       {tab==='thresholds'&&<ThresholdConfig />}
       {tab==='hours'&&<ConfigTable title="Production Hours" sub="Net processing hours per day" endpoint="/config/production-hours" dataKey="hours" idFields={[{key:'team',label:'Team'},{key:'status',label:'Status'}]} />}
       {tab==='levels'&&<UserLevels />}
       {tab==='audit'&&<AuditLog />}
+    </div>
+  );
+}
+
+// Global toggle that controls whether KPI rollups exclude data-quality flagged
+// segments (same-minute clusters, chain-break long durations, multi-open
+// orphans, stuck open). Manager+ can change it; effect is dashboard-wide
+// after the next page load (or refresh).
+function DataQualityToggle() {
+  const [enabled, setEnabled] = useState(null);
+  const [saving, setSaving] = useState(false);
+  const canEdit = isManagerPlus();
+
+  useEffect(() => {
+    api('/config/dashboard-settings', { silent: true })
+      .then(d => setEnabled(!!d.excludeFlaggedFromKpi))
+      .catch(() => setEnabled(false));
+  }, []);
+
+  const toggle = async () => {
+    if (!canEdit) return;
+    const next = !enabled;
+    setSaving(true);
+    try {
+      await api('/config/dashboard-settings', {
+        method: 'PUT',
+        body: JSON.stringify({ excludeFlaggedFromKpi: next })
+      });
+      setEnabled(next);
+    } catch (e) {
+      alert(`Couldn't save: ${e.message}`);
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  if (enabled === null) return null;
+  return (
+    <div className="card-surface p-4 flex items-center gap-4 flex-wrap">
+      <div className="flex-1 min-w-[260px]">
+        <div className="text-sm font-display font-bold text-ink-900">Exclude flagged segments from KPI rollups</div>
+        <div className="text-[11px] text-ink-500 mt-0.5">
+          When ON, Avg Duration / Median / Total Hours / XpH on KPI Overview and User Drill-Down filter out segments flagged by Data Health (same-minute clusters, chain-break {'>'}24h durations, multi-open orphans, stuck open {'>'}7d). Drilldowns still show the flagged rows with red highlighting and reason badges so you can see exactly what was excluded. Browser refresh required for changes to take effect across open tabs.
+        </div>
+      </div>
+      <button onClick={toggle} disabled={!canEdit || saving}
+        aria-pressed={enabled}
+        className={`relative w-12 h-6 rounded-full transition-colors ${enabled ? 'bg-emerald-500' : 'bg-surface-300'} disabled:opacity-50`}>
+        <span className={`absolute top-0.5 left-0.5 w-5 h-5 rounded-full bg-white shadow transition-transform ${enabled ? 'translate-x-6' : ''}`} />
+      </button>
+      <span className={`text-xs font-semibold ${enabled ? 'text-emerald-600' : 'text-ink-400'}`}>
+        {enabled ? 'ON' : 'OFF'}
+      </span>
     </div>
   );
 }

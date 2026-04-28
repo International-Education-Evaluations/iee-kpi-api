@@ -5371,6 +5371,142 @@ app.post('/diag/order-quality/repair', requireRole('admin'), async (req, res) =>
   }
 });
 
+// —— GET /data/data-quality-flags ————————————————————————————
+// Returns the set of orderSerialNumbers currently flagged by Data Health
+// (same patterns as /diag/data-health: same-minute clusters, long-duration
+// chain breaks, multi-open orphans, stuck open segments). Cached 5min in-memory
+// since the underlying patterns only shift when backfill ingests new data.
+//
+// Auth: any logged-in user can read this — KPI pages need it to filter
+// rollups when the global "exclude flagged from KPI" toggle is on.
+let _flaggedCache = null;
+let _flaggedCacheTs = 0;
+const FLAGGED_TTL_MS = 5 * 60 * 1000;
+
+async function computeFlaggedOrders() {
+  const days = 30;
+  const cutoff = new Date(Date.now() - days * 86400000).toISOString();
+  const sevenDaysAgo = new Date(Date.now() - 7 * 86400000).toISOString();
+  const configDb = await getConfigDb();
+  const segCol = configDb.collection('backfill_kpi_segments');
+
+  // Per-segment flagging — each entry returns _compositeKey of the OFFENDING
+  // segment(s), not the whole order. Lets the client filter at segment grain.
+  const [sameMinuteSegs, longDurSegs, multiOpenSegs, stuckOpenSegs] = await Promise.all([
+    // Same-minute: every segment whose (order, minute) bucket has 2+ entries.
+    // First find the offending buckets, then re-fetch the segment rows in those buckets.
+    (async () => {
+      const buckets = await segCol.aggregate([
+        { $match: { segmentStart: { $gte: cutoff } } },
+        { $project: { orderSerialNumber: 1, minute: { $substr: ['$segmentStart', 0, 16] }, _compositeKey: 1 } },
+        { $group: { _id: { order: '$orderSerialNumber', minute: '$minute' }, c: { $sum: 1 }, keys: { $push: '$_compositeKey' } } },
+        { $match: { c: { $gte: 2 } } },
+        { $project: { _id: 0, orderSerialNumber: '$_id.order', minute: '$_id.minute', keys: 1 } }
+      ], { allowDiskUse: true }).toArray();
+      const result = [];
+      for (const b of buckets) for (const k of b.keys) result.push({ key: k, orderSerialNumber: b.orderSerialNumber });
+      return result;
+    })(),
+    segCol.find(
+      { segmentStart: { $gte: cutoff }, isOpen: false, durationMinutes: { $gt: 1440 } },
+      { projection: { _id: 0, _compositeKey: 1, orderSerialNumber: 1 } }
+    ).toArray(),
+    // Multi-open: every open segment for an order that has 2+ open segments.
+    // Drop ALL of them (we don't know which is "real" — that's the orphan bug).
+    (async () => {
+      const orderIds = await segCol.aggregate([
+        { $match: { isOpen: true, segmentStart: { $gte: cutoff } } },
+        { $group: { _id: '$orderSerialNumber', c: { $sum: 1 } } },
+        { $match: { c: { $gte: 2 } } }
+      ], { allowDiskUse: true }).toArray();
+      const ids = orderIds.map(x => x._id);
+      if (!ids.length) return [];
+      return segCol.find(
+        { isOpen: true, orderSerialNumber: { $in: ids } },
+        { projection: { _id: 0, _compositeKey: 1, orderSerialNumber: 1 } }
+      ).toArray();
+    })(),
+    segCol.find(
+      { isOpen: true, segmentStart: { $lt: sevenDaysAgo } },
+      { projection: { _id: 0, _compositeKey: 1, orderSerialNumber: 1 } }
+    ).toArray()
+  ]);
+
+  // Build per-key reason map. A single segment can have multiple reasons.
+  const reasonsByKey = {};
+  const flaggedOrdersSet = new Set();
+  const add = (key, serial, tag) => {
+    if (!key) return;
+    (reasonsByKey[key] = reasonsByKey[key] || []).push(tag);
+    if (serial) flaggedOrdersSet.add(serial);
+  };
+  for (const r of sameMinuteSegs) add(r.key,           r.orderSerialNumber, 'same-minute');
+  for (const r of longDurSegs)    add(r._compositeKey, r.orderSerialNumber, 'long-duration');
+  for (const r of multiOpenSegs)  add(r._compositeKey, r.orderSerialNumber, 'multi-open');
+  for (const r of stuckOpenSegs)  add(r._compositeKey, r.orderSerialNumber, 'stuck-open');
+
+  return {
+    flaggedSegmentKeys: Object.keys(reasonsByKey),
+    reasonsByKey,
+    flaggedOrders: [...flaggedOrdersSet],   // kept for the multi-open Repair flow
+    counts: {
+      sameMinute:    sameMinuteSegs.length,
+      longDuration:  longDurSegs.length,
+      multiOpen:     multiOpenSegs.length,
+      stuckOpen:     stuckOpenSegs.length,
+      totalSegments: Object.keys(reasonsByKey).length,
+      totalOrders:   flaggedOrdersSet.size
+    },
+    computedAt: new Date().toISOString()
+  };
+}
+
+app.get('/data/data-quality-flags', async (req, res) => {
+  try {
+    const now = Date.now();
+    if (_flaggedCache && now - _flaggedCacheTs < FLAGGED_TTL_MS) {
+      return res.json({ ..._flaggedCache, cached: true });
+    }
+    const fresh = await computeFlaggedOrders();
+    _flaggedCache = fresh;
+    _flaggedCacheTs = now;
+    res.json({ ...fresh, cached: false });
+  } catch (err) {
+    console.error('[/data/data-quality-flags]', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// —— GET/PUT /config/dashboard-settings ——————————————————————
+// Single-row global config (collection: dashboard_settings, _id: 'global').
+// excludeFlaggedFromKpi (bool, default false) controls whether KPI rollups
+// hide orders that are in the flagged set above.
+app.get('/config/dashboard-settings', async (req, res) => {
+  try {
+    const db = await getConfigDb();
+    const doc = await db.collection('dashboard_settings').findOne({ _id: 'global' });
+    res.json({ excludeFlaggedFromKpi: !!doc?.excludeFlaggedFromKpi });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.put('/config/dashboard-settings', requireRole('admin', 'manager'), async (req, res) => {
+  try {
+    const { excludeFlaggedFromKpi } = req.body || {};
+    const db = await getConfigDb();
+    await db.collection('dashboard_settings').updateOne(
+      { _id: 'global' },
+      { $set: { excludeFlaggedFromKpi: !!excludeFlaggedFromKpi, updatedAt: new Date() } },
+      { upsert: true }
+    );
+    auditLog('dashboard_settings_update', 'dashboard_settings', { excludeFlaggedFromKpi: !!excludeFlaggedFromKpi }, req.user?.email || req.user?.name || 'unknown');
+    res.json({ excludeFlaggedFromKpi: !!excludeFlaggedFromKpi });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ═══════════════════════════════════════════════════════════
 // FAST READ ENDPOINTS — Read from backfill collections
 // These replace the slow live queries for the dashboard.
@@ -5408,6 +5544,7 @@ app.get('/data/kpi-segments', async (req, res) => {
       reportItemCount:1,  // Reports unit XpH
       credentialCount:1,  // Credentials unit XpH
       departmentName:1,   // For dept filtering
+      _compositeKey:1,    // Used by client-side data-quality flag filter
       ...(drilldown ? {
         // Drilldown-only fields — fetched separately when user opens detail tabs
         segmentEnd:1, durationSeconds:1,
