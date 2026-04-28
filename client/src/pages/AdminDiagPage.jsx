@@ -455,13 +455,21 @@ function DataHealthResult({ data, onRepair, repairing }) {
         <Card label="Orders in window" value={fmtI(s.totalOrders)} color="brand"
           tooltip="Distinct orders that have at least one segment in backfill_kpi_segments within the selected window." />
         <Card label="Affected orders" value={fmtI(s.anyAffectedOrderCount)} sub={`${affectedPct}% of orders`} color={s.anyAffectedOrderCount > 0 ? 'red' : 'green'}
-          tooltip="Orders touched by at least one of the three data-quality patterns. Use the tables below to dig in." />
+          tooltip="Orders touched by at least one data-quality pattern. Use the tables below to dig in." />
         <Card label="Same-minute clusters" value={fmtI(s.ordersWithSameMinuteClusters)} sub={`${fmtI(s.clusteredEntriesTotal)} clustered entries`} color={s.ordersWithSameMinuteClusters > 0 ? 'amber' : 'slate'}
           tooltip="Orders where 2+ Processing segments share the same wall-clock minute. V1↔V2 batch-sync signal. NOT autofixable — original times are lost." />
         <Card label="Long segments (>24h)" value={fmtI(s.ordersWithLongSegments)} color={s.ordersWithLongSegments > 0 ? 'amber' : 'slate'}
-          tooltip="Closed Processing segments longer than 24 hours — usually chain-break artifacts where intermediate transitions went missing. Already excluded from Avg/Median in PR #2 if benchmarks classify them as Excl-Long." />
+          tooltip="Closed Processing segments longer than 24 hours — usually chain-break artifacts where intermediate transitions went missing. Already excluded from Avg/Median in PR #2." />
         <Card label="Multi-open orders" value={fmtI(s.ordersWithMultipleOpen)} color={s.ordersWithMultipleOpen > 0 ? 'red' : 'green'}
           tooltip="Orders with >1 open Processing segment. Structurally impossible if data is clean. AUTOFIXABLE via Repair — re-syncs from live history and deletes orphans." />
+      </div>
+      <div className="grid grid-cols-2 sm:grid-cols-3 gap-3">
+        <Card label="Stuck open segments" value={fmtI(s.stuckOpenCount)} sub={s.stuckCriticalCount > 0 ? `${fmtI(s.stuckCriticalCount)} > 30 days` : undefined} color={s.stuckCriticalCount > 0 ? 'red' : s.stuckOpenCount > 0 ? 'amber' : 'slate'}
+          tooltip="Open Processing segments that haven't been closed in 7+ days. The order is sitting in this status with this worker, never touched. Flagged so ops can chase it down or close it manually." />
+        <Card label="Tiny segments (<30s)" value={fmtI(s.tinySegmentsTotal)} sub={s.workersWithTinySegments > 0 ? `across ${fmtI(s.workersWithTinySegments)} workers` : undefined} color={s.tinySegmentsTotal > 0 ? 'amber' : 'slate'}
+          tooltip="Closed Processing segments under 30 seconds, grouped by worker (≥5 per worker to qualify). Almost always ghost clicks — pollutes XpH numerator without representing real work." />
+        <Card label="High-open-rate workers" value={fmtI(s.workersWithHighOpenRate)} color={s.workersWithHighOpenRate > 0 ? 'amber' : 'slate'}
+          tooltip="Workers with ≥30% open segments and ≥10 total segments in the window. They start statuses but don't close them — could be a workflow issue or a data-quality artifact (orphan segments not yet repaired)." />
       </div>
 
       {data.multipleOpenOrders?.length > 0 && (
@@ -573,7 +581,114 @@ function DataHealthResult({ data, onRepair, repairing }) {
         </div>
       )}
 
-      {s.anyAffectedOrderCount === 0 && (
+      {data.stuckOpenSegments?.length > 0 && (
+        <div className="card-surface p-4">
+          <div className="text-xs font-semibold text-ink-600 mb-2">Stuck open segments ({data.stuckOpenSegments.length}) — needs ops triage</div>
+          <div className="text-[11px] text-ink-500 mb-3">
+            Open Processing segments that haven't progressed in 7+ days. Either the order genuinely fell off someone's queue, or it's an orphan from V2 mutating its history. Sorted oldest first; rows older than 30 days are highlighted red.
+          </div>
+          <div className="overflow-auto max-h-[400px]">
+            <table className="tbl w-full">
+              <thead className="sticky top-0 bg-surface-50">
+                <tr>
+                  <th className="text-[10px] px-3 py-2 text-left text-ink-500">Order</th>
+                  <th className="text-[10px] px-3 py-2 text-left text-ink-500">Status</th>
+                  <th className="text-[10px] px-3 py-2 text-left text-ink-500">Worker</th>
+                  <th className="text-[10px] px-3 py-2 text-left text-ink-500">Open since</th>
+                  <th className="text-[10px] px-3 py-2 text-right text-ink-500">Days open</th>
+                </tr>
+              </thead>
+              <tbody>
+                {data.stuckOpenSegments.map((row, i) => {
+                  const days = Math.floor((Date.now() - new Date(row.segmentStart).getTime()) / 86400000);
+                  const critical = days >= 30;
+                  return (
+                    <tr key={i} className={`border-t border-surface-100 ${critical ? 'bg-red-50' : ''}`}>
+                      <td className="px-3 py-2 text-xs font-mono">{row.orderSerialNumber}</td>
+                      <td className="px-3 py-2 text-[11px]">{row.statusName}</td>
+                      <td className="px-3 py-2 text-[11px] text-ink-500">{row.workerName || '—'}</td>
+                      <td className="px-3 py-2 text-[11px] font-mono">{fmtDateTime(row.segmentStart)}</td>
+                      <td className={`px-3 py-2 text-xs text-right font-mono ${critical ? 'text-red-700 font-semibold' : 'text-amber-700'}`}>{days}</td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
+
+      {data.tinySegmentsByWorker?.length > 0 && (
+        <div className="card-surface p-4">
+          <div className="text-xs font-semibold text-ink-600 mb-2">Workers with tiny (&lt;30s) segments ({data.tinySegmentsByWorker.length})</div>
+          <div className="text-[11px] text-ink-500 mb-3">
+            Each worker below has ≥5 closed Processing segments under 30 seconds. These are almost always ghost clicks — they bump the worker's segment count without representing real work. Surfacing here so you can decide whether to coach the worker or filter the segments out of XpH.
+          </div>
+          <div className="overflow-auto max-h-[400px]">
+            <table className="tbl w-full">
+              <thead className="sticky top-0 bg-surface-50">
+                <tr>
+                  <th className="text-[10px] px-3 py-2 text-left text-ink-500">Worker</th>
+                  <th className="text-[10px] px-3 py-2 text-right text-ink-500">Tiny segments</th>
+                  <th className="text-[10px] px-3 py-2 text-left text-ink-500">Sample order · status · seconds</th>
+                </tr>
+              </thead>
+              <tbody>
+                {data.tinySegmentsByWorker.map((w, i) => (
+                  <tr key={i} className="border-t border-surface-100">
+                    <td className="px-3 py-2 text-[11px]">
+                      {w.workerName || w.workerEmail || '—'}
+                      {w.workerEmail && w.workerName && <div className="text-[10px] text-ink-400 font-mono">{w.workerEmail}</div>}
+                    </td>
+                    <td className="px-3 py-2 text-xs text-right font-mono text-amber-700">{fmtI(w.tinyCount)}</td>
+                    <td className="px-3 py-2 text-[11px] text-ink-500">
+                      {(w.samples || []).map((sm, j) => (
+                        <div key={j}><span className="font-mono">{sm.orderSerialNumber}</span> · {sm.statusName} · <span className="font-mono">{Math.round(sm.durationSeconds)}s</span></div>
+                      ))}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
+
+      {data.highOpenWorkers?.length > 0 && (
+        <div className="card-surface p-4">
+          <div className="text-xs font-semibold text-ink-600 mb-2">Workers with high open-segment rate ({data.highOpenWorkers.length})</div>
+          <div className="text-[11px] text-ink-500 mb-3">
+            Workers whose segments are ≥30% open (and have ≥10 total segments in the window). Could be: a workflow issue (statuses left abandoned), a data-quality issue (orphan phantoms inflating the open count — see Multi-open above), or a real long-running role.
+          </div>
+          <div className="overflow-auto max-h-[400px]">
+            <table className="tbl w-full">
+              <thead className="sticky top-0 bg-surface-50">
+                <tr>
+                  <th className="text-[10px] px-3 py-2 text-left text-ink-500">Worker</th>
+                  <th className="text-[10px] px-3 py-2 text-right text-ink-500">Total segments</th>
+                  <th className="text-[10px] px-3 py-2 text-right text-ink-500">Open</th>
+                  <th className="text-[10px] px-3 py-2 text-right text-ink-500">Open rate</th>
+                </tr>
+              </thead>
+              <tbody>
+                {data.highOpenWorkers.map((w, i) => (
+                  <tr key={i} className="border-t border-surface-100">
+                    <td className="px-3 py-2 text-[11px]">
+                      {w.workerName || w.workerEmail || '—'}
+                      {w.workerEmail && w.workerName && <div className="text-[10px] text-ink-400 font-mono">{w.workerEmail}</div>}
+                    </td>
+                    <td className="px-3 py-2 text-xs text-right font-mono">{fmtI(w.total)}</td>
+                    <td className="px-3 py-2 text-xs text-right font-mono">{fmtI(w.open)}</td>
+                    <td className={`px-3 py-2 text-xs text-right font-mono ${w.openRate >= 50 ? 'text-red-700' : 'text-amber-700'} font-semibold`}>{w.openRate}%</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
+
+      {s.anyAffectedOrderCount === 0 && s.stuckOpenCount === 0 && s.tinySegmentsTotal === 0 && s.workersWithHighOpenRate === 0 && (
         <div className="card-surface bg-emerald-50 border-emerald-200 p-6 text-center">
           <div className="text-3xl mb-2">✓</div>
           <div className="text-sm font-semibold text-emerald-700">No data-quality issues detected in this window.</div>
