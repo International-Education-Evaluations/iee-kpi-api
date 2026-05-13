@@ -4057,7 +4057,7 @@ async function runBackfill(options = {}) {
 
   try {
     const configDb = await getConfigDb();
-    const isFullRefresh = !!options.full;
+    const isFullRefresh = !!(options.full || options.fullRefresh);
     const hasDateRange = !!(options.dateFrom || options.dateTo);
 
     push(`Starting ${isFullRefresh ? 'FULL' : hasDateRange ? 'DATE RANGE' : 'INCREMENTAL'} backfill`);
