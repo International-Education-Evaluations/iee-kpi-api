@@ -4081,13 +4081,13 @@ async function runBackfill(options = {}) {
 
     if (hasDateRange) {
       // Explicit date range — backfill only this window
-      segmentCutoff = options.dateFrom ? new Date(options.dateFrom) : getCutoff(options.days || 90);
-      qcCutoff = options.dateFrom ? new Date(options.dateFrom) : getCutoff(options.days || 90);
+      segmentCutoff = options.dateFrom ? new Date(options.dateFrom) : getCutoff(options.days || 500);
+      qcCutoff = options.dateFrom ? new Date(options.dateFrom) : getCutoff(options.days || 500);
       upperBound = options.dateTo ? new Date(options.dateTo + 'T23:59:59.999Z') : null;
       push(`Date range: ${segmentCutoff.toISOString()} → ${upperBound ? upperBound.toISOString() : 'now'}`);
     } else if (isFullRefresh) {
       // Full refresh runs in monthly batches to avoid timeout
-      const days = options.days || 90;
+      const days = options.days || 500;
       await segCol.deleteMany({});
       await qcCol.deleteMany({});
       push(`Full refresh: cleared all, will batch ${days} days in monthly chunks`);
@@ -4298,7 +4298,7 @@ async function runBackfill(options = {}) {
 
       if (!latestSeg && !latestQc) {
         // Empty — seed with full window
-        const days = options.days || 90;
+        const days = options.days || 500;
         segmentCutoff = getCutoff(days);
         qcCutoff = getCutoff(days);
         push(`No existing data — seeding full ${days}-day window`);
@@ -4308,10 +4308,10 @@ async function runBackfill(options = {}) {
         const bufferMs = 15 * 60 * 1000;
         segmentCutoff = latestSeg?.segmentStart
           ? new Date(new Date(latestSeg.segmentStart).getTime() - bufferMs)
-          : getCutoff(options.days || 90);
+          : getCutoff(options.days || 500);
         qcCutoff = latestQc?.qcCreatedAt
           ? new Date(new Date(latestQc.qcCreatedAt).getTime() - bufferMs)
-          : getCutoff(options.days || 90);
+          : getCutoff(options.days || 500);
         push(`Incremental from seg=${segmentCutoff.toISOString()}, qc=${qcCutoff.toISOString()}`);
       }
     }
@@ -4698,7 +4698,7 @@ async function runBackfill(options = {}) {
         { $set: { ...waitResult, _backfilledAt: new Date() } },
         { upsert: true }
       );
-      push(`Queue wait summary: ${waitResult.statusCount || 0} statuses over ${waitResult.days || 90} days`);
+      push(`Queue wait summary: ${waitResult.statusCount || 0} statuses over ${waitResult.days || 500} days`);
     } catch (wErr) {
       push(`Queue wait summary: SKIPPED (${wErr.message})`);
     }
@@ -4792,7 +4792,7 @@ async function runBackfill(options = {}) {
 
 // —— POST /backfill/run — Admin trigger ——————————————————
 // Body options:
-//   { full: true, days: 90 }          — wipe + re-seed last N days
+//   { full: true, days: 500 }          — wipe + re-seed last N days
 //   { dateFrom: "2025-01-01", dateTo: "2025-01-31" }  — backfill specific range
 //   {}                                 — incremental (only new since last run)
 app.post('/backfill/run', requireRole('admin'), async (req, res) => {
@@ -4862,7 +4862,7 @@ app.put('/backfill/settings', requireRole('admin'), async (req, res) => {
     const db = await getConfigDb();
     const settings = {
       autoRefreshMinutes: Math.max(autoRefreshMinutes || 5, 1), // min 1 minute
-      days: Math.min(days || 90, 365),
+      days: days || 500,
       enabled: enabled !== false,
       updatedBy: req.user?.name,
       updatedAt: new Date()
@@ -4882,7 +4882,7 @@ app.get('/backfill/settings', async (req, res) => {
   try {
     const db = await getConfigDb();
     const settings = await db.collection('backfill_metadata').findOne({ _id: 'settings' });
-    res.json(settings || { autoRefreshMinutes: 5, days: 90, enabled: true });
+    res.json(settings || { autoRefreshMinutes: 5, days: 500, enabled: true });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -5853,10 +5853,10 @@ function startBackfillScheduler() {
 
         if (daysSinceFullRefresh > 30) {
           console.log(`[BACKFILL-CRON] Auto full-refresh triggered — last full refresh was ${Math.round(daysSinceFullRefresh)}d ago`);
-          runBackfill({ fullRefresh: true, days: settings.days || 90, triggeredBy: 'auto-monthly-full' });
+          runBackfill({ fullRefresh: true, days: settings.days || 500, triggeredBy: 'auto-monthly-full' });
         } else {
           console.log(`[BACKFILL-CRON] Auto-backfill triggered (interval: ${settings.autoRefreshMinutes}min, mem: ${memMB}MB, cooldown: ${Math.round(timeSinceEnd/1000)}s since last end)`);
-          runBackfill({ days: settings.days || 90, triggeredBy: 'auto-scheduler' });
+          runBackfill({ days: settings.days || 500, triggeredBy: 'auto-scheduler' });
         }
       }
     } catch (err) {
