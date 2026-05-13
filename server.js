@@ -5616,10 +5616,8 @@ app.get('/data/kpi-segments', async (req, res) => {
       .toArray();
     const hasMorePage = rawSegments.length > pageSize;
     const segments = hasMorePage ? rawSegments.slice(0, pageSize) : rawSegments;
-    // Approximate totalCount: exact only on last page, estimated otherwise
-    const totalCount = hasMorePage
-      ? (page - 1) * pageSize + pageSize + 1  // at least this many
-      : (page - 1) * pageSize + segments.length;
+    // Exact totalCount via countDocuments for accurate totalPages
+    const totalCount = await col.countDocuments(filter);
 
     const meta = await getBackfillMeta(db);
 
