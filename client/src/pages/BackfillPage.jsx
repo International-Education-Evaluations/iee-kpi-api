@@ -12,7 +12,7 @@ export default function BackfillPage() {
   const [mode, setMode] = useState('incremental');
   const [dateFrom, setDateFrom] = useState('');
   const [dateTo, setDateTo] = useState('');
-  const [fullDays, setFullDays] = useState(365);
+  const [fullDays, setFullDays] = useState(500);
 
   useEffect(() => { load(); const t = setInterval(load, 10000); return () => clearInterval(t); }, []);
 
@@ -132,7 +132,7 @@ export default function BackfillPage() {
           <div className="flex items-center gap-3">
             <label className="text-xs text-red-700 font-semibold whitespace-nowrap">Days to backfill:</label>
             <input type="number" min={30} max={730} step={30} value={fullDays}
-              onChange={e => setFullDays(Math.max(30, Math.min(730, parseInt(e.target.value)||365)))}
+              onChange={e => setFullDays(Math.max(30, Math.min(730, parseInt(e.target.value)||500)))}
               className="w-24 px-2 py-1 text-sm border border-red-200 rounded bg-white text-ink-900 font-mono" />
             <span className="text-xs text-red-500">
               = {Math.ceil(fullDays / 30)} monthly batches · ~{Math.round(fullDays / 30 * 0.5 * 10) / 10} min est.
@@ -177,7 +177,7 @@ export default function BackfillPage() {
           </div>
           <div>
             <label className="text-[10px] text-ink-400 uppercase block mb-1">Default Data Window (days)</label>
-            <input type="number" value={settings?.days || 90} min={7} max={365}
+            <input type="number" value={settings?.days || 90} min={7} max={730}
               onChange={e => setSettings(s => ({ ...s, days: parseInt(e.target.value) || 90 }))}
               className="w-full px-3 py-1.5 bg-white border border-surface-200 rounded text-sm text-ink-900" />
           </div>
