@@ -88,7 +88,14 @@ export async function api(path, opts = {}) {
     const err = new Error(b.error || `Error ${r.status}`);
     err.status = r.status;
     err.path = path;
-    if (!silent) emitToast({ kind: 'error', title: `${r.status} on ${shortPath(path)}`, message: err.message });
+    if (!silent) {
+      if (r.status === 429) {
+        // Rate limited — reassure rather than alarm; the app recovers on its own.
+        emitToast({ kind: 'warn', title: 'Slow down a moment', message: b.error || 'Too many requests — retrying shortly is fine.' });
+      } else {
+        emitToast({ kind: 'error', title: `${r.status} on ${shortPath(path)}`, message: err.message });
+      }
+    }
     throw err;
   }
   return r.json();
