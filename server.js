@@ -36,6 +36,8 @@ const rateLimit = require('express-rate-limit');
 const cors = require('cors');
 const zlib = require('zlib');
 const { MongoClient, ObjectId } = require('mongodb');
+const { createMongoConnector } = require('./lib/mongo-connector');
+const { errorBody } = require('./lib/error-response');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const crypto = require('crypto');
@@ -66,6 +68,16 @@ if (!CONFIG.JWT_SECRET) {
   process.exit(1);
 }
 
+const IS_PROD = CONFIG.NODE_ENV === 'production';
+
+// Sanitized 500 response: always log the full error server-side, but only leak
+// the real message to clients outside production (avoids exposing Mongo/stack
+// internals). Access log correlates by requestId on the same line.
+function sendServerError(res, err) {
+  console.error('500:', (err && (err.stack || err.message)) || err);
+  return res.status(500).json(errorBody(err, { production: IS_PROD }));
+}
+
 // —— Security ————————————————————————————————————————————
 app.use(helmet());
 app.set('etag', false); // Disable ETags — parallel paginated requests get 304 instead of data
@@ -78,19 +90,19 @@ app.use('/data', (req, res, next) => {
 });
 app.use(cors({
   origin: function(origin, callback) {
-    // Allow GAS, Railway dashboard, and localhost dev
+    // Always allow: same-origin/server-to-server (no Origin header), Google
+    // Apps Script, and the app's own Railway origins.
     const allowed = [
       'https://script.google.com',
       'https://script.googleusercontent.com'
     ];
-    // Allow any Railway app origin and localhost for dev
-    if (!origin || allowed.includes(origin)
-        || origin.endsWith('.up.railway.app')
-        || origin.startsWith('http://localhost')) {
-      callback(null, true);
-    } else {
-      callback(new Error('Not allowed by CORS'));
-    }
+    const ok = !origin
+      || allowed.includes(origin)
+      || origin.endsWith('.up.railway.app')
+      // localhost is dev-only — never accept it in production.
+      || (!IS_PROD && origin.startsWith('http://localhost'));
+    if (ok) callback(null, true);
+    else callback(new Error('Not allowed by CORS'));
   },
   methods: ['GET', 'POST', 'PUT', 'DELETE'],
   allowedHeaders: ['x-api-key', 'Content-Type', 'Authorization']
@@ -116,8 +128,40 @@ app.use((req, res, next) => {
   next();
 });
 
-app.use(rateLimit({ windowMs: 60000, max: 60, standardHeaders: true, legacyHeaders: false }));
+// Serve the built SPA (bundle, CSS, favicon) BEFORE any rate limiter so static
+// assets never consume the API budget. A 429 on the JS bundle = blank app; that
+// was the production outage. The SPA fallback (app.get('*')) stays registered
+// last, after all API routes.
+const distPath = path.join(__dirname, 'dist');
+app.use(express.static(distPath));
+
 app.use(express.json({ limit: '1mb' }));
+
+// —— Rate limiting ————————————————————————————————————————
+// Two tiers instead of one flat global limit:
+//  • apiLimiter — generous, keyed per authenticated USER (falls back to IP for
+//    unauthenticated calls) so many staff behind one office NAT don't share a
+//    single bucket. Registered after authMiddleware so req.user is populated.
+//  • authLimiter — strict per-IP cap on /auth/login to blunt credential stuffing.
+const apiLimiter = rateLimit({
+  windowMs: 60000,
+  max: 300,
+  standardHeaders: true,
+  legacyHeaders: false,
+  keyGenerator: (req) => req.user?.userId || req.ip,
+  validate: { ip: false }, // we intentionally key by user id, falling back to req.ip
+  message: { error: 'Too many requests — please slow down and retry in a minute.' }
+});
+// 30/min per IP: blunts credential stuffing (bcrypt-12 already caps an attacker
+// at a few tries/sec) while leaving headroom for a whole shift logging in from
+// one shared office IP — the NAT scenario behind the original incident.
+const authLimiter = rateLimit({
+  windowMs: 60000,
+  max: 30,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many login attempts — please wait a minute and try again.' }
+});
 
 // —— Utility helpers ————————————————————————————————————
 
@@ -318,37 +362,43 @@ function buildQcEvent(doc, order) {
 // —— MongoDB ————————————————————————————————————————————
 // Two clients: read-only for production data, read-write for dashboard config.
 // If MONGO_CONFIG_URI is not set, falls back to MONGO_URI (single cluster mode).
-let client;
+// Both use createMongoConnector, which only caches a connection AFTER connect()
+// succeeds and drops the cache if it fails — so a failed connect self-heals on
+// the next request instead of poisoning the singleton with a closed topology.
+const prodConnector = createMongoConnector({
+  uri: CONFIG.MONGO_URI,
+  options: {
+    maxPoolSize: 10,
+    serverSelectionTimeoutMS: 10000,
+    connectTimeoutMS: 10000,
+    retryWrites: true,
+    retryReads: true
+  },
+  MongoClient,
+  onConnect: () => console.log('Connected to MongoDB Atlas (production data - read)'),
+  onError: (err) => console.error('[MONGO] Connect FAILED (production data - read):', err.message)
+});
 async function getDb(dbName) {
-  if (!client) {
-    client = new MongoClient(CONFIG.MONGO_URI, {
-      maxPoolSize: 10,
-      serverSelectionTimeoutMS: 10000,
-      connectTimeoutMS: 10000,
-      retryWrites: true,
-      retryReads: true
-    });
-    await client.connect();
-    console.log('Connected to MongoDB Atlas (production data - read)');
-  }
+  const client = await prodConnector.getClient();
   return client.db(dbName);
 }
 
-let configClient;
+const configConnector = createMongoConnector({
+  uri: CONFIG.MONGO_CONFIG_URI || CONFIG.MONGO_URI,
+  options: {
+    maxPoolSize: 5,
+    serverSelectionTimeoutMS: 10000,
+    connectTimeoutMS: 10000,
+    retryWrites: true,
+    retryReads: true
+  },
+  MongoClient,
+  onConnect: () => console.log(`Connected to MongoDB Atlas (config - readWrite)${CONFIG.MONGO_CONFIG_URI ? ' [separate cluster]' : ' [same cluster]'}`),
+  onError: (err) => console.error('[MONGO] Connect FAILED (config - readWrite):', err.message)
+});
 async function getConfigDb() {
-  const uri = CONFIG.MONGO_CONFIG_URI || CONFIG.MONGO_URI;
-  if (!configClient) {
-    configClient = new MongoClient(uri, {
-      maxPoolSize: 5,
-      serverSelectionTimeoutMS: 10000,
-      connectTimeoutMS: 10000,
-      retryWrites: true,
-      retryReads: true
-    });
-    await configClient.connect();
-    console.log(`Connected to MongoDB Atlas (config - readWrite)${CONFIG.MONGO_CONFIG_URI ? ' [separate cluster]' : ' [same cluster]'}`);
-  }
-  return configClient.db('iee_dashboard');
+  const client = await configConnector.getClient();
+  return client.db('iee_dashboard');
 }
 
 // ── Server-side in-memory config cache ─────────────────────────────────────
@@ -681,6 +731,9 @@ function requireRole(...roles) {
 
 app.use(ipCheck);
 app.use(authMiddleware);
+// Applied after auth so the limiter can key on the authenticated user id.
+// Static assets are already served above, so they never reach this limiter.
+app.use(apiLimiter);
 
 app.use((req, res, next) => {
   const start = Date.now();
@@ -714,7 +767,9 @@ app.get('/health', async (req, res) => {
       lastWatchdogResetAt: backfillLastWatchdogResetAt
     });
   } catch (err) {
-    res.status(500).json({ status: 'error', message: err.message });
+    // Public endpoint — don't leak internal DB errors (e.g. driver internals).
+    console.error('500: /health', (err && (err.stack || err.message)) || err);
+    res.status(500).json({ status: 'error', message: IS_PROD ? 'database unavailable' : (err && err.message) });
   }
 });
 
@@ -734,7 +789,7 @@ app.get('/collections', async (req, res) => {
     }
     res.json(result);
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendServerError(res, err);
   }
 });
 
@@ -881,7 +936,7 @@ app.get('/kpi-segments', async (req, res) => {
     });
   } catch (err) {
     console.error('KPI segments error:', err);
-    res.status(500).json({ error: err.message });
+    sendServerError(res, err);
   }
 });
 
@@ -1057,7 +1112,7 @@ app.get('/kpi-classify', async (req, res) => {
     });
   } catch (err) {
     console.error('KPI classify error:', err);
-    res.status(500).json({ error: err.message });
+    sendServerError(res, err);
   }
 });
 
@@ -1086,7 +1141,7 @@ app.put('/config/benchmarks/thresholds', requireRole('admin', 'manager'), async 
     await auditLog('update_thresholds', 'dashboard_benchmarks', { status, ...update }, req.user?.name);
     res.json({ success: true });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendServerError(res, err);
   }
 });
 
@@ -1134,7 +1189,7 @@ app.get('/credential-counts', async (req, res) => {
     });
   } catch (err) {
     console.error('Credential counts error:', err);
-    res.status(500).json({ error: err.message });
+    sendServerError(res, err);
   }
 });
 
@@ -1180,7 +1235,7 @@ app.get('/report-counts', async (req, res) => {
     res.json({ count: result.length, reports: result });
   } catch (err) {
     console.error('Report counts error:', err);
-    res.status(500).json({ error: err.message });
+    sendServerError(res, err);
   }
 });
 
@@ -1230,7 +1285,7 @@ app.get('/qc-events', async (req, res) => {
     });
   } catch (err) {
     console.error('QC events error:', err);
-    res.status(500).json({ error: err.message });
+    sendServerError(res, err);
   }
 });
 
@@ -1271,7 +1326,7 @@ app.get('/qc-orders', async (req, res) => {
     });
   } catch (err) {
     console.error('QC orders error:', err);
-    res.status(500).json({ error: err.message });
+    sendServerError(res, err);
   }
 });
 
@@ -1319,7 +1374,7 @@ app.get('/qc-summary', async (req, res) => {
     });
   } catch (err) {
     console.error('QC summary error:', err);
-    res.status(500).json({ error: err.message });
+    sendServerError(res, err);
   }
 });
 
@@ -1385,7 +1440,7 @@ app.get('/qc-discovery', async (req, res) => {
     });
   } catch (err) {
     console.error('QC discovery error:', err);
-    res.status(500).json({ error: err.message });
+    sendServerError(res, err);
   }
 });
 
@@ -1535,7 +1590,7 @@ app.get('/users', async (req, res) => {
     });
   } catch (err) {
     console.error('/users error:', err);
-    res.status(500).json({ error: err.message });
+    sendServerError(res, err);
   }
 });
 
@@ -1705,7 +1760,7 @@ app.get('/queue-wait-summary', async (req, res) => {
     res.json(result);
   } catch (err) {
     console.error('Queue wait summary error:', err);
-    res.status(500).json({ error: err.message });
+    sendServerError(res, err);
   }
 });
 
@@ -1855,7 +1910,7 @@ app.get('/queue-snapshot', async (req, res) => {
     });
   } catch (err) {
     console.error('Queue snapshot error:', err);
-    res.status(500).json({ error: err.message });
+    sendServerError(res, err);
   }
 });
 
@@ -1915,12 +1970,12 @@ app.post('/auth/setup', async (req, res) => {
       user: { id: user._id, email: user.email, name: user.name, role: user.role, apiKey }
     });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendServerError(res, err);
   }
 });
 
 // —— POST /auth/login ——————————————————————————————————————
-app.post('/auth/login', async (req, res) => {
+app.post('/auth/login', authLimiter, async (req, res) => {
   try {
     const { email, password } = req.body;
     if (!email || !password) {
@@ -1963,7 +2018,7 @@ app.post('/auth/login', async (req, res) => {
       }
     });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendServerError(res, err);
   }
 });
 
@@ -1981,7 +2036,7 @@ app.get('/auth/me', async (req, res) => {
     if (!user) return res.status(404).json({ error: 'User not found' });
     res.json({ user });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendServerError(res, err);
   }
 });
 
@@ -1995,7 +2050,7 @@ app.get('/auth/users', requireRole('admin'), async (req, res) => {
       .toArray();
     res.json({ count: users.length, users });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendServerError(res, err);
   }
 });
 
@@ -2103,7 +2158,7 @@ app.post('/auth/users', requireRole('admin'), async (req, res) => {
       user: { id: result.insertedId, email: user.email, name: user.name, role: user.role, apiKey, isPending: user.isPending }
     });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendServerError(res, err);
   }
 });
 
@@ -2147,7 +2202,7 @@ app.post('/auth/accept-invite', async (req, res) => {
       user: { id: user._id, email: user.email, name: user.name, role: user.role }
     });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendServerError(res, err);
   }
 });
 
@@ -2219,7 +2274,7 @@ app.post('/auth/resend-invite', requireRole('admin'), async (req, res) => {
     await auditLog('resend_invite', 'dashboard_users', { email: user.email }, req.user?.name);
     res.json({ success: true, inviteEmail: { sent: true } });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendServerError(res, err);
   }
 });
 
@@ -2245,7 +2300,7 @@ app.put('/auth/users/:id', requireRole('admin'), async (req, res) => {
 
     res.json({ success: true });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendServerError(res, err);
   }
 });
 
@@ -2265,7 +2320,7 @@ app.post('/auth/users/:id/regenerate-key', requireRole('admin'), async (req, res
 
     res.json({ success: true, apiKey });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendServerError(res, err);
   }
 });
 
@@ -2288,7 +2343,7 @@ app.delete('/auth/users/:id', requireRole('admin'), async (req, res) => {
 
     res.json({ success: true, deleted: user.email });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendServerError(res, err);
   }
 });
 
@@ -2309,7 +2364,7 @@ app.get('/config/benchmarks/statuses', async (req, res) => {
       statuses: segments.map(s => ({ slug: s._id, name: s.name, count: s.count }))
     });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendServerError(res, err);
   }
 });
 
@@ -2355,7 +2410,7 @@ app.get('/ai/system-prompt', async (req, res) => {
       updatedBy: prompt?.updatedBy || null
     });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendServerError(res, err);
   }
 });
 
@@ -2386,7 +2441,7 @@ app.put('/ai/system-prompt', requireRole('admin', 'manager'), async (req, res) =
 
     res.json({ success: true });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendServerError(res, err);
   }
 });
 
@@ -3110,7 +3165,7 @@ app.post(`/ai/chat`, aiRateLimit, async (req, res) => {
 
   } catch (err) {
     console.error(`[AI/chat] ✗ unhandled error:`, err.message, err.stack?.split('\n')[1]||'');
-    res.status(500).json({ error: err.message });
+    sendServerError(res, err);
   }
 });
 
@@ -3163,7 +3218,7 @@ app.get('/config/benchmarks', async (req, res) => {
     setCachedConfig('benchmarks', payload);
     res.json(payload);
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendServerError(res, err);
   }
 });
 
@@ -3197,7 +3252,7 @@ app.put('/config/benchmarks', requireRole('admin', 'manager'), async (req, res) 
     await auditLog('upsert', 'dashboard_benchmarks', doc, changedBy);
     res.json({ success: true, benchmark: doc });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendServerError(res, err);
   }
 });
 
@@ -3223,7 +3278,7 @@ app.post('/config/benchmarks/seed', requireRole('admin'), async (req, res) => {
     await auditLog('seed', 'dashboard_benchmarks', { count: upserted }, changedBy);
     res.json({ success: true, upserted });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendServerError(res, err);
   }
 });
 
@@ -3238,7 +3293,7 @@ app.get('/config/production-hours', async (req, res) => {
     setCachedConfig('production_hours', { count: hours.length, hours });
     res.json({ count: hours.length, hours });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendServerError(res, err);
   }
 });
 
@@ -3271,7 +3326,7 @@ app.put('/config/production-hours', requireRole('admin', 'manager'), async (req,
     await auditLog('upsert', 'dashboard_production_hours', doc, changedBy);
     res.json({ success: true, hours: doc });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendServerError(res, err);
   }
 });
 
@@ -3296,7 +3351,7 @@ app.post('/config/production-hours/seed', requireRole('admin'), async (req, res)
     await auditLog('seed', 'dashboard_production_hours', { count: upserted }, changedBy);
     res.json({ success: true, upserted });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendServerError(res, err);
   }
 });
 
@@ -3312,7 +3367,7 @@ app.get('/config/user-levels', async (req, res) => {
     setCachedConfig('user_levels', payload);
     res.json(payload);
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendServerError(res, err);
   }
 });
 
@@ -3343,7 +3398,7 @@ app.put('/config/user-levels', requireRole('admin', 'manager'), async (req, res)
     await auditLog('upsert', 'dashboard_user_levels', doc, changedBy);
     res.json({ success: true, level: doc });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendServerError(res, err);
   }
 });
 
@@ -3369,7 +3424,7 @@ app.post('/config/user-levels/seed', requireRole('admin'), async (req, res) => {
     await auditLog('seed', 'dashboard_user_levels', { count: upserted }, changedBy);
     res.json({ success: true, upserted });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendServerError(res, err);
   }
 });
 
@@ -3399,7 +3454,7 @@ app.post('/config/benchmarks/thresholds/seed', requireRole('admin'), async (req,
     await auditLog('seed_thresholds', 'dashboard_benchmarks', { count: updated }, changedBy);
     res.json({ success: true, updated });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendServerError(res, err);
   }
 });
 
@@ -3412,7 +3467,7 @@ app.get('/config/audit-log', async (req, res) => {
       .find({}).sort({ timestamp: -1 }).limit(limit).toArray();
     res.json({ count: logs.length, logs });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendServerError(res, err);
   }
 });
 
@@ -3430,7 +3485,7 @@ app.get('/glossary', async (req, res) => {
     const items = await db.collection('dashboard_glossary')
       .find({}).sort({ term: 1 }).toArray();
     res.json({ count: items.length, glossary: items });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { sendServerError(res, err); }
 });
 
 // —— PUT /glossary ————————————————————————————————————————
@@ -3454,7 +3509,7 @@ app.put('/glossary', requireRole('admin', 'manager'), async (req, res) => {
     );
     await auditLog('upsert', 'dashboard_glossary', { term: doc.term }, req.user?.name);
     res.json({ success: true, item: doc });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { sendServerError(res, err); }
 });
 
 // —— DELETE /glossary/:term ———————————————————————————————
@@ -3464,7 +3519,7 @@ app.delete('/glossary/:term', requireRole('admin', 'manager'), async (req, res) 
     await db.collection('dashboard_glossary').deleteOne({ term: req.params.term });
     await auditLog('delete', 'dashboard_glossary', { term: req.params.term }, req.user?.name);
     res.json({ success: true });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { sendServerError(res, err); }
 });
 
 // ═══════════════════════════════════════════════════════════
@@ -3490,7 +3545,7 @@ app.get('/ai/guardrails', async (req, res) => {
     const db = await getConfigDb();
     const g = await db.collection('dashboard_ai_guardrails').findOne({ active: true });
     res.json({ guardrails: g || DEFAULT_GUARDRAILS, isDefault: !g });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { sendServerError(res, err); }
 });
 
 // —— PUT /ai/guardrails ——————————————————————————————————
@@ -3515,7 +3570,7 @@ app.put('/ai/guardrails', requireRole('admin'), async (req, res) => {
     await db.collection('dashboard_ai_guardrails').insertOne(doc);
     await auditLog('update_guardrails', 'dashboard_ai_guardrails', doc, req.user?.name);
     res.json({ success: true, guardrails: doc });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { sendServerError(res, err); }
 });
 
 // Helper: get active guardrails
@@ -3549,7 +3604,7 @@ app.get('/email/schedules', requireRole('admin', 'manager'), async (req, res) =>
     const schedules = await db.collection('dashboard_email_schedules')
       .find({}).sort({ createdAt: -1 }).toArray();
     res.json({ count: schedules.length, schedules });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { sendServerError(res, err); }
 });
 
 // —— POST /email/schedules ———————————————————————————————
@@ -3570,7 +3625,7 @@ app.post('/email/schedules', requireRole('admin', 'manager'), async (req, res) =
     const result = await db.collection('dashboard_email_schedules').insertOne(doc);
     await auditLog('create_schedule', 'dashboard_email_schedules', { name }, req.user?.name);
     res.json({ success: true, id: result.insertedId, schedule: doc });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { sendServerError(res, err); }
 });
 
 // —— PUT /email/schedules/:id ————————————————————————————
@@ -3590,7 +3645,7 @@ app.put('/email/schedules/:id', requireRole('admin', 'manager'), async (req, res
     );
     await auditLog('update_schedule', 'dashboard_email_schedules', { id: req.params.id }, req.user?.name);
     res.json({ success: true });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { sendServerError(res, err); }
 });
 
 // —— DELETE /email/schedules/:id —————————————————————————
@@ -3600,7 +3655,7 @@ app.delete('/email/schedules/:id', requireRole('admin'), async (req, res) => {
     await db.collection('dashboard_email_schedules').deleteOne({ _id: new ObjectId(req.params.id) });
     await auditLog('delete_schedule', 'dashboard_email_schedules', { id: req.params.id }, req.user?.name);
     res.json({ success: true });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { sendServerError(res, err); }
 });
 
 // —— POST /email/send-now ————————————————————————————————
@@ -3663,7 +3718,7 @@ app.post('/email/send-now', requireRole('admin', 'manager'), async (req, res) =>
 
     await auditLog('send_email', 'dashboard_email_schedules', { recipients, templateData: { report_date: templateData.report_date } }, req.user?.name);
     res.json({ success: true, templateData });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { sendServerError(res, err); }
 });
 
 
@@ -4813,7 +4868,7 @@ app.post('/backfill/run', requireRole('admin'), async (req, res) => {
     res.json({ success: true, message: `${mode} backfill started. Check /backfill/status.` });
     runBackfill(opts);
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendServerError(res, err);
   }
 });
 
@@ -4836,7 +4891,7 @@ app.get('/backfill/status', async (req, res) => {
       isRunning: backfillRunning
     });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendServerError(res, err);
   }
 });
 
@@ -4851,7 +4906,7 @@ app.get('/backfill/history', requireRole('admin', 'manager'), async (req, res) =
       .toArray();
     res.json({ count: history.length, history });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendServerError(res, err);
   }
 });
 
@@ -4873,7 +4928,7 @@ app.put('/backfill/settings', requireRole('admin'), async (req, res) => {
     await auditLog('update_backfill_settings', 'backfill_metadata', settings, req.user?.name);
     res.json({ success: true, settings });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendServerError(res, err);
   }
 });
 
@@ -4884,7 +4939,7 @@ app.get('/backfill/settings', async (req, res) => {
     const settings = await db.collection('backfill_metadata').findOne({ _id: 'settings' });
     res.json(settings || { autoRefreshMinutes: 5, days: 500, enabled: true });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendServerError(res, err);
   }
 });
 
@@ -4933,7 +4988,7 @@ app.get('/backfill/next', async (req, res) => {
       }
     });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendServerError(res, err);
   }
 });
 
@@ -5056,7 +5111,7 @@ app.get('/diag/coverage', requireRole('admin'), async (req, res) => {
     });
   } catch (err) {
     console.error('[/diag/coverage]', err);
-    res.status(500).json({ error: err.message });
+    sendServerError(res, err);
   }
 });
 
@@ -5179,7 +5234,7 @@ app.get('/diag/order-quality', requireRole('admin'), async (req, res) => {
     });
   } catch (err) {
     console.error('[/diag/order-quality]', err);
-    res.status(500).json({ error: err.message });
+    sendServerError(res, err);
   }
 });
 
@@ -5352,7 +5407,7 @@ app.get('/diag/data-health', requireRole('admin'), async (req, res) => {
     });
   } catch (err) {
     console.error('[/diag/data-health]', err);
-    res.status(500).json({ error: err.message });
+    sendServerError(res, err);
   }
 });
 
@@ -5424,7 +5479,7 @@ app.post('/diag/order-quality/repair', requireRole('admin'), async (req, res) =>
     });
   } catch (err) {
     console.error('[/diag/order-quality/repair]', err);
-    res.status(500).json({ error: err.message });
+    sendServerError(res, err);
   }
 });
 
@@ -5530,7 +5585,7 @@ app.get('/data/data-quality-flags', async (req, res) => {
     res.json({ ...fresh, cached: false });
   } catch (err) {
     console.error('[/data/data-quality-flags]', err);
-    res.status(500).json({ error: err.message });
+    sendServerError(res, err);
   }
 });
 
@@ -5544,7 +5599,7 @@ app.get('/config/dashboard-settings', async (req, res) => {
     const doc = await db.collection('dashboard_settings').findOne({ _id: 'global' });
     res.json({ excludeFlaggedFromKpi: !!doc?.excludeFlaggedFromKpi });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendServerError(res, err);
   }
 });
 
@@ -5560,7 +5615,7 @@ app.put('/config/dashboard-settings', requireRole('admin', 'manager'), async (re
     auditLog('dashboard_settings_update', 'dashboard_settings', { excludeFlaggedFromKpi: !!excludeFlaggedFromKpi }, req.user?.email || req.user?.name || 'unknown');
     res.json({ excludeFlaggedFromKpi: !!excludeFlaggedFromKpi });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendServerError(res, err);
   }
 });
 
@@ -5634,7 +5689,7 @@ app.get('/data/kpi-segments', async (req, res) => {
       segments
     });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendServerError(res, err);
   }
 });
 
@@ -5681,7 +5736,7 @@ app.get('/data/qc-events', async (req, res) => {
       events
     });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendServerError(res, err);
   }
 });
 
@@ -5698,7 +5753,7 @@ app.get('/data/users', async (req, res) => {
       .toArray();
     res.json({ count: users.length, source: 'backfill', users });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendServerError(res, err);
   }
 });
 
@@ -5718,7 +5773,7 @@ app.get('/data/queue-snapshot', async (req, res) => {
       res.json({ ...live, source: 'live-fallback' });
     }
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendServerError(res, err);
   }
 });
 
@@ -5775,7 +5830,7 @@ app.get('/data/queue-status-orders', async (req, res) => {
 
     res.json({ count: rows.length, statusSlug, statusName: rows[0]?.statusName || statusSlug, rows });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendServerError(res, err);
   }
 });
 
@@ -5798,7 +5853,7 @@ app.get('/data/queue-wait-summary', async (req, res) => {
       res.json({ ...live, source: 'live-fallback' });
     }
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendServerError(res, err);
   }
 });
 
@@ -5955,7 +6010,7 @@ app.get('/data/order/:serialNumber', async (req, res) => {
     });
   } catch (err) {
     console.error('Order tracker error:', err);
-    res.status(500).json({ error: err.message });
+    sendServerError(res, err);
   }
 });
 
@@ -6190,7 +6245,7 @@ app.post('/reports/query', async (req, res) => {
     });
   } catch (err) {
     console.error('Report query error:', err);
-    res.status(500).json({ error: err.message });
+    sendServerError(res, err);
   }
 });
 
@@ -6288,7 +6343,7 @@ app.get('/reports/filters', async (req, res) => {
       orderTypes: ['evaluation', 'translation']
     });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendServerError(res, err);
   }
 });
 
@@ -6360,7 +6415,7 @@ app.post('/reports/export', async (req, res) => {
     res.setHeader('Content-Disposition', `attachment; filename="iee-report-${source}-${new Date().toISOString().slice(0,10)}.csv"`);
     res.send([headers.join(','), ...csvRows].join('\n'));
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendServerError(res, err);
   }
 });
 
@@ -6447,7 +6502,7 @@ app.get('/data/forecast/arrivals', async (req, res) => {
     res.json({ slots, weeklyTrend, slaStats, departments: allDepts, activeDept: dept,
                dataSpanWeeks, dataSpanDays: spanDays });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendServerError(res, err);
   }
 });
 
@@ -6613,7 +6668,7 @@ app.get('/data/forecast/staffing', async (req, res) => {
       modelMeta,          // transparency data for the confidence panel
     });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendServerError(res, err);
   }
 });
 
@@ -6735,7 +6790,7 @@ app.get('/data/forecast/sla-analysis', async (req, res) => {
 
     res.json({ byType, byStatus:byStatusFinal, bottlenecks, dailyTrend, recommendations, departments: (departments||[]).filter(Boolean).sort(), activeDept: dept });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendServerError(res, err);
   }
 });
 
@@ -6749,7 +6804,7 @@ app.get('/ai/conversations', async (req, res) => {
       .find({ userId }).sort({ updatedAt: -1 }).limit(50)
       .project({ title:1, createdAt:1, updatedAt:1, messageCount:1, preview:1 }).toArray();
     res.json({ count: convos.length, conversations: convos });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { sendServerError(res, err); }
 });
 app.get('/ai/conversations/:id', async (req, res) => {
   try {
@@ -6758,7 +6813,7 @@ app.get('/ai/conversations/:id', async (req, res) => {
     const convo = await db.collection('dashboard_ai_conversations').findOne({ _id: new ObjectId(req.params.id), userId });
     if (!convo) return res.status(404).json({ error: 'Not found' });
     res.json(convo);
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { sendServerError(res, err); }
 });
 app.post('/ai/conversations', async (req, res) => {
   try {
@@ -6789,7 +6844,7 @@ app.post('/ai/conversations', async (req, res) => {
     }
 
     res.json({ success:true, id:result.insertedId, conversation:doc });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { sendServerError(res, err); }
 });
 app.put('/ai/conversations/:id', async (req, res) => {
   try {
@@ -6802,7 +6857,7 @@ app.put('/ai/conversations/:id', async (req, res) => {
       { $set:{ ...(title&&{title}), ...(messages&&{messages,messageCount:messages.length,preview}), updatedAt:new Date() } }
     );
     res.json({ success:true });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { sendServerError(res, err); }
 });
 app.delete('/ai/conversations/:id', async (req, res) => {
   try {
@@ -6810,7 +6865,7 @@ app.delete('/ai/conversations/:id', async (req, res) => {
     const userId = req.user?.id || req.user?._id || req.user?.email;
     await db.collection('dashboard_ai_conversations').deleteOne({ _id:new ObjectId(req.params.id), userId });
     res.json({ success:true });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { sendServerError(res, err); }
 });
 
 // —— Saved Reports CRUD ————————————————————————————————
@@ -6825,7 +6880,7 @@ app.get('/reports/saved', async (req, res) => {
     const reports = await db.collection('dashboard_saved_reports')
       .find(filter).sort({ updatedAt: -1 }).toArray();
     res.json({ count: reports.length, reports });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { sendServerError(res, err); }
 });
 
 app.post('/reports/saved', async (req, res) => {
@@ -6837,7 +6892,7 @@ app.post('/reports/saved', async (req, res) => {
     const doc = { name, config, userId, createdBy: req.user?.name || 'unknown', createdAt: new Date(), updatedAt: new Date() };
     const result = await db.collection('dashboard_saved_reports').insertOne(doc);
     res.json({ success: true, id: result.insertedId, report: doc });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { sendServerError(res, err); }
 });
 
 app.delete('/reports/saved/:id', async (req, res) => {
@@ -6849,7 +6904,7 @@ app.delete('/reports/saved/:id', async (req, res) => {
     if (userId) filter.$or = [{ userId }, { userId: { $exists: false } }];
     await db.collection('dashboard_saved_reports').deleteOne(filter);
     res.json({ success: true });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { sendServerError(res, err); }
 });
 
 // ═══════════════════════════════════════════════════════════
@@ -6864,7 +6919,7 @@ app.get('/user/layout/:page', async (req, res) => {
       page: req.params.page
     });
     res.json({ layout: layout?.layout || null });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { sendServerError(res, err); }
 });
 
 app.put('/user/layout/:page', async (req, res) => {
@@ -6878,15 +6933,15 @@ app.put('/user/layout/:page', async (req, res) => {
       { upsert: true }
     );
     res.json({ success: true });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { sendServerError(res, err); }
 });
 
 // ═══════════════════════════════════════════════════════════
-// STATIC FILE SERVING — React dashboard (MUST be after ALL API routes)
+// SPA FALLBACK — React dashboard (MUST be after ALL API routes)
+// Static assets are served near the top of the middleware stack (before the
+// rate limiter); distPath is defined there.
 // ═══════════════════════════════════════════════════════════
-const distPath = path.join(__dirname, 'dist');
-app.use(express.static(distPath));
-// SPA fallback: any GET not matched by an API route serves the React app
+// Any GET not matched by an API route serves the React app.
 app.get('*', (req, res) => {
   res.sendFile(path.join(distPath, 'index.html'));
 });
@@ -6924,9 +6979,9 @@ app.use((err, req, res, next) => {
 
 // —— Start ——————————————————————————————————————————————
 const _httpServer = app.listen(CONFIG.PORT, '0.0.0.0', () => {
-  console.log(`IEE KPI Data API v5.0 running on port ${CONFIG.PORT}`);
+  console.log(`IEE KPI Data API v5.4.22 running on port ${CONFIG.PORT}`);
   console.log(`Environment: ${CONFIG.NODE_ENV}`);
-  console.log(`Rate limit: 60 requests/minute`);
+  console.log(`Rate limit: API 300/min per user · login 30/min per IP · static assets unlimited`);
   console.log(`IP allowlist: ${CONFIG.ALLOWED_IPS || 'disabled (all IPs allowed)'}`);
   // Start cron scheduler for automated emails
   if (CONFIG.SENDGRID_API_KEY) { startCronScheduler(); }
@@ -7065,8 +7120,8 @@ function gracefulShutdown(signal) {
     _httpServer.close(async () => {
       console.log('[SHUTDOWN] HTTP server closed');
       try {
-        if (client)       await client.close();
-        if (configClient) await configClient.close();
+        await prodConnector.close();
+        await configConnector.close();
         console.log('[SHUTDOWN] MongoDB connections closed');
       } catch {}
       process.exit(0);
@@ -7186,15 +7241,9 @@ function startCronScheduler() {
 }
 
 
-async function shutdown(signal) {
-  console.log(`${signal} received, shutting down...`);
-  try { if (client) { await client.close(); console.log('Production MongoDB closed.'); } } catch {}
-  try { if (configClient) { await configClient.close(); console.log('Config MongoDB closed.'); } } catch {}
-  process.exit(0);
-}
-
-process.on('SIGTERM', () => shutdown('SIGTERM'));
-process.on('SIGINT', () => shutdown('SIGINT'));
+// NOTE: SIGTERM/SIGINT are handled by gracefulShutdown (registered above). The
+// previous duplicate `shutdown` handler here closed Mongo and exited immediately,
+// racing the graceful drain and tearing down connections mid-request — removed.
 process.on('unhandledRejection', (reason) => {
   console.error('Unhandled Promise Rejection:', reason);
 });
