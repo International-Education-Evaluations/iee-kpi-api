@@ -1,12 +1,13 @@
 import React, { useState, useCallback } from 'react';
 import Tour, { useTourAutoStart } from './components/Tour';
 import { BrowserRouter, Routes, Route, Navigate, Outlet } from 'react-router-dom';
-
+import { isAuth, isAdmin, isManagerPlus } from './hooks/useApi';
 import { DataProvider } from './hooks/useData';
 import Sidebar from './components/Sidebar';
 import RefreshBar from './components/RefreshBar';
 import ErrorBoundary from './components/ErrorBoundary';
 import { ToastProvider } from './components/Toast';
+import LoginPage from './pages/LoginPage';
 import InvitePage from './pages/InvitePage';
 import KPIOverview from './pages/KPIOverview';
 import KPIUsers from './pages/KPIUsers';
@@ -31,6 +32,7 @@ function AuthGuard() {
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [tourOpen, setTourOpen] = useTourAutoStart();
   const startTour = useCallback(() => setTourOpen(true), [setTourOpen]);
+  if (!isAuth()) return <Navigate to="/login" replace />;
   return (
     <DataProvider>
       <ErrorBoundary scope="auth-shell">
@@ -73,14 +75,15 @@ function AuthGuard() {
     </DataProvider>
   );
 }
-function AdminGuard() { return <Outlet />; }
-function ManagerGuard() { return <Outlet />; }
+function AdminGuard() { if (!isAdmin()) return <Navigate to="/" replace />; return <Outlet />; }
+function ManagerGuard() { if (!isManagerPlus()) return <Navigate to="/" replace />; return <Outlet />; }
 
 export default function App() {
   return (
     <ToastProvider>
     <BrowserRouter>
       <Routes>
+        <Route path="/login" element={<LoginPage />} />
         <Route path="/invite" element={<InvitePage />} />
         <Route element={<AuthGuard />}>
           <Route path="/" element={<KPIOverview />} />
