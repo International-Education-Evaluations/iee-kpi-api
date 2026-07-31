@@ -3170,13 +3170,20 @@ app.post(`/ai/chat`, aiRateLimit, async (req, res) => {
 });
 
 // Internal fetch helper — calls own API endpoints without HTTP overhead
-async function internalFetch(path) {
-  // Parse the path and call the handler directly via a mock req/res
-  // For simplicity, just use HTTP to self — this ensures all middleware runs
+async function internalFetch(path, opts = {}) {
+  // Round-trip through our own HTTP server so all middleware runs.
+  // Defaults to GET; callers may pass { method, body } (e.g. the CSV export
+  // re-runs the POST /reports/query aggregation). Without honoring the method,
+  // a POST silently degraded to GET, missed the POST-only route, and hit the
+  // SPA fallback — returning index.html and breaking JSON.parse.
   const url = `http://localhost:${CONFIG.PORT}${path}`;
-  const res = await fetch(url, {
-    headers: { 'x-api-key': CONFIG.API_KEY }
-  });
+  const headers = { 'x-api-key': CONFIG.API_KEY };
+  const init = { method: opts.method || 'GET', headers };
+  if (opts.body != null) {
+    headers['Content-Type'] = 'application/json';
+    init.body = opts.body;
+  }
+  const res = await fetch(url, init);
   return res.json();
 }
 
