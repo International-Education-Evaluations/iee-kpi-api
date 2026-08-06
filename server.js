@@ -135,6 +135,12 @@ app.use((req, res, next) => {
 const distPath = path.join(__dirname, 'dist');
 app.use(express.static(distPath));
 
+// The CSV export accepts a batch of already-rendered rows (breakdowns and
+// drill-downs, which can be thousands of rows). Give just this route a higher
+// body limit than the 1mb global — it's authenticated and the handler caps at
+// 100k rows. Registered before the global parser so it wins for this path
+// (body-parser marks req._body and the global parser then skips it).
+app.use('/reports/csv', express.json({ limit: '25mb' }));
 app.use(express.json({ limit: '1mb' }));
 
 // —— Rate limiting ————————————————————————————————————————
@@ -493,6 +499,10 @@ async function ensureIndexes() {
       usr.createIndex({ v1Id: 1 },    { background: true }).catch(() => {}),
       usr.createIndex({ fullName: 1 },{ background: true }).catch(() => {}),
     ]);
+
+    // ── backfill_queue_orders (per-status order lists for the Queue Ops drawer) ──
+    await db.collection('backfill_queue_orders')
+      .createIndex({ statusSlug: 1 }, { background: true }).catch(() => {});
 
     _indexesEnsured = true;
     console.log('[INDEXES] All backfill collection indexes ensured');
@@ -4744,6 +4754,66 @@ async function runBackfill(options = {}) {
     }
 
     // ═════════════════════════════════════════════════════════
+    // 3a2. QUEUE ORDER LISTS — per-order rows for the drilldown drawer
+    // ═════════════════════════════════════════════════════════
+    // The snapshot above stores per-status COUNTS. The Queue Ops drawer needs the
+    // actual ORDER rows for every status. Capture them here (same production scan
+    // basis as /queue-snapshot) into backfill_queue_orders so the drawer reads
+    // from the config DB instead of hitting production live on every click.
+    push('Capturing queue order lists...');
+    try {
+      const ordersDb = await getDb('orders');
+      const ordersCol = ordersDb.collection('orders');
+      const sinceCutoff = new Date('2025-01-01T00:00:00Z');
+      const TERMINAL_TYPES = ['Completed', 'Cancelled', 'Refunded', 'Voided'];
+      const TERMINAL_SLUGS = ['completed', 'deleted', 'refunded', 'confirmed-fraudulent', 'expired'];
+
+      const queueOrders = await ordersCol.aggregate([
+        { $match: {
+            paymentStatus: 'paid',
+            orderType: { $in: ['evaluation', 'translation'] },
+            deletedAt: null,
+            orderStatusHistory: { $exists: true, $not: { $size: 0 } },
+        } },
+        { $addFields: { currentStatus: { $arrayElemAt: ['$orderStatusHistory', -1] } } },
+        { $match: {
+            'currentStatus.updatedStatus.statusType': { $nin: TERMINAL_TYPES },
+            'currentStatus.updatedStatus.slug': { $nin: TERMINAL_SLUGS },
+            'currentStatus.createdAt': { $gte: sinceCutoff },
+        } },
+        { $project: {
+            _id: 0,
+            orderId: '$_id',
+            orderSerialNumber: 1,
+            orderType: 1,
+            statusSlug: '$currentStatus.updatedStatus.slug',
+            statusName: '$currentStatus.updatedStatus.name',
+            enteredAt: '$currentStatus.createdAt',
+            assignedTo: '$currentStatus.assignedTo',
+        } },
+      ], { allowDiskUse: true }).toArray();
+
+      if (queueOrders.length > 0) {
+        // Staging swap (same pattern as user sync) so the drawer never reads an
+        // empty collection mid-run. Index carries over via renameCollection.
+        const stagingName = 'backfill_queue_orders_staging';
+        const staging = configDb.collection(stagingName);
+        await staging.drop().catch(() => {});
+        await staging.createIndex({ statusSlug: 1 }, { background: true }).catch(() => {});
+        const stamped = queueOrders.map(o => ({ ...o, _backfilledAt: new Date() }));
+        await staging.insertMany(stamped, { ordered: false });
+        await configDb.renameCollection(stagingName, 'backfill_queue_orders', { dropTarget: true });
+      }
+      push(`Queue order lists: ${queueOrders.length} orders`);
+    } catch (qoErr) {
+      push(`Queue order lists: SKIPPED (${qoErr.message})`);
+      // Drop any half-written staging so a partial set can't be swapped in later.
+      // The live backfill_queue_orders is untouched (the swap rename never ran),
+      // so the drawer keeps serving the previous good data.
+      await configDb.collection('backfill_queue_orders_staging').drop().catch(() => {});
+    }
+
+    // ═════════════════════════════════════════════════════════
     // 3b. QUEUE WAIT SUMMARY — backfill into config DB
     // ═════════════════════════════════════════════════════════
     // Previously called live on every Queue Ops page load (/queue-wait-summary?days=450)
@@ -5785,8 +5855,12 @@ app.get('/data/queue-snapshot', async (req, res) => {
 });
 
 // —— GET /data/queue-status-orders — Orders currently in a given status ——
-// Used by QueueOps drilldown drawer. Returns order-level rows for a status slug
-// from backfill_kpi_segments (open segments only) so we never hit production.
+// Used by QueueOps drilldown drawer. Sources from production orders.orders keyed
+// on the CURRENT status. Reads the pre-computed backfill_queue_orders collection
+// (populated each backfill run from the same production scan as /queue-snapshot),
+// so the drawer reads from the config DB and never hits production live, and every
+// status type is covered. The original version read backfill_kpi_segments
+// (Processing-only), which returned nothing for On-Hold/Waiting statuses.
 // Query params:
 //   statusSlug  (required) — the status slug to filter on
 //   orderType   (optional) — 'evaluation' | 'translation'
@@ -5797,33 +5871,44 @@ app.get('/data/queue-status-orders', async (req, res) => {
     if (!statusSlug) return res.status(400).json({ error: 'statusSlug is required' });
 
     const db = await getConfigDb();
-    const col = db.collection('backfill_kpi_segments');
-
-    // Base filter: open segments in this status
-    const filter = { statusSlug, isOpen: true };
+    const filter = { statusSlug };
     if (orderType) filter.orderType = orderType;
-
-    const segments = await col.find(filter)
-      .sort({ segmentStart: 1 }) // oldest first — most urgent at top
-      .limit(2000)
+    const orders = await db.collection('backfill_queue_orders')
+      .find(filter)
+      .sort({ enteredAt: 1 }) // oldest first — most urgent on top
+      .limit(5000)            // covers the largest live queue; drawer triages, not a bulk export
       .toArray();
 
-    // Calculate wait hours and apply aging bucket filter
+    // Department isn't stored on the order — enrich from backfill_users (keyed by
+    // v2Id = assignedTo.foreignKeyId, then email), the same join used elsewhere.
+    const staff = await (await getConfigDb()).collection('backfill_users')
+      .find({}, { projection: { v2Id: 1, email: 1, departmentName: 1 } }).toArray();
+    const deptByV2Id = {}, deptByEmail = {};
+    for (const u of staff) {
+      if (u.v2Id)  deptByV2Id[String(u.v2Id)] = u.departmentName || '';
+      if (u.email) deptByEmail[String(u.email).toLowerCase()] = u.departmentName || '';
+    }
+
     const now = Date.now();
-    const rows = segments.map(s => {
-      const startMs = s.segmentStart ? new Date(s.segmentStart).getTime() : null;
+    const rows = orders.map(o => {
+      const a = o.assignedTo || null; // absent for Waiting/On-Hold orders (unassigned)
+      const workerName  = a ? ([a.firstName, a.lastName].filter(Boolean).join(' ') || null) : null;
+      const workerEmail = a?.email || null;
+      const v2 = a?.foreignKeyId ? String(a.foreignKeyId) : '';
+      const departmentName = (v2 && deptByV2Id[v2]) || (workerEmail && deptByEmail[workerEmail.toLowerCase()]) || null;
+      const startMs = o.enteredAt ? new Date(o.enteredAt).getTime() : null;
       const waitHours = startMs ? Math.round((now - startMs) / 36000) / 100 : null;
       return {
-        orderSerialNumber: s.orderSerialNumber,
-        orderId: s.orderId,
-        orderType: s.orderType,
-        workerName: s.workerName || null,
-        workerEmail: s.workerEmail || null,
-        departmentName: s.departmentName || null,
-        segmentStart: s.segmentStart,
+        orderSerialNumber: o.orderSerialNumber,
+        orderId: o.orderId,
+        orderType: o.orderType,
+        workerName,
+        workerEmail,
+        departmentName,
+        segmentStart: o.enteredAt, // drawer labels this column "Entered"
         waitHours,
-        statusName: s.statusName,
-        statusSlug: s.statusSlug,
+        statusName: o.statusName,
+        statusSlug: o.statusSlug,
       };
     }).filter(r => {
       if (!agingBucket || r.waitHours === null) return true;
@@ -6423,6 +6508,158 @@ app.post('/reports/export', async (req, res) => {
     res.send([headers.join(','), ...csvRows].join('\n'));
   } catch (err) {
     sendServerError(res, err);
+  }
+});
+
+// —— POST /reports/csv — Format caller-supplied rows as a CSV download ——
+// Used by the KPI Overview breakdowns, QC Overview, and drill-down exports.
+// The client sends the rows it already rendered, so the file matches the
+// screen exactly (unit-aware XpH, worker disambiguation, active filters) and
+// the server serves the download. Large raw-segment exports use the
+// re-querying /reports/export path instead; this endpoint is only for the
+// small, already-aggregated tables and drill-down drawers.
+app.post('/reports/csv', (req, res) => {
+  try {
+    const { filename, columns, rows } = req.body || {};
+    if (!Array.isArray(columns) || !columns.length || !Array.isArray(rows)) {
+      return res.status(400).json({ error: 'columns[] and rows[] are required' });
+    }
+    // Breakdown/drill-down tables are small (hundreds of rows). Anything larger
+    // belongs in the streaming Segments export, so cap here to blunt abuse.
+    const MAX_ROWS = 100000;
+    if (rows.length > MAX_ROWS) {
+      return res.status(413).json({ error: `Too many rows (${rows.length}); max ${MAX_ROWS}. Use the Segments export for large data.` });
+    }
+    const esc = v => {
+      if (v == null) return '';
+      const s = String(v);
+      return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+    };
+    const header = columns.map(c => esc(c.label ?? c.key)).join(',');
+    const body   = rows.map(r => columns.map(c => esc(r[c.key])).join(',')).join('\n');
+    const safeName = String(filename || 'iee-export').replace(/[^a-z0-9._-]/gi, '-');
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.setHeader('Content-Disposition', `attachment; filename="${safeName}-${new Date().toISOString().slice(0, 10)}.csv"`);
+    // Lead with a UTF-8 BOM so Excel renders accented worker names correctly.
+    res.send('﻿' + header + '\n' + body);
+  } catch (err) {
+    sendServerError(res, err);
+  }
+});
+
+// —— POST /reports/segments-export — Streaming CSV of raw KPI segments ——
+// The Segments breakdown can run 400k+ rows: too large to build in the browser
+// or buffer whole in server memory. This streams matching segments straight
+// from a Mongo cursor in batches. The client routes small/worker-filtered
+// exports through /reports/csv instead (exact on-screen rows), so this endpoint
+// only handles the broad, high-volume case and takes the cleanly-mappable
+// filters (date, order type, department, status name-or-slug, flags).
+app.post('/reports/segments-export', async (req, res) => {
+  try {
+    const { filters = {} } = req.body || {};
+    const db = await getConfigDb();
+    const col = db.collection('backfill_kpi_segments');
+    const dateField = 'segmentStart';
+
+    const match = {};
+    if (filters.dateFrom) match[dateField] = { ...match[dateField], $gte: filters.dateFrom };
+    if (filters.dateTo)   match[dateField] = { ...match[dateField], $lte: filters.dateTo + 'T23:59:59' };
+    if (filters.orderType)   match.orderType = filters.orderType;
+    if (filters.excludeOpen) match.isOpen    = { $ne: true };
+    // Status filter value is the on-screen label (statusName, falling back to
+    // statusSlug), so match either field.
+    if (filters.status) match.$or = [{ statusName: filters.status }, { statusSlug: filters.status }];
+    // Honor the global exclude-flagged toggle via the same cache /reports/query uses.
+    if (filters.excludeFlagged) {
+      try {
+        const now = Date.now();
+        if (!_flaggedCache || now - _flaggedCacheTs >= FLAGGED_TTL_MS) {
+          _flaggedCache = await computeFlaggedOrders();
+          _flaggedCacheTs = now;
+        }
+        const keys = _flaggedCache?.flaggedSegmentKeys || [];
+        if (keys.length) match._compositeKey = { $nin: keys };
+      } catch { /* non-fatal — proceed without exclusion */ }
+    }
+
+    // Segments don't store departmentName — the dashboard enriches it from
+    // backfill_users (keyed by v2Id, then email). Build the same map so the
+    // export's Department column is populated, and apply any department filter
+    // in-process against the enriched value (avoids depending on the ambiguous
+    // workerUserId storage type, and keeps filter + output consistent).
+    const staff = await db.collection('backfill_users')
+      .find({}, { projection: { v2Id: 1, email: 1, departmentName: 1 } }).toArray();
+    const deptByV2Id = {}, deptByEmail = {};
+    for (const u of staff) {
+      if (u.v2Id)  deptByV2Id[String(u.v2Id)] = u.departmentName || '';
+      if (u.email) deptByEmail[String(u.email).toLowerCase()] = u.departmentName || '';
+    }
+    const deptFor = (doc) => {
+      const v2 = doc.workerUserId != null ? String(doc.workerUserId) : '';
+      if (v2 && deptByV2Id[v2]) return deptByV2Id[v2];
+      const em = (doc.workerEmail || '').toLowerCase();
+      return (em && deptByEmail[em]) || '';
+    };
+    const wantDepts = filters.departments?.length ? new Set(filters.departments) : null;
+
+    // Bucket is the 5-bucket classification shown on screen — derived from the
+    // per-status benchmark thresholds (same logic as /kpi-classify and the client
+    // classifier) so the streamed file matches the Segments table.
+    const benchmarks = await db.collection('dashboard_benchmarks').find({}).toArray();
+    const benchmarkMap = {};
+    for (const b of benchmarks) benchmarkMap[b.status] = b;
+    const classifyBucket = (doc) => {
+      if (doc.isOpen) return 'Open';
+      if (doc.durationMinutes == null) return 'Unclassified';
+      const b = benchmarkMap[doc.statusSlug] || benchmarkMap[doc.statusName];
+      if (!b) return 'Unclassified';
+      const dur = doc.durationMinutes;
+      if (dur <  (b.excludeShortMin ?? 0.5)) return 'Exclude Short';
+      if (dur <  (b.inRangeMin      ?? 1))   return 'Out-of-Range Short';
+      if (dur <= (b.inRangeMax      ?? 120)) return 'In-Range';
+      if (dur <= (b.excludeLongMax  ?? 480)) return 'Out-of-Range Long';
+      return 'Exclude Long';
+    };
+
+    // Columns match the on-screen Segments table exactly (visible columns only).
+    const COLS = [
+      { key: 'orderSerialNumber', label: 'Order' },
+      { key: 'workerName',        label: 'Worker' },
+      { key: 'departmentName',    label: 'Dept' },
+      { key: 'statusName',        label: 'Status' },
+      { key: 'orderType',         label: 'Type' },
+      { key: 'segmentStart',      label: 'Date' },
+      { key: 'durationMinutes',   label: 'Duration' },
+      { key: '_bucket',           label: 'Bucket' },
+    ];
+    const esc = v => { if (v == null) return ''; const s = String(v); return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s; };
+
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.setHeader('Content-Disposition', `attachment; filename="iee-kpi-segments-${new Date().toISOString().slice(0, 10)}.csv"`);
+    res.write('﻿' + COLS.map(c => esc(c.label)).join(',') + '\n');
+
+    // departmentName + _bucket are derived; fetch the raw fields they need.
+    const projection = {
+      orderSerialNumber: 1, workerName: 1, workerUserId: 1, workerEmail: 1,
+      statusName: 1, statusSlug: 1, orderType: 1, segmentStart: 1,
+      durationMinutes: 1, isOpen: 1,
+    };
+    const cursor = col.find(match, { projection }).sort({ [dateField]: -1 }).allowDiskUse(true);
+    let batch = [];
+    for await (const doc of cursor) {
+      const dept = deptFor(doc);
+      if (wantDepts && !wantDepts.has(dept)) continue;
+      doc.departmentName = dept;
+      doc._bucket = classifyBucket(doc);
+      batch.push(COLS.map(c => esc(doc[c.key])).join(','));
+      if (batch.length >= 5000) { res.write(batch.join('\n') + '\n'); batch = []; }
+    }
+    if (batch.length) res.write(batch.join('\n') + '\n');
+    res.end();
+  } catch (err) {
+    // Once streaming starts the headers are sent, so a JSON error is impossible.
+    if (res.headersSent) { try { res.end(); } catch { /* ignore */ } }
+    else sendServerError(res, err);
   }
 });
 

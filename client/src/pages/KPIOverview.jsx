@@ -4,7 +4,7 @@ import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, Cell } from 
 import { Card, Table, Pills, FilterBar, FilterSelect, FilterInput, FilterReset, DatePresets,
          ChartLegend, DrilldownDrawer, OrderLink,
          TOOLTIP_STYLE, fmt, fmtI, fmtDur, fmtHrs, fmtDateTime } from '../components/UI';
-import { api } from '../hooks/useApi';
+import { api, exportCsv, downloadCsvPost } from '../hooks/useApi';
 import { useData } from '../hooks/useData';
 import { makeClassifier, isOutlier, computeDateRange, findGapDays } from '../lib/classify-segment';
 
@@ -38,12 +38,56 @@ const SEG_COLS = [
     render:v=><span className={`text-[10px] font-semibold ${v==='In-Range'?'text-emerald-600':v?.includes('Out-of-Range')?'text-amber-600':v?.includes('Exclude')?'text-red-600':'text-ink-400'}`}>{v||'—'}</span> },
 ];
 
+// CSV export columns for the breakdown tables. Keys map to the raw values the
+// byStatus / byWorker rows already carry, so the export matches the on-screen
+// numbers exactly (unit-aware XpH, worker disambiguation, active filters).
+const STATUS_EXPORT_COLS = [
+  { key: 'status',  label: 'Status' },
+  { key: 'count',   label: 'Segments' },
+  { key: 'pct',     label: '% of Total' },
+  { key: 'closed',  label: 'Closed' },
+  { key: 'open',    label: 'Open' },
+  { key: 'avg',     label: 'Avg Duration (min)' },
+  { key: 'xph',     label: 'XpH' },
+  { key: 'workers', label: 'Workers' },
+];
+const WORKER_EXPORT_COLS = [
+  { key: 'worker', label: 'Worker' },
+  { key: 'dept',   label: 'Department' },
+  { key: 'count',  label: 'Segments' },
+  { key: 'orders', label: 'Orders' },
+  { key: 'closed', label: 'Closed' },
+  { key: 'open',   label: 'Open' },
+  { key: 'avg',    label: 'Avg Duration (min)' },
+  { key: 'xph',    label: 'XpH' },
+  { key: 'hrs',    label: 'Total Hrs' },
+];
+// Segments tab export columns — match the on-screen Segments table exactly
+// (visible columns only). Kept identical to the server's streaming export
+// (server.js /reports/segments-export) so the file has the same shape whether it
+// went through the thin or streaming path. `_bucket` is already on segDetail rows.
+const SEGMENT_EXPORT_COLS = [
+  { key: 'orderSerialNumber', label: 'Order' },
+  { key: 'workerName',        label: 'Worker' },
+  { key: 'departmentName',    label: 'Dept' },
+  { key: 'statusName',        label: 'Status' },
+  { key: 'orderType',         label: 'Type' },
+  { key: 'segmentStart',      label: 'Date' },
+  { key: 'durationMinutes',   label: 'Duration' },
+  { key: '_bucket',           label: 'Bucket' },
+];
+// Above this many rows the Segments export streams from the server instead of
+// sending rows up; no single worker has this many segments, so worker-filtered
+// exports always take the exact (thin) path.
+const SEGMENT_THIN_MAX = 25000;
+
 export default function KPIOverview() {
   const { kpiSegs: segs, kpiLoading: loading, loadKpi, loadStatus, benchmarks,
           flaggedSegmentKeys, flaggedReasonsByKey, excludeFlagged } = useData();
   const kpiStatus = loadStatus?.kpi || {};
   // benchmarks now come from DataProvider context — no local state needed
   const [view, setView] = useState('status');
+  const [exporting, setExporting] = useState(false);
   const [fType, setFType] = useState(''); const [fDept, setFDept] = useState('');
   const [fFrom, setFFrom] = useState(''); const [fTo, setFTo] = useState('');
   const [fWorker, setFWorker] = useState(''); const [fStatus, setFStatus] = useState('');
@@ -173,6 +217,24 @@ export default function KPIOverview() {
     return Object.values(m).sort((a,b)=>a.date.localeCompare(b.date)).map(d=>({...d,label:fmtDate(d.date)}));
   },[filtered]);
 
+  // Export the current breakdown (By Status / By Worker) to CSV via the server.
+  // Segments export is handled separately (streaming) because it can run 400k+ rows.
+  const exportBreakdown = useCallback(async () => {
+    const isWorker = view === 'worker';
+    const cols = isWorker ? WORKER_EXPORT_COLS : STATUS_EXPORT_COLS;
+    const rows = isWorker ? byWorker : byStatus;
+    if (!rows.length) return;
+    setExporting(true);
+    try {
+      await exportCsv(`iee-kpi-${isWorker ? 'by-worker' : 'by-status'}`, cols, rows);
+    } catch (e) {
+      if (typeof window !== 'undefined' && window.__ieeToast)
+        window.__ieeToast.show({ kind: 'error', title: 'Export failed', message: e.message });
+    }
+    setExporting(false);
+  }, [view, byWorker, byStatus]);
+
+
   // Open drilldown for a status row
   const openStatusDrawer = useCallback((row) => {
     const slugToFilter = row.slug || row.statusSlug || row.status;
@@ -206,6 +268,34 @@ export default function KPIOverview() {
     filtered.map(s => ({ ...s, _bucket: classifySegment(s) }))
       .sort((a,b) => (b.segmentStart||'').localeCompare(a.segmentStart||'')),
   [filtered, classifySegment]);
+
+  // Export the raw Segments tab. Small/worker-filtered sets go through the exact
+  // thin endpoint; large sets stream from the server with the current filters.
+  // Declared after segDetail so its dependency isn't referenced before init.
+  const exportSegments = useCallback(async () => {
+    if (!segDetail.length) return;
+    setExporting(true);
+    try {
+      if (segDetail.length <= SEGMENT_THIN_MAX) {
+        await exportCsv('iee-kpi-segments', SEGMENT_EXPORT_COLS, segDetail);
+      } else {
+        await downloadCsvPost('/reports/segments-export', 'iee-kpi-segments', {
+          filters: {
+            dateFrom: fFrom || undefined,
+            dateTo: fTo || undefined,
+            orderType: fType || undefined,
+            departments: fDept ? [fDept] : undefined,
+            status: fStatus || undefined,
+            excludeFlagged,
+          },
+        });
+      }
+    } catch (e) {
+      if (typeof window !== 'undefined' && window.__ieeToast)
+        window.__ieeToast.show({ kind: 'error', title: 'Export failed', message: e.message });
+    }
+    setExporting(false);
+  }, [segDetail, fFrom, fTo, fType, fDept, fStatus, excludeFlagged]);
 
   const clearFilters = ()=>{setFType('');setFDept('');setFFrom('');setFTo('');setFWorker('');setFStatus('');};
   // ── Anomaly / Alert feed ────────────────────────────────────
@@ -533,11 +623,18 @@ export default function KPIOverview() {
       <div className="card-surface overflow-hidden" data-tour="breakdown-table">
         <div className="px-4 py-3 border-b border-surface-200 flex items-center justify-between">
           <span className="text-xs font-semibold text-ink-600">Breakdown</span>
-          <Pills tabs={[
-            {key:'status',   label:`By Status (${byStatus.length})`},
-            {key:'worker',   label:`By Worker (${byWorker.length})`},
-            {key:'segments', label:`Segments (${fmtI(filtered.length)})`},
-          ]} active={view} onChange={setView} />
+          <div className="flex items-center gap-2">
+            <button onClick={view==='segments' ? exportSegments : exportBreakdown}
+              disabled={exporting || (view==='segments' ? filtered : view==='worker' ? byWorker : byStatus).length===0}
+              className="text-xs border border-surface-300 hover:bg-surface-100 text-ink-600 px-2.5 py-1 rounded font-medium disabled:opacity-50 shrink-0">
+              {exporting ? 'Exporting…' : '⬇ Export CSV'}
+            </button>
+            <Pills tabs={[
+              {key:'status',   label:`By Status (${byStatus.length})`},
+              {key:'worker',   label:`By Worker (${byWorker.length})`},
+              {key:'segments', label:`Segments (${fmtI(filtered.length)})`},
+            ]} active={view} onChange={setView} />
+          </div>
         </div>
         {view==='status' && (
           <Table cols={statusCols} rows={byStatus} defaultSort="count" defaultSortDir="desc"
@@ -551,7 +648,7 @@ export default function KPIOverview() {
         {view==='segments' && (
           <Table cols={segmentCols} rows={segDetail} defaultSort="segmentStart" defaultSortDir="desc"
             searchKey="orderSerialNumber" searchPlaceholder="Search order, worker, status…"
-            maxHeight="600px" />
+            maxHeight="600px" maxRows={1000} />
         )}
       </div>
 
