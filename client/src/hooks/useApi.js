@@ -114,6 +114,48 @@ function shortPath(p) {
   return noQuery.length > 32 ? '…' + noQuery.slice(-31) : noQuery;
 }
 
+// ── CSV export ─────────────────────────────────────────────
+// POST a JSON body to a server endpoint that responds with a CSV, then trigger
+// the browser download. Shared by the thin row-formatter and the streaming
+// segments export so neither builds a huge blob by hand in the tab.
+export async function downloadCsvPost(path, filename, body) {
+  const token = getToken();
+  const resp = await fetch(path, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
+    body: JSON.stringify(body),
+  });
+  if (!resp.ok) {
+    let msg = 'Export failed';
+    try { msg = (await resp.json()).error || msg; } catch {}
+    throw new Error(msg);
+  }
+  const blob = await resp.blob();
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `${filename}.csv`; // server also sets Content-Disposition
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+}
+
+// Send already-rendered rows to the server, which formats + serves the CSV so
+// the file matches the screen exactly. `columns` = [{ key, label }]. Rows are
+// slimmed to just the export keys first — breakdown/segment rows carry heavy
+// internal fields (e.g. per-status `durations` arrays) that would otherwise
+// bloat the request past the body limit.
+export function exportCsv(filename, columns, rows) {
+  const keys = columns.map(c => c.key);
+  const slimRows = rows.map(r => {
+    const o = {};
+    for (const k of keys) o[k] = r[k];
+    return o;
+  });
+  return downloadCsvPost('/reports/csv', filename, { filename, columns, rows: slimRows });
+}
+
 // ── Login / Setup ──────────────────────────────────────────
 export async function doLogin(email, password) {
   const r = await fetch('/auth/login', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ email, password }) });

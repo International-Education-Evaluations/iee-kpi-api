@@ -4,6 +4,7 @@ import { Card, Table, Pills, FilterBar, FilterSelect, FilterInput, FilterReset, 
          ChartLegend, DrilldownDrawer, OrderLink,
          TOOLTIP_STYLE, fmtI, fmtP, fmtDateTime } from '../components/UI';
 import { useData } from '../hooks/useData';
+import { exportCsv } from '../hooks/useApi';
 
 const COLORS=['#00aeef','#16a34a','#d97706','#ea580c','#9333ea','#0891b2','#dc2626','#65a30d','#7c3aed'];
 
@@ -29,6 +30,7 @@ export default function QCOverview() {
   const [fErr, setFErr] = useState(''); const [fFrom, setFFrom] = useState('');
   const [fTo, setFTo] = useState(''); const [fSearch, setFSearch] = useState('');
   const [drawer, setDrawer] = useState({ open:false, title:'', subtitle:'', rows:[] });
+  const [exporting, setExporting] = useState(false);
 
   const dFDept   = useDeferredValue(fDept);
   const dFType   = useDeferredValue(fType);
@@ -154,6 +156,22 @@ export default function QCOverview() {
     {key:'issues',label:'Issues',w:250,sortable:false,render:v=><span className="text-[10px] text-ink-400">{v}</span>},
   ];
 
+  // Export the current Summary Breakdown tab (Department / Issue / User) to CSV.
+  // Columns derive from the on-screen table cols so the file matches the view.
+  const exportBreakdown = useCallback(async () => {
+    const map = { dept:[deptCols,byDept,'by-department'], issue:[issueCols,byIssue,'by-issue'], user:[userCols,byUser,'by-user'] };
+    const [cols, rows, name] = map[view] || map.dept;
+    if (!rows.length) return;
+    setExporting(true);
+    try {
+      const expCols = cols.filter(c=>c.key).map(c=>({ key:c.key, label:c.label||c.key }));
+      await exportCsv(`iee-qc-${name}`, expCols, rows);
+    } catch (e) {
+      if (typeof window!=='undefined' && window.__ieeToast) window.__ieeToast.show({ kind:'error', title:'Export failed', message:e.message });
+    }
+    setExporting(false);
+  }, [view, byDept, byIssue, byUser, deptCols, issueCols, userCols]);
+
   const eventLogRows = useMemo(()=>withOutcome(filtered.slice().sort((a,b)=>(b.qcCreatedAt||'').localeCompare(a.qcCreatedAt||'')).slice(0,1000)),[filtered,withOutcome]);
   const eventLogCols = [
     {key:'qcCreatedAt',label:'Date',w:130,sortable:true,render:v=>fmtDateTime(v)},
@@ -244,7 +262,14 @@ export default function QCOverview() {
       <div className="card-surface overflow-hidden">
         <div className="px-4 py-3 border-b border-surface-200 flex items-center justify-between">
           <span className="text-xs font-semibold text-ink-600">Summary Breakdown</span>
-          <Pills tabs={[{key:'dept',label:'Department'},{key:'issue',label:'Issue'},{key:'user',label:'User'}]} active={view} onChange={setView} />
+          <div className="flex items-center gap-2">
+            <button onClick={exportBreakdown}
+              disabled={exporting || ({dept:byDept,issue:byIssue,user:byUser}[view]||byDept).length===0}
+              className="text-xs border border-surface-300 hover:bg-surface-100 text-ink-600 px-2.5 py-1 rounded font-medium disabled:opacity-50 shrink-0">
+              {exporting ? 'Exporting…' : '⬇ Export CSV'}
+            </button>
+            <Pills tabs={[{key:'dept',label:'Department'},{key:'issue',label:'Issue'},{key:'user',label:'User'}]} active={view} onChange={setView} />
+          </div>
         </div>
         {view==='dept' && <Table cols={deptCols} rows={byDept} defaultSort="total" defaultSortDir="desc" searchKey="dept" searchPlaceholder="Search departments…" onRow={openDeptDrawer} />}
         {view==='issue' && <Table cols={issueCols} rows={byIssue} defaultSort="total" defaultSortDir="desc" searchKey="issue" searchPlaceholder="Search issues…" onRow={openIssueDrawer} />}

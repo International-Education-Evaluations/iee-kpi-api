@@ -1,4 +1,5 @@
 import React, { useState, useMemo, useEffect, useRef, useCallback } from 'react';
+import { exportCsv } from '../hooks/useApi';
 
 const ORDER_URL = 'https://admin.prod.iee.com/orders/';
 
@@ -102,7 +103,7 @@ export function MiniStat({ label, value, accent }) {
 }
 
 // ── Sortable, searchable Data Table ─────────────────────────
-export function Table({ cols, rows, onRow, empty='No data', maxHeight='550px', searchKey, searchPlaceholder='Search…', defaultSort, defaultSortDir='desc' }) {
+export function Table({ cols, rows, onRow, empty='No data', maxHeight='550px', searchKey, searchPlaceholder='Search…', defaultSort, defaultSortDir='desc', maxRows }) {
   const [sortKey, setSortKey] = useState(defaultSort || null);
   const [sortDir, setSortDir] = useState(defaultSortDir);
   const [search, setSearch] = useState('');
@@ -132,6 +133,12 @@ export function Table({ cols, rows, onRow, empty='No data', maxHeight='550px', s
     return out;
   }, [rows, search, searchKey, sortKey, sortDir]);
 
+  // Cap how many rows we actually render. Search + sort still run over the full
+  // set above; we just paint a preview so huge tables (e.g. 396k segments)
+  // don't build millions of DOM nodes and freeze the tab. Export gives all rows.
+  const rendered = maxRows && displayed.length > maxRows ? displayed.slice(0, maxRows) : displayed;
+  const capped = rendered.length < displayed.length;
+
   return (
     <div>
       {searchKey && (
@@ -154,7 +161,7 @@ export function Table({ cols, rows, onRow, empty='No data', maxHeight='550px', s
                   </th>
                 ))}
               </tr></thead>
-              <tbody>{displayed.map((r,i) => (
+              <tbody>{rendered.map((r,i) => (
                 <tr key={i} className={onRow?'cursor-pointer':''} onClick={() => onRow?.(r)}>
                   {cols.map((c,j) => <td key={j} className={c.right?'text-right font-mono':''}>{c.render?c.render(r[c.key],r):(r[c.key]??'—')}</td>)}
                 </tr>
@@ -162,6 +169,11 @@ export function Table({ cols, rows, onRow, empty='No data', maxHeight='550px', s
             </table>
           </div>
       }
+      {capped && (
+        <div className="px-4 py-2 border-t border-surface-100 bg-surface-50 text-[11px] text-ink-500">
+          Showing first {rendered.length.toLocaleString()} of {displayed.length.toLocaleString()} rows. Use <span className="font-medium">Export CSV</span> for the full set.
+        </div>
+      )}
     </div>
   );
 }
@@ -298,6 +310,7 @@ export function DrilldownDrawer({ open, onClose, title, subtitle, rows=[], loadi
   const [search, setSearch] = useState('');
   const [sortKey, setSortKey] = useState(null);
   const [sortDir, setSortDir] = useState('asc');
+  const [exporting, setExporting] = useState(false);
 
   useEffect(() => { if (open) setSearch(''); }, [open]);
   useEffect(() => {
@@ -346,6 +359,21 @@ export function DrilldownDrawer({ open, onClose, title, subtitle, rows=[], loadi
     });
   }, [cols, rows]);
 
+  // Export the currently-shown drill-down rows (after search + sort) as CSV,
+  // using the visible columns. Server formats + serves the file.
+  const doExport = useCallback(async () => {
+    if (!displayed.length) return;
+    setExporting(true);
+    try {
+      const expCols = visibleCols.filter(c => c.key).map(c => ({ key: c.key, label: c.label || c.key }));
+      const slug = (title || 'drilldown').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 60) || 'drilldown';
+      await exportCsv(`iee-${slug}`, expCols, displayed);
+    } catch (e) {
+      if (typeof window !== 'undefined' && window.__ieeToast) window.__ieeToast.show({ kind: 'error', title: 'Export failed', message: e.message });
+    }
+    setExporting(false);
+  }, [displayed, visibleCols, title]);
+
   return (
     <>
       <div onClick={onClose}
@@ -373,6 +401,10 @@ export function DrilldownDrawer({ open, onClose, title, subtitle, rows=[], loadi
             placeholder="Search orders, workers, departments…"
             className="flex-1 min-w-[180px] px-3 py-1.5 bg-white border border-surface-200 rounded-lg text-xs text-ink-800 placeholder-ink-400 focus:outline-none focus:border-brand-400 focus:ring-2 focus:ring-brand-100" />
           {extraFilters}
+          <button onClick={doExport} disabled={exporting || !displayed.length}
+            className="text-xs border border-surface-200 bg-white hover:bg-surface-100 text-ink-600 px-2.5 py-1.5 rounded-lg font-medium disabled:opacity-50 shrink-0">
+            {exporting ? 'Exporting…' : '⬇ Export CSV'}
+          </button>
           <span className="text-[10px] text-ink-400 whitespace-nowrap">
             {loading ? 'Loading…' : `${displayed.length.toLocaleString()} / ${rows.length.toLocaleString()}`}
           </span>
