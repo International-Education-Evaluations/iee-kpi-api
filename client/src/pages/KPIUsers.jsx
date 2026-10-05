@@ -65,14 +65,13 @@ const ORDER_COLS = [
 
 export default function KPIUsers() {
   const { kpiSegs: segs, kpiLoading: loading, loadKpi, benchmarks,
-          flaggedSegmentKeys, excludeFlagged } = useData();
+          flaggedSegmentKeys, excludeFlagged,
+          kpiFrom: fFrom, setKpiFrom: setFFrom, kpiTo: fTo, setKpiTo: setFTo, resetKpiRange, kpiRangeIsDefault, kpiEffectiveFrom } = useData();
   const classifySegment = useMemo(() => makeClassifier(benchmarks || []), [benchmarks]);
   const [sp] = useSearchParams();
   // Persist selected worker per-user so navigation away and back restores the selection
   const [sel, setSelRaw] = useState(() => sp.get('worker') || userGet('kpiusers_sel') || '');
   const setSel = (v) => { setSelRaw(v); userSet('kpiusers_sel', v); };
-  const [fFrom, setFFrom]     = useState('');
-  const [fTo, setFTo]         = useState('');
   const [fStatus, setFStatus] = useState('');
   const [fType, setFType]     = useState('');
   const [view, setViewRaw]    = useState(() => userGet('kpiusers_view') || 'status');
@@ -83,7 +82,7 @@ export default function KPIUsers() {
   const [drawerState, setDrawerState] = useState('all'); // 'all' | 'closed' | 'open'
 
   const dSel     = useDeferredValue(sel);
-  const dFFrom   = useDeferredValue(fFrom);
+  const dFFrom   = useDeferredValue(kpiEffectiveFrom);
   const dFTo     = useDeferredValue(fTo);
   const dFStatus = useDeferredValue(fStatus);
   const dFType   = useDeferredValue(fType);
@@ -283,7 +282,7 @@ export default function KPIUsers() {
 
   const statuses  = useMemo(() => [...new Set(segs.filter(s=>s._workerId===sel).map(s=>s.statusName||s.statusSlug).filter(Boolean))].sort(), [segs,sel]);
   const selName   = workers.find(w=>w.value===sel)?.label || '';
-  const hasFilters = fFrom||fTo||fStatus||fType;
+  const hasFilters = !kpiRangeIsDefault||fStatus||fType;
 
   // ── Drilldown handlers ────────────────────────────────────
   // Drilldown rows always include flagged segments (regardless of the global
@@ -389,7 +388,7 @@ export default function KPIUsers() {
           <FilterInput  label="From"       value={fFrom}   onChange={setFFrom}   type="date" />
           <FilterInput  label="To"         value={fTo}     onChange={setFTo}     type="date" />
           <DatePresets onSelect={(from,to)=>{ setFFrom(from); setFTo(to); }} />
-          {hasFilters && <FilterReset onClick={()=>{setFFrom('');setFTo('');setFStatus('');setFType('');}} />}
+          {hasFilters && <FilterReset onClick={()=>{resetKpiRange();setFStatus('');setFType('');}} />}
         </FilterBar>
 
         {/* Worker identity bar */}

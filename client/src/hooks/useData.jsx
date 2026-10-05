@@ -1,5 +1,6 @@
-import React, { createContext, useContext, useState, useCallback, useRef } from 'react';
+import React, { createContext, useContext, useState, useCallback, useRef, useEffect } from 'react';
 import { api } from './useApi';
+import { defaultKpiFrom, needsKpiRefetch, kpiFetchFrom, kpiSegmentsPath } from '../lib/kpi-window';
 import { disambiguateWorkers } from '../components/UI';
 
 const DataContext = createContext(null);
@@ -33,13 +34,30 @@ export function DataProvider({ children }) {
   const [flaggedCounts,  setFlaggedCounts]  = useState({ totalSegments: 0, totalOrders: 0, sameMinute: 0, longDuration: 0, multiOpen: 0, stuckOpen: 0 });
   const [excludeFlagged, setExcludeFlagged] = useState(false);
   const loadedRef = useRef({ kpi: false, qc: false, queue: false });
+  // Shared KPI date window. Default = last 90 days so login doesn't pull the
+  // whole backfill (~95k rows). Pages bind their From/To inputs to this.
+  const [kpiDefaultFrom]      = useState(() => defaultKpiFrom());
+  const [kpiFrom, setKpiFrom] = useState(kpiDefaultFrom);
+  const [kpiTo, setKpiTo]     = useState('');
+  const [kpiLoadedFrom, setKpiLoadedFrom] = useState(/** @type {string|null} */(null)); // `from` of the segments on screen
+  const kpiFromRef       = useRef(kpiFrom);
+  kpiFromRef.current     = kpiFrom;
+  const kpiToRef         = useRef(kpiTo);
+  kpiToRef.current       = kpiTo;
+  const requestedFromRef = useRef(/** @type {string|null} */(null)); // null = no page asked yet
+  const loadedFromRef    = useRef(/** @type {string|null} */(null)); // ref twin of kpiLoadedFrom for loadKpi
+  const kpiSeqRef        = useRef(0);
 
   function bumpStatus(key, patch) {
     setLoadStatus(s => ({ ...s, [key]: { ...s[key], ...patch, at: Date.now() } }));
   }
 
   const loadKpi = useCallback(async (force = false) => {
-    if (loadedRef.current.kpi && !force) return;
+    if (requestedFromRef.current !== null && !force) return;
+    // Empty or half-typed From keeps the current window rather than pulling all history.
+    const from = kpiFetchFrom(kpiFromRef.current, kpiToRef.current, loadedFromRef.current ?? kpiDefaultFrom);
+    const seq = ++kpiSeqRef.current;
+    requestedFromRef.current = from;
     setKpiLoading(true);
     bumpStatus('kpi', { state: 'loading', error: null, partial: {} });
     try {
@@ -108,19 +126,20 @@ export function DataProvider({ children }) {
       // cb= cache-bust: forces unique URLs so browser/proxy never deduplicates
       // parallel requests or returns a cached 304 for a different page
       const cb = Date.now();
-      const first = await api(`/data/kpi-segments?page=1&pageSize=10000&drilldown=1&cb=${cb}`);
+      const first = await api(kpiSegmentsPath({ page: 1, from, cb }));
       const totalPages = first.totalPages || 1;
 
       let rest = [];
       if (totalPages > 1) {
         rest = await Promise.all(
           Array.from({ length: totalPages - 1 }, (_, i) =>
-            api(`/data/kpi-segments?page=${i + 2}&pageSize=10000&drilldown=1&cb=${cb}`)
+            api(kpiSegmentsPath({ page: i + 2, from, cb }))
           )
         );
       }
 
       const all = [first, ...rest].flatMap(d => d.segments || []);
+      if (seq !== kpiSeqRef.current) return; // a newer range request superseded this one
 
       // Build a lookup so each segment can carry its data-quality reasons
       // through to the UI (drilldown row highlight + Flags column badge).
@@ -157,16 +176,22 @@ export function DataProvider({ children }) {
 
       setKpiSegs(disambiguateWorkers(enriched));
       loadedRef.current.kpi = true;
+      loadedFromRef.current = from;
+      setKpiLoadedFrom(from);
 
       // Sub-fetch failures bubble up as partial state — overall is 'ok' if
       // segments themselves loaded, even if a side-fetch (users/levels) failed.
       const anyPartialErr = Object.values(partial).some(v => v !== 'ok');
       bumpStatus('kpi', { state: anyPartialErr ? 'partial' : 'ok', error: null, partial });
     } catch (e) {
+      if (seq !== kpiSeqRef.current) return; // superseded — newer call owns status + spinner
       console.error('KPI load failed:', e);
+      // Fall back to what's on screen so a later widen still refetches;
+      // null (nothing loaded yet) lets a page remount or Retry try again.
+      requestedFromRef.current = loadedFromRef.current;
       bumpStatus('kpi', { state: 'error', error: e.message });
     }
-    setKpiLoading(false);
+    if (seq === kpiSeqRef.current) setKpiLoading(false);
   }, []);
 
   const loadQc = useCallback(async (force = false) => {
@@ -237,6 +262,24 @@ export function DataProvider({ children }) {
     await Promise.all([loadKpi(true), loadQc(true), loadQueue(true)]);
   }, [loadKpi, loadQc, loadQueue]);
 
+  // Effective window start: what pages filter on and exports send. Empty From
+  // shows the loaded window (never all history); empty From + old To shows the
+  // 90 days ending at To.
+  const kpiEffectiveFrom = kpiFetchFrom(kpiFrom, kpiTo, kpiLoadedFrom ?? kpiDefaultFrom);
+
+  // Widening the window (earlier From, or an older To with From empty) goes
+  // back to the server. Debounced: date inputs fire per keystroke.
+  useEffect(() => {
+    const requested = requestedFromRef.current;
+    if (requested === null) return; // no KPI page has loaded yet
+    if (!needsKpiRefetch(requested, kpiEffectiveFrom)) return;
+    const t = setTimeout(() => loadKpi(true), 600);
+    return () => clearTimeout(t);
+  }, [kpiEffectiveFrom, loadKpi]);
+
+  const resetKpiRange = useCallback(() => { setKpiFrom(kpiDefaultFrom); setKpiTo(''); }, [kpiDefaultFrom]);
+  const kpiRangeIsDefault = kpiFrom === kpiDefaultFrom && !kpiTo;
+
   return (
     <DataContext.Provider value={{
       kpiSegs, classifiedSummary, qcEvents, queueSnap, queueWait, users, benchmarks,
@@ -244,6 +287,7 @@ export function DataProvider({ children }) {
       loadStatus,
       flaggedSegmentKeys, flaggedReasonsByKey, flaggedOrders, flaggedCounts, excludeFlagged, setExcludeFlagged,
       loadKpi, loadQc, loadQueue, forceRefreshQueue, refreshAll,
+      kpiFrom, setKpiFrom, kpiTo, setKpiTo, resetKpiRange, kpiRangeIsDefault, kpiDefaultFrom, kpiEffectiveFrom,
     }}>
       {children}
     </DataContext.Provider>

@@ -63,6 +63,7 @@ Severity scale:
 | B-P2 | P1 | `server.js:5331` | `/reports/query` $match uses arbitrary user filters; only the leading filter benefits from compound indexes. Expensive cross-cuts (department + errorType + date) have no good index. |
 | B-P3 | P1 | `server.js:2406+` | AI chat tools call `internalFetch` per tool invocation. No memoization across iterations of the same conversation turn — `fetch_kpi_summary` called twice in one tool sequence pays full cost twice. |
 | B-P4 | P2 | `server.js:355` | Config cache stores raw arrays (~500KB benchmarks). Acceptable today; revisit if benchmarks grow. |
+| B-P5 | P1 | `server.js` `/data/kpi-segments` | Runs `countDocuments(filter)` on every page request, so N parallel pages pay N identical counts. Return `totalCount` only on page 1 (or cache it per filter for a few seconds). |
 
 ### 2.4 Code structure
 
@@ -130,6 +131,9 @@ Severity scale:
 | F-P1 | P1 | `client/vite.config.js` | No code splitting. All 14 pages + recharts + react-markdown + react-grid-layout in one bundle. `React.lazy()` for ChatPage, ReportBuilder, StaffingForecast, BackfillPage would meaningfully reduce TTI. |
 | F-P2 | P2 | `client/src/pages/KPIUsers.jsx` | `workers` derivation lacks `useMemo` (the equivalent in KPIOverview uses it). |
 | F-P3 | P2 | Recharts everywhere | Charts re-render on every parent state change. Wrap chart containers in `React.memo` keyed on data slice. |
+| F-P5 | P1 | `client/src/hooks/useData.jsx` `loadQc` | QC events load has the same unbounded pattern the KPI load had before the 90-day window fix: no date filter, all pages fetched in parallel. Not on the login path today; apply the same shared-window approach before QC volume grows. |
+| F-P6 | P2 | `client/src/hooks/useData.jsx` `loadKpi` | All remaining segment pages are fired at once via `Promise.all`. Cap concurrency (e.g. 2–3 in flight) so a wide range can't flood the server. |
+| F-P7 | P2 | `client/src/hooks/useData.jsx` `loadKpi` | Side fetches (users, user-levels, benchmarks, data-quality flags, dashboard settings) are re-fetched on every KPI range refetch. Split them out so widening the date range only re-pulls segments. |
 | F-P4 | P2 | `client/src/hooks/useData.jsx:73` | Parallel page fetch is good, but `cb=Date.now()` cache-buster runs on every load — would benefit from `If-None-Match`/`ETag` if server preserved them (currently disabled in `server.js:67`). |
 
 ### 3.4 Security

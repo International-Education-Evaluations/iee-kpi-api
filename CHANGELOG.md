@@ -1,5 +1,23 @@
 # IEE Operations Dashboard — Changelog
 
+## Unreleased — KPI default 90-day window (2026-10-05)
+
+### Why
+Users saw slow loads and 502s right at login. The landing page (KPI Overview) had no default date range, so `loadKpi` downloaded the entire `backfill_kpi_segments` collection (~95k raw rows, drilldown projection, ~10 parallel 10k-row page requests) and filtered dates in the browser. The server already supported `from`/`to`; the client never sent them.
+
+### Changes
+- **Shared KPI date window** in `DataProvider` (`useData.jsx`), default **last 90 days**. KPI Overview, KPI Users, Scorecard, Dept Comparison and Shift Heatmap now share one From/To range instead of per-page state.
+- **Server-side windowing** — `loadKpi` sends `from=…&includeOpen=1` to `/data/kpi-segments`, so Mongo filters on the indexed `segmentStart`.
+- **Refetch on widen** — picking an earlier From refetches after a 600ms debounce; narrowing filters client-side with no request. Newest request wins; superseded responses are discarded.
+- **An empty From never downloads all history.** Date inputs emit `''` for a half-edited date. One effective window start (`kpiFetchFrom` → `kpiEffectiveFrom`) drives fetching, page filters and the Segments export: a real From date wins; an empty From with a To older than the loaded window means the 90 days ending at To (refetched); otherwise the loaded window. To see older data, pick an earlier date.
+- **`/data/kpi-segments` returns 400 for non-string filter params** (`?from[$ne]=…`, repeated `?orderType=a&orderType=b`) instead of passing them to Mongo.
+- **"Clear filters" resets to the 90-day default.**
+- **Gap-day banner fixed for From-only ranges** — `computeDateRange` now ends a From-only range at the last day with data (today if none), so "days with no segments" still shows on the default window without flagging today early.
+- **Open segments outside the window still load** (`includeOpen=1`) so the Overview "stuck >48h" alert keeps seeing old open segments.
+- **`lib/kpi-segment-filter.js`** — `/data/kpi-segments` filter extracted and unit-tested. Callers sending no params, or single string params, get the same results as before.
+- **"Last 90d" date preset** added. Outdated "60-day window" copy on KPI Overview fixed (backfill keeps 500 days).
+- Tests: `test/kpi-segment-filter.test.js`, `test/kpi-window.test.js`.
+
 ## v5.4.22 (2026-03-26)
 
 ### Staffing Forecast — New System

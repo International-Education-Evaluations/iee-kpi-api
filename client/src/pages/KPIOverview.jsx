@@ -83,13 +83,13 @@ const SEGMENT_THIN_MAX = 25000;
 
 export default function KPIOverview() {
   const { kpiSegs: segs, kpiLoading: loading, loadKpi, loadStatus, benchmarks,
-          flaggedSegmentKeys, flaggedReasonsByKey, excludeFlagged } = useData();
+          flaggedSegmentKeys, flaggedReasonsByKey, excludeFlagged,
+          kpiFrom: fFrom, setKpiFrom: setFFrom, kpiTo: fTo, setKpiTo: setFTo, resetKpiRange, kpiRangeIsDefault, kpiEffectiveFrom } = useData();
   const kpiStatus = loadStatus?.kpi || {};
   // benchmarks now come from DataProvider context — no local state needed
   const [view, setView] = useState('status');
   const [exporting, setExporting] = useState(false);
   const [fType, setFType] = useState(''); const [fDept, setFDept] = useState('');
-  const [fFrom, setFFrom] = useState(''); const [fTo, setFTo] = useState('');
   const [fWorker, setFWorker] = useState(''); const [fStatus, setFStatus] = useState('');
   const [drawer, setDrawer] = useState({ open:false, title:'', subtitle:'', rows:[] });
   const [anomalyOpen, setAnomalyOpen] = useState(false); // collapsed by default
@@ -101,7 +101,7 @@ export default function KPIOverview() {
   const deferredFDept    = useDeferredValue(fDept);
   const deferredFWorker  = useDeferredValue(fWorker);
   const deferredFStatus  = useDeferredValue(fStatus);
-  const deferredFFrom    = useDeferredValue(fFrom);
+  const deferredFFrom    = useDeferredValue(kpiEffectiveFrom);
   const deferredFTo      = useDeferredValue(fTo);
 
   useEffect(() => { loadKpi(); }, [loadKpi]);
@@ -281,7 +281,7 @@ export default function KPIOverview() {
       } else {
         await downloadCsvPost('/reports/segments-export', 'iee-kpi-segments', {
           filters: {
-            dateFrom: fFrom || undefined,
+            dateFrom: kpiEffectiveFrom || undefined,
             dateTo: fTo || undefined,
             orderType: fType || undefined,
             departments: fDept ? [fDept] : undefined,
@@ -295,9 +295,9 @@ export default function KPIOverview() {
         window.__ieeToast.show({ kind: 'error', title: 'Export failed', message: e.message });
     }
     setExporting(false);
-  }, [segDetail, fFrom, fTo, fType, fDept, fStatus, excludeFlagged]);
+  }, [segDetail, kpiEffectiveFrom, fTo, fType, fDept, fStatus, excludeFlagged]);
 
-  const clearFilters = ()=>{setFType('');setFDept('');setFFrom('');setFTo('');setFWorker('');setFStatus('');};
+  const clearFilters = ()=>{setFType('');setFDept('');resetKpiRange();setFWorker('');setFStatus('');};
   // ── Anomaly / Alert feed ────────────────────────────────────
   // Uses filtered segs when dept/worker/status filters are active so alerts
   // are relevant to the current view. Falls back to all segs when no filters set.
@@ -362,7 +362,7 @@ export default function KPIOverview() {
     return flags.slice(0, 10); // cap at 10
   }, [segs, benchmarks]);
 
-  const hasFilters = fType||fDept||fWorker||fStatus||fFrom||fTo;
+  const hasFilters = fType||fDept||fWorker||fStatus||!kpiRangeIsDefault;
 
   const segmentCols = [
     {key:'segmentStart',    label:'Date',       w:130, sortable:true, render:v=>fmtDateTime(v)},
@@ -455,9 +455,9 @@ export default function KPIOverview() {
           <div className="flex-1 text-xs text-amber-800">
             <div className="font-semibold">No segments match the current filters</div>
             <div className="text-amber-700 mt-0.5">
-              {fDept || fType || fStatus || fWorker || fFrom || fTo
+              {fDept || fType || fStatus || fWorker || !kpiRangeIsDefault
                 ? `Try widening the date range or clearing some filters. Total segments loaded: ${fmtI(segs.length)}.`
-                : `The 60-day window has ${fmtI(segs.length)} segments — but the active filter combination matches none.`}
+                : `The selected date window has ${fmtI(segs.length)} segments — but the active filter combination matches none.`}
             </div>
           </div>
           {hasFilters && <button onClick={clearFilters}
@@ -470,7 +470,7 @@ export default function KPIOverview() {
           <div className="flex-1 text-xs text-amber-800">
             <div className="font-semibold">No segments in the backfill yet</div>
             <div className="text-amber-700 mt-0.5">
-              The backfill may not have run, or the 60-day cutoff filtered everything out. Check
+              The backfill may not have run, or no segments fall inside the selected date window. Check
               {' '}<a href="/admin/diagnostics" className="underline">Diagnostics → Coverage Gaps</a>
               {' '}or <a href="/admin/backfill" className="underline">Data Backfill</a> for the last run status.
             </div>

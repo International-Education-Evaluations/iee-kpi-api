@@ -216,6 +216,7 @@ export function DatePresets({ onSelect }) {
     { label: 'Yesterday',  getDates: () => { const d = toYMD(daysAgo(1)); return [d, d]; } },
     { label: 'Last 7d',    getDates: () => [toYMD(daysAgo(6)), toYMD(new Date())] },
     { label: 'Last 30d',   getDates: () => [toYMD(daysAgo(29)), toYMD(new Date())] },
+    { label: 'Last 90d',   getDates: () => [toYMD(daysAgo(89)), toYMD(new Date())] },
     { label: 'This week',  getDates: () => { const n = new Date(); const d = n.getDay(); return [toYMD(daysAgo(d)), toYMD(new Date())]; } },
     { label: 'Last week',  getDates: () => { const n = new Date(); const d = n.getDay(); return [toYMD(daysAgo(d + 7)), toYMD(daysAgo(d + 1))]; } },
     { label: 'This month', getDates: () => { const n = new Date(); return [`${n.getFullYear()}-${String(n.getMonth()+1).padStart(2,'0')}-01`, toYMD(new Date())]; } },

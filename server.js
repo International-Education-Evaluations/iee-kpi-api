@@ -38,6 +38,7 @@ const zlib = require('zlib');
 const { MongoClient, ObjectId } = require('mongodb');
 const { createMongoConnector } = require('./lib/mongo-connector');
 const { errorBody } = require('./lib/error-response');
+const { buildKpiSegmentFilter } = require('./lib/kpi-segment-filter');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const crypto = require('crypto');
@@ -5710,14 +5711,8 @@ app.get('/data/kpi-segments', async (req, res) => {
     const db = await getConfigDb();
     const col = db.collection('backfill_kpi_segments');
 
-    // Build filter
-    const filter = {};
-    if (req.query.orderType) filter.orderType = req.query.orderType;
-    if (req.query.workerEmail) filter.workerEmail = req.query.workerEmail;
-    if (req.query.workerUserId) filter.workerUserId = req.query.workerUserId;
-    if (req.query.statusSlug) filter.statusSlug = req.query.statusSlug;
-    if (req.query.from) filter.segmentStart = { $gte: req.query.from };
-    if (req.query.to) filter.segmentStart = { ...filter.segmentStart, $lte: req.query.to + 'T23:59:59' };
+    const filter = buildKpiSegmentFilter(req.query);
+    if (!filter) return res.status(400).json({ error: 'Invalid filter parameter' });
 
     // Use a single find() — avoids separate countDocuments() round trip.
     // We fetch pageSize+1 docs to detect if there are more pages.

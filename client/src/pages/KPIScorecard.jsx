@@ -47,14 +47,13 @@ function MiniBar({ pct, color = '#16a34a' }) {
 }
 
 export default function KPIScorecard() {
-  const { kpiSegs, kpiLoading, loadKpi, flaggedSegmentKeys, excludeFlagged } = useData();
+  const { kpiSegs, kpiLoading, loadKpi, flaggedSegmentKeys, excludeFlagged,
+          kpiFrom: fFrom, setKpiFrom: setFFrom, kpiTo: fTo, setKpiTo: setFTo, resetKpiRange, kpiRangeIsDefault, kpiEffectiveFrom } = useData();
   const [benchmarks, setBenchmarks] = useState([]);
   const [userLevels, setUserLevels] = useState([]);
   const [fDept, setFDept] = useState('');
   const [fStatus, setFStatus] = useState('');
   const [fWorker, setFWorker] = useState('');
-  const [fFrom, setFFrom] = useState('');
-  const [fTo, setFTo] = useState('');
   const [view, setView] = useState('worker'); // worker | status | matrix
   const [sortCol, setSortCol] = useState('xph_pct');
   const [sortDir, setSortDir] = useState('asc'); // asc = worst first (red on top)
@@ -62,7 +61,7 @@ export default function KPIScorecard() {
   const dFDept   = useDeferredValue(fDept);
   const dFStatus = useDeferredValue(fStatus);
   const dFWorker = useDeferredValue(fWorker);
-  const dFFrom   = useDeferredValue(fFrom);
+  const dFFrom   = useDeferredValue(kpiEffectiveFrom);
   const dFTo     = useDeferredValue(fTo);
 
   useEffect(() => {
@@ -267,7 +266,7 @@ export default function KPIScorecard() {
     </th>
   );
 
-  const hasFilters = fDept||fStatus||fWorker||fFrom||fTo;
+  const hasFilters = fDept||fStatus||fWorker||!kpiRangeIsDefault;
 
   return (
     <div className="space-y-4" data-tour="scorecard-title">
@@ -311,7 +310,7 @@ export default function KPIScorecard() {
               className="px-2.5 py-1.5 bg-white border border-surface-200 rounded-lg text-xs text-ink-800 focus:outline-none focus:border-brand-400" />
           </div>
         ))}
-        {hasFilters && <button onClick={()=>{setFDept('');setFStatus('');setFWorker('');setFFrom('');setFTo('');}} className="text-[11px] text-red-500 hover:text-red-700 font-medium self-end pb-1.5">Clear</button>}
+        {hasFilters && <button onClick={()=>{setFDept('');setFStatus('');setFWorker('');resetKpiRange();}} className="text-[11px] text-red-500 hover:text-red-700 font-medium self-end pb-1.5">Clear</button>}
       </div>
 
       {kpiLoading && <div className="text-center text-ink-400 text-sm py-12">Loading segments…</div>}
