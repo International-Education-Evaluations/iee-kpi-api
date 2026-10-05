@@ -24,15 +24,14 @@ function heatColorStyle(val, max) {
 }
 
 export default function ShiftHeatmap() {
-  const { kpiSegs, kpiLoading, loadKpi, flaggedSegmentKeys, excludeFlagged } = useData();
+  const { kpiSegs, kpiLoading, loadKpi, flaggedSegmentKeys, excludeFlagged,
+          kpiFrom: fFrom, setKpiFrom: setFFrom, kpiTo: fTo, setKpiTo: setFTo, resetKpiRange, kpiRangeIsDefault, kpiEffectiveFrom } = useData();
   const [metric, setMetric] = useState('count'); // count | avgDuration | xph
   const [fDept, setFDept]   = useState('');
-  const [fFrom, setFFrom]   = useState('');
-  const [fTo, setFTo]       = useState('');
   const [fType, setFType]   = useState('');
 
   const dFDept = useDeferredValue(fDept);
-  const dFFrom = useDeferredValue(fFrom);
+  const dFFrom = useDeferredValue(kpiEffectiveFrom);
   const dFTo   = useDeferredValue(fTo);
   const dFType = useDeferredValue(fType);
 
@@ -150,7 +149,7 @@ export default function ShiftHeatmap() {
             <option value="translation">Translation</option>
           </select>
         </div>
-        {(fDept||fFrom||fTo||fType)&&<button onClick={()=>{setFDept('');setFFrom('');setFTo('');setFType('');}} className="text-[11px] text-red-500 hover:text-red-700 font-medium self-end pb-1.5">Clear</button>}
+        {(fDept||!kpiRangeIsDefault||fType)&&<button onClick={()=>{setFDept('');resetKpiRange();setFType('');}} className="text-[11px] text-red-500 hover:text-red-700 font-medium self-end pb-1.5">Clear</button>}
       </div>
 
       {kpiLoading && <div className="text-center text-ink-400 py-12">Loading…</div>}

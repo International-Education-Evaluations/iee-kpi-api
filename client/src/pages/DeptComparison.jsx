@@ -19,14 +19,13 @@ function StatCell({ value, max, color }) {
 }
 
 export default function DeptComparison() {
-  const { kpiSegs, qcEvents, kpiLoading, qcLoading, loadKpi, loadQc, flaggedSegmentKeys, excludeFlagged } = useData();
+  const { kpiSegs, qcEvents, kpiLoading, qcLoading, loadKpi, loadQc, flaggedSegmentKeys, excludeFlagged,
+          kpiFrom: fFrom, setKpiFrom: setFFrom, kpiTo: fTo, setKpiTo: setFTo, resetKpiRange, kpiRangeIsDefault, kpiEffectiveFrom } = useData();
   const [benchmarks, setBenchmarks] = useState([]);
-  const [fFrom, setFFrom] = useState('');
-  const [fTo, setFTo] = useState('');
   const [fType, setFType] = useState('');
   const [chartMetric, setChartMetric] = useState('xph');
 
-  const dFFrom = useDeferredValue(fFrom);
+  const dFFrom = useDeferredValue(kpiEffectiveFrom);
   const dFTo   = useDeferredValue(fTo);
   const dFType = useDeferredValue(fType);
 
@@ -153,7 +152,7 @@ export default function DeptComparison() {
             <option value="translation">Translation</option>
           </select>
         </div>
-        {(fFrom||fTo||fType) && <button onClick={()=>{setFFrom('');setFTo('');setFType('');}} className="text-[11px] text-red-500 hover:text-red-700 font-medium self-end pb-1.5">Clear</button>}
+        {(!kpiRangeIsDefault||fType) && <button onClick={()=>{resetKpiRange();setFType('');}} className="text-[11px] text-red-500 hover:text-red-700 font-medium self-end pb-1.5">Clear</button>}
       </div>
 
       {(kpiLoading || qcLoading) && <div className="text-center text-ink-400 py-10">Loading…</div>}

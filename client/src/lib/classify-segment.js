@@ -36,10 +36,16 @@ function _fmtMD(iso) {
   return `${_MO[m - 1] || '?'} ${d}`;
 }
 
-export function computeDateRange({ from, to, segments, fallbackDays = 60 }) {
-  // 1. Explicit filter wins.
+export function computeDateRange({ from, to, segments, fallbackDays = 60, now = new Date() }) {
+  // 1. Explicit filter wins. From-only (the default KPI window) ends at the last
+  //    day with data (or today if none) so gap-day detection has a closed range
+  //    without flagging today before its first segment.
   if (from && to) return { fromIso: from, toIso: to, label: `${_fmtMD(from)} – ${_fmtMD(to)}` };
-  if (from)       return { fromIso: from, toIso: null, label: `${_fmtMD(from)} – now` };
+  if (from) {
+    let maxIso = null;
+    for (const s of segments || []) if (s?.segmentStart && (maxIso === null || s.segmentStart > maxIso)) maxIso = s.segmentStart;
+    return { fromIso: from, toIso: (maxIso || now.toISOString()).slice(0, 10), label: `${_fmtMD(from)} – now` };
+  }
   if (to)         return { fromIso: null, toIso: to,   label: `up to ${_fmtMD(to)}` };
 
   // 2. Derive from data — pick the min/max segmentStart across loaded rows.
